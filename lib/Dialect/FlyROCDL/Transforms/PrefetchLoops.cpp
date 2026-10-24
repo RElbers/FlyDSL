@@ -109,12 +109,14 @@ bool isBoundsCheckedRead(Operation *op) {
 // A buffer read is masked to zero (`select(pred, load, 0)`); any other read is sunk into
 // `scf.if(pred)` yielding zero, because it can fault when issued past the trip count. Pure ops run
 // unchanged on the zeroed inputs. The zeros never reach the loop results: the pipeliner selects
-// each epilogue live-out against the previous iteration's value under the same predicate. A
-// side-effecting op whose results are unused (a store, a commutative atomicrmw) is sunk into
-// `scf.if(pred)`. Any other side-effecting op returns nullptr, which makes pipelineForLoop leave
-// the loop un-pipelined.
+// each epilogue live-out against the previous iteration's value under the same predicate. Any
+// other side-effecting op (a store, an atomicrmw, an scf.if or scf.for that reads) is sunk into
+// `scf.if(pred)`, yielding zeros when it does not run; those zeros are discarded the same way. A
+// side-effecting op with a result type that cannot be zeroed returns nullptr, which makes
+// pipelineForLoop leave the loop un-pipelined.
 //
-// The pipeliner maps the original op's results to the returned op's results by position.
+// The pipeliner calls this on each clone before any later op uses its results, and maps the
+// original op's results to the returned op's results by position.
 Operation *predicateOp(RewriterBase &rewriter, Operation *op, Value pred) {
   Location loc = op->getLoc();
   if (isPipelineableRead(op) && op->getNumResults() == 1) {
@@ -137,8 +139,6 @@ Operation *predicateOp(RewriterBase &rewriter, Operation *op, Value pred) {
   }
   if (isMemoryEffectFree(op))
     return op;
-  if (!op->use_empty())
-    return nullptr;
 
   bool zeroable = llvm::all_of(op->getResultTypes(), [](Type t) {
     return isa<IntegerType, FloatType, VectorType>(t);
@@ -153,7 +153,7 @@ Operation *predicateOp(RewriterBase &rewriter, Operation *op, Value pred) {
     return ifOp;
   }
   // With result types the builder leaves both blocks unterminated, so build the yields here. The
-  // else-branch zeros are never read: the results are unused.
+  // else-branch zeros only reach ops of the same out-of-range iteration.
   auto ifOp = scf::IfOp::create(rewriter, loc, op->getResultTypes(), pred, /*withElseRegion=*/true);
   op->moveBefore(ifOp.thenBlock(), ifOp.thenBlock()->end());
   rewriter.setInsertionPointToEnd(ifOp.thenBlock());
