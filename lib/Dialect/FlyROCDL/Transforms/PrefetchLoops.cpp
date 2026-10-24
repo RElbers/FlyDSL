@@ -48,14 +48,26 @@ bool isPipelineableRead(Operation *op) {
   return n.contains("buffer.load") || n.contains("global.load") || n.contains("ds.read");
 }
 
+// An op whose result depends on which lanes of the wave are active (shuffles, ballots, lane reads,
+// DPP). Unrolling splits the iterations between the main loop and a serial remainder loop, so when
+// lanes have different trip counts, lanes run the same iteration at different times and such an op
+// sees a different set of active lanes than in the original loop.
+bool isLaneExchangeOp(StringRef n) {
+  return n.contains("shuffle") || n.contains("ballot") || n.contains("bpermute") ||
+         n.contains("permlane") || n.contains("readlane") || n.contains("readfirstlane") ||
+         n.contains("dpp") || n.contains("ds_swizzle") || n.contains("subgroup");
+}
+
 // Mechanical whole-loop rotation cannot safely pipeline a loop that contains an intra-loop barrier
 // or a single-buffered global->LDS DMA (`buffer.load.lds`) / LDS store: rotating the DMA across the
 // backedge would clobber the shared buffer (no double buffering), and a dynamic-trip epilogue would
-// have to predicate the barrier, which is illegal. Such loops are left as they are.
+// have to predicate the barrier, which is illegal. Loops with a lane-exchange op are skipped too.
+// Such loops are left as they are.
 bool isMechanicallyPipelineable(scf::ForOp forOp) {
   WalkResult result = forOp.getBody()->walk([](Operation *op) {
     StringRef n = op->getName().getStringRef();
-    if (n.contains("barrier") || n.contains("buffer.load.lds") || n.contains("ds.write"))
+    if (n.contains("barrier") || n.contains("buffer.load.lds") || n.contains("ds.write") ||
+        isLaneExchangeOp(n))
       return WalkResult::interrupt();
     return WalkResult::advance();
   });

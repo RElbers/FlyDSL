@@ -8,7 +8,7 @@
 //     epilogue stores, and a serial remainder loop for the runtime trip count
 //   - a raw load in the prologue only issues under scf.if, since it can fault past the trip count;
 //     a buffer load issues unguarded and its result is masked to zero
-//   - a loop with a barrier is left unchanged
+//   - a loop with a barrier or a lane-exchange op (gpu.shuffle) is left unchanged
 //   - the marker is consumed in every case; unmarked loops are untouched
 
 // CHECK-LABEL: gpu.func @scatter
@@ -37,6 +37,16 @@
 // CHECK-NEXT:   llvm.getelementptr
 // CHECK-NEXT:   llvm.load
 // CHECK-NEXT:   gpu.barrier
+// CHECK-NEXT:   llvm.getelementptr
+// CHECK-NEXT:   llvm.store
+// CHECK-NEXT: }
+// CHECK-NEXT: gpu.return
+
+// CHECK-LABEL: gpu.func @with_shuffle
+// CHECK:      scf.for
+// CHECK-NEXT:   llvm.getelementptr
+// CHECK-NEXT:   llvm.load
+// CHECK-NEXT:   gpu.shuffle
 // CHECK-NEXT:   llvm.getelementptr
 // CHECK-NEXT:   llvm.store
 // CHECK-NEXT: }
@@ -87,6 +97,20 @@ gpu.module @prefetch_loops {
       gpu.barrier
       %pout = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
       llvm.store %v, %pout : f32, !llvm.ptr<1>
+    } {fly.prefetch_depth = 4 : i64}
+    gpu.return
+  }
+
+  gpu.func @with_shuffle(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c64 = arith.constant 64 : i32
+    scf.for %i = %c0 to %n step %c1 : i32 {
+      %pin = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      %v = llvm.load %pin : !llvm.ptr<1> -> f32
+      %s, %valid = gpu.shuffle xor %v, %c1, %c64 : f32
+      %pout = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      llvm.store %s, %pout : f32, !llvm.ptr<1>
     } {fly.prefetch_depth = 4 : i64}
     gpu.return
   }
