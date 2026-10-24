@@ -8,7 +8,8 @@
 //     epilogue stores, and a serial remainder loop for the runtime trip count
 //   - a raw load in the prologue only issues under scf.if, since it can fault past the trip count;
 //     a buffer load issues unguarded and its result is masked to zero
-//   - a loop with a barrier or a lane-exchange op (gpu.shuffle) is left unchanged
+//   - a loop with a barrier is left unchanged, and so is a loop with a lane-exchange op
+//     (gpu.shuffle) whose trip count depends on the lane; with wave-uniform bounds it is pipelined
 //   - the marker is consumed in every case; unmarked loops are untouched
 
 // CHECK-LABEL: gpu.func @scatter
@@ -41,6 +42,13 @@
 // CHECK-NEXT:   llvm.store
 // CHECK-NEXT: }
 // CHECK-NEXT: gpu.return
+
+// CHECK-LABEL: gpu.func @with_shuffle_uniform
+// CHECK-COUNT-4: scf.if {{.*}} -> (f32) {
+// CHECK-NEXT:      llvm.load
+// CHECK: scf.for
+// CHECK:   gpu.shuffle
+// CHECK: gpu.return
 
 // CHECK-LABEL: gpu.func @with_shuffle
 // CHECK:      scf.for
@@ -101,11 +109,30 @@ gpu.module @prefetch_loops {
     gpu.return
   }
 
-  gpu.func @with_shuffle(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
+  gpu.func @with_shuffle_uniform(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
     %c0 = arith.constant 0 : i32
     %c1 = arith.constant 1 : i32
     %c64 = arith.constant 64 : i32
-    scf.for %i = %c0 to %n step %c1 : i32 {
+    %bid = gpu.block_id x
+    %bid_i32 = arith.index_cast %bid : index to i32
+    %lo = arith.muli %bid_i32, %n : i32
+    %hi = arith.addi %lo, %n : i32
+    scf.for %i = %lo to %hi step %c1 : i32 {
+      %pin = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      %v = llvm.load %pin : !llvm.ptr<1> -> f32
+      %s, %valid = gpu.shuffle xor %v, %c1, %c64 : f32
+      %pout = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      llvm.store %s, %pout : f32, !llvm.ptr<1>
+    } {fly.prefetch_depth = 4 : i64}
+    gpu.return
+  }
+
+  gpu.func @with_shuffle(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
+    %c1 = arith.constant 1 : i32
+    %c64 = arith.constant 64 : i32
+    %tid = gpu.thread_id x
+    %lo = arith.index_cast %tid : index to i32
+    scf.for %i = %lo to %n step %c1 : i32 {
       %pin = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
       %v = llvm.load %pin : !llvm.ptr<1> -> f32
       %s, %valid = gpu.shuffle xor %v, %c1, %c64 : f32

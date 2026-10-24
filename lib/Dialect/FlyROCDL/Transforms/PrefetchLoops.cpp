@@ -48,30 +48,86 @@ bool isPipelineableRead(Operation *op) {
   return n.contains("buffer.load") || n.contains("global.load") || n.contains("ds.read");
 }
 
-// An op whose result depends on which lanes of the wave are active (shuffles, ballots, lane reads,
-// DPP). Unrolling splits the iterations between the main loop and a serial remainder loop, so when
-// lanes have different trip counts, lanes run the same iteration at different times and such an op
-// sees a different set of active lanes than in the original loop.
+// An op whose result depends on the values or the set of active lanes of the wave (shuffles,
+// ballots, lane reads, DPP). Unrolling splits the iterations between the main loop and a serial
+// remainder loop, so when lanes have different trip counts, lanes run the same iteration at
+// different times and such an op sees a different set of active lanes than in the original loop.
 bool isLaneExchangeOp(StringRef n) {
   return n.contains("shuffle") || n.contains("ballot") || n.contains("bpermute") ||
          n.contains("permlane") || n.contains("readlane") || n.contains("readfirstlane") ||
          n.contains("dpp") || n.contains("ds_swizzle") || n.contains("subgroup");
 }
 
+// An operand-free op whose value is the same in every lane of a wave.
+bool isUniformSource(Operation *op) {
+  if (op->hasTrait<OpTrait::ConstantLike>())
+    return true;
+  StringRef n = op->getName().getStringRef();
+  return llvm::is_contained({"gpu.block_id", "gpu.block_dim", "gpu.grid_dim", "gpu.cluster_id",
+                             "gpu.cluster_dim", "gpu.cluster_block_id", "gpu.subgroup_id",
+                             "gpu.num_subgroups", "gpu.subgroup_size", "llvm.mlir.addressof"},
+                            n) ||
+         n.starts_with("rocdl.workgroup.") || n.starts_with("rocdl.grid.");
+}
+
+// Whether every lane of a wave holds the same value of `v`. Conservative: false when unsure. Kernel
+// arguments, constants and block-level ids are uniform; so is a pure or read-only op whose operands
+// all are, and a readfirstlane. Thread / lane ids, atomics, ops with regions and loop-carried
+// values are not.
+bool isWaveUniform(Value v, DenseMap<Value, bool> &memo) {
+  if (auto it = memo.find(v); it != memo.end())
+    return it->second;
+  memo[v] = false;
+  bool uniform = false;
+  if (auto arg = dyn_cast<BlockArgument>(v)) {
+    Operation *parent = arg.getOwner()->getParentOp();
+    if (parent->getName().getStringRef() == "gpu.func" && parent->hasAttr("kernel"))
+      uniform = true;
+    else if (auto forOp = dyn_cast<scf::ForOp>(parent); forOp && v == forOp.getInductionVar())
+      uniform = isWaveUniform(forOp.getLowerBound(), memo) &&
+                isWaveUniform(forOp.getUpperBound(), memo) &&
+                isWaveUniform(forOp.getStep(), memo);
+  } else {
+    Operation *op = v.getDefiningOp();
+    StringRef n = op->getName().getStringRef();
+    if (n.contains("readfirstlane"))
+      uniform = true;
+    else if (op->getNumOperands() == 0)
+      uniform = isUniformSource(op);
+    else if (op->getNumRegions() == 0 && !isLaneExchangeOp(n) &&
+             (isMemoryEffectFree(op) || hasSingleEffect<MemoryEffects::Read>(op)))
+      uniform = llvm::all_of(op->getOperands(),
+                             [&](Value operand) { return isWaveUniform(operand, memo); });
+  }
+  memo[v] = uniform;
+  return uniform;
+}
+
+// Every lane of a wave runs the same number of iterations.
+bool hasWaveUniformTripCount(scf::ForOp forOp) {
+  DenseMap<Value, bool> memo;
+  return isWaveUniform(forOp.getLowerBound(), memo) && isWaveUniform(forOp.getUpperBound(), memo) &&
+         isWaveUniform(forOp.getStep(), memo);
+}
+
 // Mechanical whole-loop rotation cannot safely pipeline a loop that contains an intra-loop barrier
 // or a single-buffered global->LDS DMA (`buffer.load.lds`) / LDS store: rotating the DMA across the
 // backedge would clobber the shared buffer (no double buffering), and a dynamic-trip epilogue would
-// have to predicate the barrier, which is illegal. Loops with a lane-exchange op are skipped too.
-// Such loops are left as they are.
+// have to predicate the barrier, which is illegal. A loop with a lane-exchange op is skipped unless
+// every lane has the same trip count, since then all lanes still run each iteration together. Such
+// loops are left as they are.
 bool isMechanicallyPipelineable(scf::ForOp forOp) {
-  WalkResult result = forOp.getBody()->walk([](Operation *op) {
+  bool hasLaneExchange = false;
+  WalkResult result = forOp.getBody()->walk([&](Operation *op) {
     StringRef n = op->getName().getStringRef();
-    if (n.contains("barrier") || n.contains("buffer.load.lds") || n.contains("ds.write") ||
-        isLaneExchangeOp(n))
+    if (n.contains("barrier") || n.contains("buffer.load.lds") || n.contains("ds.write"))
       return WalkResult::interrupt();
+    hasLaneExchange |= isLaneExchangeOp(n);
     return WalkResult::advance();
   });
-  return !result.wasInterrupted();
+  if (result.wasInterrupted())
+    return false;
+  return !hasLaneExchange || hasWaveUniformTripCount(forOp);
 }
 
 // Stage 0 = reads + the pure address math feeding them; last stage = everything else.
