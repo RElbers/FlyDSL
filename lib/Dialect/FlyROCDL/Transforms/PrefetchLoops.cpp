@@ -87,13 +87,20 @@ void buildLoadComputeSchedule(scf::ForOp forOp,
     schedule.push_back({&op, stage0.contains(&op) ? 0u : kNumStages - 1});
 }
 
+// A buffer load past its resource returns 0 instead of faulting, so it may issue unguarded.
+bool isBoundsCheckedRead(Operation *op) {
+  return op->getName().getStringRef().contains("buffer.load");
+}
+
 // Predicate an op cloned into the prologue/epilogue of a dynamic-trip loop.
 //
-// Reads are masked to zero (`select(pred, load, 0)`) and pure ops run unchanged on the zeroed
-// inputs. That is sound only when a zero input contributes nothing (sums, multiply-accumulate);
-// min / max / product reductions are not handled yet. A side-effecting op whose results are unused
-// (a store, a commutative atomicrmw) is sunk into `scf.if(pred)`. Any other side-effecting op
-// returns nullptr, which makes pipelineForLoop leave the loop un-pipelined.
+// A buffer read is masked to zero (`select(pred, load, 0)`); any other read is sunk into
+// `scf.if(pred)` yielding zero, because it can fault when issued past the trip count. Pure ops run
+// unchanged on the zeroed inputs. The zeros never reach the loop results: the pipeliner selects
+// each epilogue live-out against the previous iteration's value under the same predicate. A
+// side-effecting op whose results are unused (a store, a commutative atomicrmw) is sunk into
+// `scf.if(pred)`. Any other side-effecting op returns nullptr, which makes pipelineForLoop leave
+// the loop un-pipelined.
 //
 // The pipeliner maps the original op's results to the returned op's results by position.
 Operation *predicateOp(RewriterBase &rewriter, Operation *op, Value pred) {
@@ -101,11 +108,20 @@ Operation *predicateOp(RewriterBase &rewriter, Operation *op, Value pred) {
   if (isPipelineableRead(op) && op->getNumResults() == 1) {
     Type ty = op->getResult(0).getType();
     if (!isa<IntegerType, FloatType, VectorType>(ty))
-      return op; // rely on the raw-buffer OOB -> 0 clamp
+      return isBoundsCheckedRead(op) ? op : nullptr;
     OpBuilder::InsertionGuard g(rewriter);
     rewriter.setInsertionPointAfter(op);
     auto zero = arith::ConstantOp::create(rewriter, loc, cast<TypedAttr>(rewriter.getZeroAttr(ty)));
-    return arith::SelectOp::create(rewriter, loc, pred, op->getResult(0), zero);
+    if (isBoundsCheckedRead(op))
+      return arith::SelectOp::create(rewriter, loc, pred, op->getResult(0), zero);
+    auto ifOp = scf::IfOp::create(rewriter, loc, TypeRange{ty}, pred, /*withElseRegion=*/true);
+    op->moveBefore(ifOp.thenBlock(), ifOp.thenBlock()->end());
+    zero->moveBefore(ifOp.elseBlock(), ifOp.elseBlock()->end());
+    rewriter.setInsertionPointToEnd(ifOp.thenBlock());
+    scf::YieldOp::create(rewriter, loc, op->getResults());
+    rewriter.setInsertionPointToEnd(ifOp.elseBlock());
+    scf::YieldOp::create(rewriter, loc, zero.getResult());
+    return ifOp;
   }
   if (isMemoryEffectFree(op))
     return op;

@@ -3,14 +3,17 @@
 // RUN: %fly-opt %s --pass-pipeline='builtin.module(gpu.module(fly-rocdl-prefetch-loops))' | FileCheck %s --implicit-check-not=fly.prefetch_depth
 
 // Tests for fly-rocdl-prefetch-loops:
-//   - a marked loop is unrolled by its depth and pipelined: masked prologue loads, a steady
+//   - a marked loop is unrolled by its depth and pipelined: guarded prologue loads, a steady
 //     state that issues the next group's loads before storing the current group, predicated
 //     epilogue stores, and a serial remainder loop for the runtime trip count
+//   - a raw load in the prologue only issues under scf.if, since it can fault past the trip count;
+//     a buffer load issues unguarded and its result is masked to zero
 //   - a loop with a barrier is left unchanged
 //   - the marker is consumed in every case; unmarked loops are untouched
 
 // CHECK-LABEL: gpu.func @scatter
-// CHECK-COUNT-4: llvm.load
+// CHECK-COUNT-4: scf.if {{.*}} -> (f32) {
+// CHECK-NEXT:      llvm.load
 // CHECK: scf.for {{.*}} iter_args(%[[V0:[a-z0-9_]+]] = {{.*}}) -> (f32, i32, f32, i32, f32, i32, f32)
 // CHECK:   llvm.load
 // CHECK:   llvm.store %[[V0]],
@@ -20,6 +23,13 @@
 // CHECK: scf.for
 // CHECK:   llvm.load
 // CHECK:   llvm.store
+// CHECK: gpu.return
+
+// CHECK-LABEL: gpu.func @buffer_scatter
+// CHECK-NOT: scf.if
+// CHECK-COUNT-4: rocdl.raw.ptr.buffer.load
+// CHECK: arith.select
+// CHECK: scf.for
 // CHECK: gpu.return
 
 // CHECK-LABEL: gpu.func @with_barrier
@@ -49,6 +59,21 @@ gpu.module @prefetch_loops {
       %v = llvm.load %pin : !llvm.ptr<1> -> f32
       %pout = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
       llvm.store %v, %pout : f32, !llvm.ptr<1>
+    } {fly.prefetch_depth = 4 : i64}
+    gpu.return
+  }
+
+  gpu.func @buffer_scatter(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c0_i16 = arith.constant 0 : i16
+    %num_records = arith.constant 4294967295 : i64
+    %flags = arith.constant 159744 : i32
+    %rin = rocdl.make.buffer.rsrc %in, %c0_i16, %num_records, %flags : <1>, i64 to <8>
+    %rout = rocdl.make.buffer.rsrc %out, %c0_i16, %num_records, %flags : <1>, i64 to <8>
+    scf.for %i = %c0 to %n step %c1 : i32 {
+      %v = rocdl.raw.ptr.buffer.load %rin, %i, %c0, 0 : f32
+      rocdl.raw.ptr.buffer.store %v, %rout, %i, %c0, 0 : f32
     } {fly.prefetch_depth = 4 : i64}
     gpu.return
   }
