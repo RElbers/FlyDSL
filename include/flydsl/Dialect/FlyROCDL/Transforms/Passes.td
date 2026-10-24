@@ -30,4 +30,22 @@ def FlyROCDLClusterAttrPass : Pass<"fly-rocdl-cluster-attr"> {
   ];
 }
 
+def FlyROCDLPrefetchLoopsPass : Pass<"fly-rocdl-prefetch-loops"> {
+  let summary = "Software-pipeline scf.for loops marked with fly.prefetch_depth";
+  let description = [{
+    Rewrites each `scf.for` carrying `fly.prefetch_depth = N` (set by
+    `range(..., prefetch_depth=N)`) so the loads of up to N future iterations
+    stay in flight across the backedge, instead of draining `vmcnt(0)` every
+    iteration. The loop is unrolled by N and pipelined in two stages; the
+    prologue and epilogue of a runtime trip count are predicated. Loops with a
+    barrier, an LDS store or a global->LDS DMA are left unchanged. Run inside
+    `gpu.module(...)` after `convert-fly-to-rocdl` and before
+    `convert-scf-to-cf`.
+  }];
+  let dependentDialects = [
+    "arith::ArithDialect",
+    "scf::SCFDialect"
+  ];
+}
+
 #endif // FLYROCDL_PASSES

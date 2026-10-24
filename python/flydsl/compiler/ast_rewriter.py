@@ -967,7 +967,7 @@ class InsertEmptyYieldForSCFFor(Transformer):
     # a loop is emitted; they are NOT loop-carried state (``init``) nor the
     # positional start/stop/step. To add a new directive, add its name here and a
     # matching keyword-only parameter on the builders -- no other change needed.
-    _LOOP_DIRECTIVE_KWARGS = ("unroll", "unroll_full")
+    _LOOP_DIRECTIVE_KWARGS = ("unroll", "unroll_full", "prefetch_depth")
 
     @staticmethod
     def _to_index(val):
@@ -1018,7 +1018,29 @@ class InsertEmptyYieldForSCFFor(Transformer):
         for_op.attributes["loop_annotation"] = ir.Attribute.parse(f"#llvm.loop_annotation<unroll = {body}>")
 
     @staticmethod
-    def scf_range(start, stop=None, step=None, *, init=None, unroll=-1, unroll_full=False):
+    def _apply_loop_prefetch(for_op, prefetch_depth, unroll, unroll_full):
+        """Mark an ``scf.for`` for the ``fly-rocdl-prefetch-loops`` pass.
+
+        ``prefetch_depth=N`` asks for the loads of up to N future iterations to
+        stay in flight across the backedge. The pass reorders loads ahead of
+        earlier iterations' stores and issues masked loads past the trip count,
+        so it is not a plain hint. It unrolls the loop itself, so it cannot be
+        combined with ``unroll`` / ``unroll_full``.
+        """
+        if prefetch_depth is None:
+            return
+        if isinstance(prefetch_depth, bool) or not isinstance(prefetch_depth, int):
+            raise TypeError(
+                f"for-loop `prefetch_depth` must be a Python int constant, got {type(prefetch_depth).__name__}"
+            )
+        if prefetch_depth < 1:
+            raise ValueError(f"for-loop `prefetch_depth` must be >= 1, got {prefetch_depth}")
+        if unroll != -1 or unroll_full:
+            raise ValueError("for-loop `prefetch_depth` and `unroll` / `unroll_full` are mutually exclusive")
+        for_op.attributes["fly.prefetch_depth"] = ir.IntegerAttr.get(ir.IntegerType.get_signless(64), prefetch_depth)
+
+    @staticmethod
+    def scf_range(start, stop=None, step=None, *, init=None, unroll=-1, unroll_full=False, prefetch_depth=None):
         if stop is None:
             stop = start
             start = 0
@@ -1032,6 +1054,7 @@ class InsertEmptyYieldForSCFFor(Transformer):
             loc = capture_user_location()
             for_op = scf.ForOp(start_val, stop_val, step_val, init, loc=loc)
             InsertEmptyYieldForSCFFor._apply_loop_unroll(for_op, unroll, unroll_full)
+            InsertEmptyYieldForSCFFor._apply_loop_prefetch(for_op, prefetch_depth, unroll, unroll_full)
             _locate_block_args(for_op.body, loc)
             with ir.InsertionPoint(for_op.body):
                 yield for_op.induction_variable, list(for_op.inner_iter_args)
@@ -1039,13 +1062,23 @@ class InsertEmptyYieldForSCFFor(Transformer):
             loc = capture_user_location()
             for_op = scf.ForOp(start_val, stop_val, step_val, loc=loc)
             InsertEmptyYieldForSCFFor._apply_loop_unroll(for_op, unroll, unroll_full)
+            InsertEmptyYieldForSCFFor._apply_loop_prefetch(for_op, prefetch_depth, unroll, unroll_full)
             _locate_block_args(for_op.body, loc)
             with ir.InsertionPoint(for_op.body):
                 yield for_op.induction_variable
 
     @staticmethod
     def scf_for_dispatch(
-        start, stop, step, body_fn, *, result_names=(), result_values=(), unroll=-1, unroll_full=False
+        start,
+        stop,
+        step,
+        body_fn,
+        *,
+        result_names=(),
+        result_values=(),
+        unroll=-1,
+        unroll_full=False,
+        prefetch_depth=None,
     ):
         start_val = as_ir_value(start)
         stop_val = as_ir_value(stop)
@@ -1082,6 +1115,7 @@ class InsertEmptyYieldForSCFFor(Transformer):
             loc = capture_user_location()
             for_op = scf.ForOp(start_val, stop_val, step_val, loc=loc)
             InsertEmptyYieldForSCFFor._apply_loop_unroll(for_op, unroll, unroll_full)
+            InsertEmptyYieldForSCFFor._apply_loop_prefetch(for_op, prefetch_depth, unroll, unroll_full)
             _locate_block_args(for_op.body, loc)
             with ir.InsertionPoint(for_op.body):
                 iv = for_op.induction_variable
@@ -1097,6 +1131,7 @@ class InsertEmptyYieldForSCFFor(Transformer):
         loc = capture_user_location()
         for_op = scf.ForOp(start_val, stop_val, step_val, state_raw, loc=loc)
         InsertEmptyYieldForSCFFor._apply_loop_unroll(for_op, unroll, unroll_full)
+        InsertEmptyYieldForSCFFor._apply_loop_prefetch(for_op, prefetch_depth, unroll, unroll_full)
         _locate_block_args(for_op.body, loc)
 
         with ir.InsertionPoint(for_op.body):
