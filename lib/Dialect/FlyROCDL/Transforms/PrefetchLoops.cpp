@@ -110,24 +110,85 @@ bool hasWaveUniformTripCount(scf::ForOp forOp) {
          isWaveUniform(forOp.getStep(), memo);
 }
 
+bool hasLaneExchangeOp(scf::ForOp forOp) {
+  WalkResult result = forOp.getBody()->walk([](Operation *op) {
+    return isLaneExchangeOp(op->getName().getStringRef()) ? WalkResult::interrupt()
+                                                          : WalkResult::advance();
+  });
+  return result.wasInterrupted();
+}
+
 // Mechanical whole-loop rotation cannot safely pipeline a loop that contains an intra-loop barrier
 // or a single-buffered global->LDS DMA (`buffer.load.lds`) / LDS store: rotating the DMA across the
 // backedge would clobber the shared buffer (no double buffering), and a dynamic-trip epilogue would
-// have to predicate the barrier, which is illegal. A loop with a lane-exchange op is skipped unless
-// every lane has the same trip count, since then all lanes still run each iteration together. Such
-// loops are left as they are.
+// have to predicate the barrier, which is illegal. Such loops are left as they are.
 bool isMechanicallyPipelineable(scf::ForOp forOp) {
-  bool hasLaneExchange = false;
-  WalkResult result = forOp.getBody()->walk([&](Operation *op) {
+  WalkResult result = forOp.getBody()->walk([](Operation *op) {
     StringRef n = op->getName().getStringRef();
     if (n.contains("barrier") || n.contains("buffer.load.lds") || n.contains("ds.write"))
       return WalkResult::interrupt();
-    hasLaneExchange |= isLaneExchangeOp(n);
     return WalkResult::advance();
   });
-  if (result.wasInterrupted())
-    return false;
-  return !hasLaneExchange || hasWaveUniformTripCount(forOp);
+  return !result.wasInterrupted();
+}
+
+Value toI64(RewriterBase &rewriter, Location loc, Value v) {
+  Type i64 = rewriter.getI64Type();
+  if (v.getType().isIndex())
+    return arith::IndexCastOp::create(rewriter, loc, i64, v);
+  if (v.getType().getIntOrFloatBitWidth() < 64)
+    return arith::ExtSIOp::create(rewriter, loc, i64, v);
+  return v;
+}
+
+Value fromI64(RewriterBase &rewriter, Location loc, Value v, Type ty) {
+  if (ty.isIndex())
+    return arith::IndexCastOp::create(rewriter, loc, ty, v);
+  if (ty.getIntOrFloatBitWidth() < 64)
+    return arith::TruncIOp::create(rewriter, loc, ty, v);
+  return v;
+}
+
+// Ends `forOp` after the wave's shortest trip count, rounded down to a multiple of `depth`, and
+// runs the remaining iterations of each lane in a plain tail loop after it. Every lane then runs
+// `forOp` the same number of times, and the tail runs in lockstep, so each iteration index sees the
+// same active lanes as in the original loop. Costs one wave reduction before the loop.
+LogicalResult splitAtWaveUniformTripCount(RewriterBase &rewriter, scf::ForOp forOp,
+                                          int64_t depth) {
+  if (forOp.getUnsignedCmp())
+    return failure();
+  Location loc = forOp.getLoc();
+  Type boundTy = forOp.getLowerBound().getType();
+  OpBuilder::InsertionGuard g(rewriter);
+  rewriter.setInsertionPoint(forOp);
+  Value lb = toI64(rewriter, loc, forOp.getLowerBound());
+  Value ub = toI64(rewriter, loc, forOp.getUpperBound());
+  Value step = toI64(rewriter, loc, forOp.getStep());
+  Value zero = arith::ConstantIntOp::create(rewriter, loc, 0, 64);
+  Value span = arith::SubIOp::create(rewriter, loc, ub, lb);
+  Value tripCount = arith::MaxSIOp::create(
+      rewriter, loc, arith::CeilDivSIOp::create(rewriter, loc, span, step), zero);
+  Value strategy = LLVM::ConstantOp::create(rewriter, loc, rewriter.getI32IntegerAttr(0));
+  Value minTripCount =
+      LLVM::CallIntrinsicOp::create(rewriter, loc, rewriter.getI64Type(),
+                                    rewriter.getStringAttr("llvm.amdgcn.wave.reduce.umin"),
+                                    ValueRange{tripCount, strategy})
+          .getResult(0);
+  Value depthVal = arith::ConstantIntOp::create(rewriter, loc, depth, 64);
+  Value groups = arith::DivUIOp::create(rewriter, loc, minTripCount, depthVal);
+  Value mainTrips = arith::MulIOp::create(rewriter, loc, groups, depthVal);
+  Value split = arith::AddIOp::create(rewriter, loc, lb,
+                                      arith::MulIOp::create(rewriter, loc, mainTrips, step));
+  split = fromI64(rewriter, loc, split, boundTy);
+
+  rewriter.setInsertionPointAfter(forOp);
+  auto tail = cast<scf::ForOp>(rewriter.clone(*forOp));
+  for (auto [from, to] : llvm::zip(forOp.getResults(), tail.getResults()))
+    rewriter.replaceAllUsesExcept(from, to, tail);
+  tail.setLowerBound(split);
+  tail.getInitArgsMutable().assign(forOp.getResults());
+  forOp.setUpperBound(split);
+  return success();
 }
 
 // Stage 0 = reads + the pure address math feeding them; last stage = everything else.
@@ -239,6 +300,11 @@ public:
     for (auto [forOp, depth] : requested) {
       forOp->removeAttr(kPrefetchDepthAttr);
       if (depth < 1 || !isMechanicallyPipelineable(forOp))
+        continue;
+      // Unrolling and peeling split each lane's iterations at its own trip count; a lane-exchange
+      // op needs that split to fall at the same iteration in every lane of the wave.
+      if (hasLaneExchangeOp(forOp) && !hasWaveUniformTripCount(forOp) &&
+          failed(splitAtWaveUniformTripCount(rewriter, forOp, depth)))
         continue;
 
       scf::ForOp target = forOp;

@@ -8,8 +8,10 @@
 //     epilogue stores, and a serial remainder loop for the runtime trip count
 //   - a raw load in the prologue only issues under scf.if, since it can fault past the trip count;
 //     a buffer load issues unguarded and its result is masked to zero
-//   - a loop with a barrier is left unchanged, and so is a loop with a lane-exchange op
-//     (gpu.shuffle) whose trip count depends on the lane; with wave-uniform bounds it is pipelined
+//   - a loop with a barrier is left unchanged
+//   - a loop with a lane-exchange op (gpu.shuffle) is pipelined as is when its bounds are
+//     wave-uniform; when they depend on the lane, its main loop first ends at the wave's shortest
+//     trip count (wave.reduce.umin) and a plain tail loop runs each lane's remaining iterations
 //   - the marker is consumed in every case; unmarked loops are untouched
 
 // CHECK-LABEL: gpu.func @scatter
@@ -51,14 +53,19 @@
 // CHECK: gpu.return
 
 // CHECK-LABEL: gpu.func @with_shuffle
+// CHECK:      gpu.thread_id
+// CHECK:      %[[TRIPS:.*]] = llvm.call_intrinsic "llvm.amdgcn.wave.reduce.umin"
+// CHECK:      arith.divui %[[TRIPS]]
+// CHECK-COUNT-4: scf.if {{.*}} -> (f32) {
+// CHECK-NEXT:      llvm.load
 // CHECK:      scf.for
+// CHECK:        gpu.shuffle
+// CHECK:      scf.for %{{.*}} = %{{.*}} to %[[SPLIT:[a-z0-9_]+]] step
+// CHECK:      scf.for %{{.*}} = %[[SPLIT]] to %arg2 step
 // CHECK-NEXT:   llvm.getelementptr
 // CHECK-NEXT:   llvm.load
 // CHECK-NEXT:   gpu.shuffle
-// CHECK-NEXT:   llvm.getelementptr
-// CHECK-NEXT:   llvm.store
-// CHECK-NEXT: }
-// CHECK-NEXT: gpu.return
+// CHECK:      gpu.return
 
 // CHECK-LABEL: gpu.func @unmarked
 // CHECK:      scf.for
