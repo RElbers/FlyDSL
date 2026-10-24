@@ -11,7 +11,8 @@
 //   - a loop with a barrier is left unchanged
 //   - a loop with a lane-exchange op (gpu.shuffle) is pipelined as is when its bounds are
 //     wave-uniform; when they depend on the lane, its main loop first ends at the wave's shortest
-//     trip count (wave.reduce.umin) and a plain tail loop runs each lane's remaining iterations
+//     trip count (wave.reduce.umin, as i32 for 32-bit bounds and i64 for index) and a plain tail
+//     loop runs each lane's remaining iterations
 //   - the marker is consumed in every case; unmarked loops are untouched
 
 // CHECK-LABEL: gpu.func @scatter
@@ -54,8 +55,8 @@
 
 // CHECK-LABEL: gpu.func @with_shuffle
 // CHECK:      gpu.thread_id
-// CHECK:      %[[TRIPS:.*]] = llvm.call_intrinsic "llvm.amdgcn.wave.reduce.umin"
-// CHECK:      arith.divui %[[TRIPS]]
+// CHECK:      %[[TRIPS:.*]] = llvm.call_intrinsic "llvm.amdgcn.wave.reduce.umin"({{.*}}) : (i32, i32) -> i32
+// CHECK:      arith.extui %[[TRIPS]] : i32 to i64
 // CHECK-COUNT-4: scf.if {{.*}} -> (f32) {
 // CHECK-NEXT:      llvm.load
 // CHECK:      scf.for
@@ -65,6 +66,10 @@
 // CHECK-NEXT:   llvm.getelementptr
 // CHECK-NEXT:   llvm.load
 // CHECK-NEXT:   gpu.shuffle
+// CHECK:      gpu.return
+
+// CHECK-LABEL: gpu.func @with_shuffle_index
+// CHECK:      llvm.call_intrinsic "llvm.amdgcn.wave.reduce.umin"({{.*}}) : (i64, i32) -> i64
 // CHECK:      gpu.return
 
 // CHECK-LABEL: gpu.func @unmarked
@@ -144,6 +149,22 @@ gpu.module @prefetch_loops {
       %v = llvm.load %pin : !llvm.ptr<1> -> f32
       %s, %valid = gpu.shuffle xor %v, %c1, %c64 : f32
       %pout = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      llvm.store %s, %pout : f32, !llvm.ptr<1>
+    } {fly.prefetch_depth = 4 : i64}
+    gpu.return
+  }
+
+  gpu.func @with_shuffle_index(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: index) kernel {
+    %c1 = arith.constant 1 : index
+    %c1_i32 = arith.constant 1 : i32
+    %c64 = arith.constant 64 : i32
+    %tid = gpu.thread_id x
+    scf.for %i = %tid to %n step %c1 {
+      %i64 = arith.index_cast %i : index to i64
+      %pin = llvm.getelementptr %in[%i64] : (!llvm.ptr<1>, i64) -> !llvm.ptr<1>, f32
+      %v = llvm.load %pin : !llvm.ptr<1> -> f32
+      %s, %valid = gpu.shuffle xor %v, %c1_i32, %c64 : f32
+      %pout = llvm.getelementptr %out[%i64] : (!llvm.ptr<1>, i64) -> !llvm.ptr<1>, f32
       llvm.store %s, %pout : f32, !llvm.ptr<1>
     } {fly.prefetch_depth = 4 : i64}
     gpu.return

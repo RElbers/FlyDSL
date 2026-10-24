@@ -168,12 +168,20 @@ LogicalResult splitAtWaveUniformTripCount(RewriterBase &rewriter, scf::ForOp for
   Value span = arith::SubIOp::create(rewriter, loc, ub, lb);
   Value tripCount = arith::MaxSIOp::create(
       rewriter, loc, arith::CeilDivSIOp::create(rewriter, loc, span, step), zero);
+  // With bounds of at most 32 bits the trip count is below 2^32, so reduce it as an unsigned i32,
+  // which halves the cross-lane work.
+  bool narrow = !boundTy.isIndex() && boundTy.getIntOrFloatBitWidth() <= 32;
+  Type reduceTy = narrow ? rewriter.getI32Type() : rewriter.getI64Type();
+  if (narrow)
+    tripCount = arith::TruncIOp::create(rewriter, loc, reduceTy, tripCount);
   Value strategy = LLVM::ConstantOp::create(rewriter, loc, rewriter.getI32IntegerAttr(0));
   Value minTripCount =
-      LLVM::CallIntrinsicOp::create(rewriter, loc, rewriter.getI64Type(),
+      LLVM::CallIntrinsicOp::create(rewriter, loc, reduceTy,
                                     rewriter.getStringAttr("llvm.amdgcn.wave.reduce.umin"),
                                     ValueRange{tripCount, strategy})
           .getResult(0);
+  if (narrow)
+    minTripCount = arith::ExtUIOp::create(rewriter, loc, rewriter.getI64Type(), minTripCount);
   Value depthVal = arith::ConstantIntOp::create(rewriter, loc, depth, 64);
   Value groups = arith::DivUIOp::create(rewriter, loc, minTripCount, depthVal);
   Value mainTrips = arith::MulIOp::create(rewriter, loc, groups, depthVal);
