@@ -294,6 +294,48 @@ Three pitfalls (all covered in `/prefetch-data-load`):
 3. **Build shared-memory views at the top of the kernel**, not inside the loop
    body, or the epilogue use hits an SSA dominance error.
 
+### Compiler prefetch with `range(..., prefetch_depth=N)`
+
+For a loop that waits on its global loads, the compiler can do the prefetch
+above itself. `prefetch_depth=N` unrolls the loop by N and software-pipelines
+it: each pass issues the loads of the next N iterations before computing on the
+previous N, so up to N loads per lane stay in flight across the backedge instead
+of one load and a `s_waitcnt vmcnt(0)` per iteration. It works on runtime trip
+counts, with or without `init=`:
+
+```python
+for i, state in range(fx.Int32(tid), n, fx.Int32(BLOCK), init=[fx.Float32(0.0)], prefetch_depth=8):
+    x = buffer_ops.buffer_load(rsrc, i, vec_width=1, dtype=T.f32)
+    acc = yield [state[0] + x]
+```
+
+The iterations that don't fill a group of N run in a plain loop after the
+pipelined one. The extra loads the pipelined loop issues past the trip count are
+predicated: a buffer load returns 0 past its resource and its result is masked;
+any other load is skipped. `prefetch_depth` cannot be combined with `unroll` or
+`unroll_full`.
+
+**Contract.** Loads move ahead of the stores of earlier iterations, so a load
+must not read what an earlier iteration of the same loop stored (a recurrence
+through memory gives wrong results). The compiler does check the same iteration:
+a load that follows a possible store in the body keeps the loop as it is.
+
+**Loops left unchanged.** The loop is compiled as plain `range`, with a
+`UserWarning` naming the reason (`loop not pipelined (prefetch_depth=8): ...`),
+when it contains a barrier, a global-to-LDS copy, a print or an assert, a load
+after a possible store in the same iteration, or no load at the top level of the
+body. The warning points at the loop's source line when
+`FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1`, and only appears when the kernel is actually
+compiled (not on a JIT cache hit). Shuffles, ballots and other lane-exchange ops
+are supported; when the loop bounds may differ across lanes (a grid-stride loop
+starting at the lane id), the compiler adds one wave reduction before the loop.
+
+**When it pays off.** Each lane must run many more iterations than N, and the
+loop must be waiting on its loads. A loop that runs only a few iterations per
+lane gets slower: the extra prologue, epilogue and remainder code costs more than
+the overlap. Registers grow with N (a vec4 load body uses ~140 VGPRs at N=16 and
+spills at N=64 on gfx950); check with `/isa-resource-diff`. Profile both ways.
+
 ### Async copy (global → LDS DMA)
 
 On gfx942/gfx950, `use_async_copy=True` streams A directly from global memory
