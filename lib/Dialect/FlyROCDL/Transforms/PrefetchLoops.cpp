@@ -505,6 +505,93 @@ Operation *predicateOp(RewriterBase &rewriter, Operation *op, Value pred) {
   return ifOp;
 }
 
+// Merges `second` into `first`, an earlier guard in the same block with the same predicate, and
+// returns the merged guard. Every op between them must be free of memory effects, so the guarded
+// ops of `second` can move above them; the ones `second` uses move above `first`, which fails
+// when they depend on its results (a load whose address another guarded load produced).
+FailureOr<scf::IfOp> mergeGuard(RewriterBase &rewriter, scf::IfOp first, scf::IfOp second) {
+  DenseSet<Operation *> between;
+  for (Operation *op = first->getNextNode(); op != second; op = op->getNextNode()) {
+    if (!isMemoryEffectFree(op))
+      return failure();
+    between.insert(op);
+  }
+  SetVector<Value> used;
+  getUsedValuesDefinedAbove(second->getRegions(), used);
+  SmallVector<Value> worklist(used.begin(), used.end());
+  DenseSet<Operation *> needed;
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    Operation *def = v.getDefiningOp();
+    if (def == first.getOperation())
+      return failure();
+    if (!def || !between.contains(def) || !needed.insert(def).second)
+      continue;
+    if (def->getNumRegions() > 0)
+      return failure();
+    llvm::append_range(worklist, def->getOperands());
+  }
+  for (Operation *op = first->getNextNode(); op != second;) {
+    Operation *next = op->getNextNode();
+    if (needed.contains(op))
+      rewriter.moveOpBefore(op, first);
+    op = next;
+  }
+
+  SmallVector<Type> types(first->getResultTypes());
+  llvm::append_range(types, second->getResultTypes());
+  rewriter.setInsertionPoint(first);
+  scf::IfOp merged;
+  if (types.empty()) {
+    merged = scf::IfOp::create(rewriter, first.getLoc(), TypeRange{}, first.getCondition(),
+                               /*withElseRegion=*/false);
+    for (scf::IfOp guard : {first, second}) {
+      rewriter.eraseOp(guard.thenBlock()->getTerminator());
+      rewriter.inlineBlockBefore(guard.thenBlock(), merged.thenBlock()->getTerminator());
+    }
+  } else {
+    // With result types the builder leaves both blocks unterminated, so build the yields here.
+    merged = scf::IfOp::create(rewriter, first.getLoc(), types, first.getCondition(),
+                               /*withElseRegion=*/true);
+    SmallVector<Value> thenValues, elseValues;
+    for (scf::IfOp guard : {first, second}) {
+      llvm::append_range(thenValues, guard.thenYield().getOperands());
+      rewriter.eraseOp(guard.thenYield());
+      rewriter.mergeBlocks(guard.thenBlock(), merged.thenBlock());
+      if (guard.getNumResults() == 0)
+        continue;
+      llvm::append_range(elseValues, guard.elseYield().getOperands());
+      rewriter.eraseOp(guard.elseYield());
+      rewriter.mergeBlocks(guard.elseBlock(), merged.elseBlock());
+    }
+    rewriter.setInsertionPointToEnd(merged.thenBlock());
+    scf::YieldOp::create(rewriter, first.getLoc(), thenValues);
+    rewriter.setInsertionPointToEnd(merged.elseBlock());
+    scf::YieldOp::create(rewriter, first.getLoc(), elseValues);
+  }
+  unsigned numFirst = first.getNumResults();
+  rewriter.replaceOp(first, merged.getResults().take_front(numFirst));
+  rewriter.replaceOp(second, merged.getResults().drop_front(numFirst));
+  return merged;
+}
+
+// `predicateOp` guards each op on its own, so N loads in the prologue would become N branch
+// regions, each saving and restoring the exec mask. Merge each guard into the previous one with
+// the same predicate where `mergeGuard` can. Upstream's CombineIfs only merges adjacent ifs, and
+// each guard is preceded by its own address math.
+void mergeGuards(RewriterBase &rewriter, ArrayRef<scf::IfOp> guards) {
+  scf::IfOp head;
+  for (scf::IfOp guard : guards) {
+    if (head && head->getBlock() == guard->getBlock() &&
+        head.getCondition() == guard.getCondition() && head->isBeforeInBlock(guard))
+      if (FailureOr<scf::IfOp> merged = mergeGuard(rewriter, head, guard); succeeded(merged)) {
+        head = *merged;
+        continue;
+      }
+    head = guard;
+  }
+}
+
 // A copy into or out of LDS issued by the memory unit, or an asynchronous copy whose completion is
 // tied to a separate wait. Pipelining would move it relative to the reads of the same buffer and
 // to its wait.
@@ -701,7 +788,13 @@ public:
       options.supportDynamicLoops = true;
       // peelEpilogue (default true) must stay true: folding the epilogue into the kernel would
       // predicate every steady-state load, forcing a wait right after each one.
-      options.predicateFn = predicateOp;
+      SmallVector<scf::IfOp> guards;
+      options.predicateFn = [&](RewriterBase &r, Operation *op, Value pred) {
+        Operation *guarded = predicateOp(r, op, pred);
+        if (guarded && guarded != op)
+          guards.push_back(cast<scf::IfOp>(guarded));
+        return guarded;
+      };
       options.getScheduleFn = buildLoadComputeSchedule;
       rewriter.setInsertionPoint(target);
       bool modified = false;
@@ -730,7 +823,9 @@ public:
         if (unrolled)
           why += "; the loop is only unrolled";
         notPipelined(target, why);
+        continue;
       }
+      mergeGuards(rewriter, guards);
     }
   }
 };

@@ -3,6 +3,11 @@
 // RUN: %fly-opt %s --pass-pipeline='builtin.module(gpu.module(fly-rocdl-prefetch-loops),canonicalize)' | FileCheck %s --implicit-check-not=fly.prefetch_depth --implicit-check-not=fly.prefetch_assume_independent
 // RUN: %fly-opt %s --pass-pipeline='builtin.module(gpu.module(fly-rocdl-prefetch-loops))' -verify-diagnostics -o /dev/null
 
+// The FileCheck run adds canonicalize only to fold constant bounds and trip counts, which some
+// checks below rely on. The compile pipeline runs no canonicalize after the pass, so these checks
+// must not depend on it merging guards: the pass merges guards with the same predicate itself, and
+// upstream's CombineIfs only merges adjacent ones.
+
 gpu.module @prefetch_edges {
   // Unrolling leaves exactly one main-loop iteration; it must not erase the operation before
   // pipelining. Canonicalization folds the resulting straight-line computation.
@@ -222,7 +227,7 @@ gpu.module @prefetch_edges {
   // loads and reduces is pipelined without the flag, after the wave-uniform split.
   // CHECK-LABEL: gpu.func @intrinsic_reduction_without_flag
   // CHECK: llvm.call_intrinsic "llvm.amdgcn.wave.reduce.umin"
-  // CHECK: scf.if {{.*}} -> (i32) {
+  // CHECK: scf.if {{.*}} -> (i32, i32, i32, i32) {
   // CHECK: scf.for
   // CHECK: llvm.call_intrinsic "llvm.amdgcn.wave.reduce.umin"
   // CHECK: gpu.return
@@ -488,7 +493,7 @@ gpu.module @prefetch_edges {
   // A scheduling hint is neither a barrier nor a write, so a load-only loop with one is pipelined
   // without the flag.
   // CHECK-LABEL: gpu.func @sched_barrier_hint
-  // CHECK: scf.if {{.*}} -> (f32) {
+  // CHECK: scf.if {{.*}} -> (f32, f32, f32, f32) {
   // CHECK: scf.for
   // CHECK: rocdl.sched.barrier
   // CHECK: gpu.return

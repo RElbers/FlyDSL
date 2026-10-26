@@ -9,6 +9,9 @@
 //     epilogue stores, and a serial remainder loop for the runtime trip count
 //   - every load in the prologue only issues under scf.if, since it can fault past the trip count;
 //     that includes buffer loads, whose resource usually has no size limit
+//   - guards with the same predicate are merged into one scf.if, with the address math between
+//     them moved above it; a load whose address another guarded load produces stays in a later
+//     guard (gather, pointer_table)
 //   - a load whose address is carried from the previous iteration is pipelined, with the address
 //     update moved ahead with it; a pointer loaded in the loop gets a null placeholder
 //   - a loop is left unchanged when a load's address comes from a side effect (an atomic), or when
@@ -29,22 +32,26 @@
 //   - the marker is consumed in every case; unmarked loops are untouched
 
 // CHECK-LABEL: gpu.func @scatter
-// CHECK-COUNT-4: scf.if {{.*}} -> (f32) {
-// CHECK-NEXT:      llvm.load
+// CHECK:      scf.if {{.*}} -> (f32, f32, f32, f32) {
+// CHECK-COUNT-4:   llvm.load
+// CHECK-NEXT:   scf.yield
 // CHECK: scf.for {{.*}} iter_args(%{{[a-z0-9_]+}} = %{{[a-z0-9_]+}}, %[[V0:[a-z0-9_]+]] = {{.*}}) -> (i32, f32, i32, f32, i32, f32, i32, f32)
 // CHECK:   llvm.load
 // CHECK:   llvm.store %[[V0]],
 // CHECK-COUNT-3: llvm.load
 // CHECK:   scf.yield
-// CHECK-COUNT-4: scf.if
+// CHECK:      scf.if
+// CHECK-COUNT-4: llvm.store
+// CHECK-NOT:  scf.if
 // CHECK: scf.for
 // CHECK:   llvm.load
 // CHECK:   llvm.store
 // CHECK: gpu.return
 
 // CHECK-LABEL: gpu.func @buffer_scatter
-// CHECK-COUNT-4: scf.if {{.*}} -> (f32) {
-// CHECK-NEXT:      rocdl.raw.ptr.buffer.load
+// CHECK:      scf.if {{.*}} -> (f32, f32, f32, f32) {
+// CHECK-COUNT-4:   rocdl.raw.ptr.buffer.load
+// CHECK-NEXT:   scf.yield
 // CHECK: scf.for
 // CHECK: gpu.return
 
@@ -60,8 +67,9 @@
 
 // CHECK-LABEL: gpu.func @with_shuffle_uniform
 // CHECK-NOT: wave.reduce
-// CHECK-COUNT-4: scf.if {{.*}} -> (f32) {
-// CHECK-NEXT:      llvm.load
+// CHECK:      scf.if {{.*}} -> (f32, f32, f32, f32) {
+// CHECK-COUNT-4:   llvm.load
+// CHECK-NEXT:   scf.yield
 // CHECK: scf.for
 // CHECK:   gpu.shuffle
 // CHECK: gpu.return
@@ -73,8 +81,9 @@
 // CHECK:      %[[SPLIT:[a-z0-9_]+]] = arith.trunci {{.*}} : i64 to i32
 // CHECK:      %[[WIDE_SPLIT:[a-z0-9_]+]] = arith.extsi %[[SPLIT]] : i32 to i64
 // CHECK:      %[[CLAMPED:[a-z0-9_]+]] = arith.maxsi %{{.*}}, %[[WIDE_SPLIT]] : i64
-// CHECK-COUNT-4: scf.if {{.*}} -> (f32) {
-// CHECK-NEXT:      llvm.load
+// CHECK:      scf.if {{.*}} -> (f32, f32, f32, f32) {
+// CHECK-COUNT-4:   llvm.load
+// CHECK-NEXT:   scf.yield
 // CHECK:      scf.for
 // CHECK:        gpu.shuffle
 // CHECK-NOT:  to %[[CLAMPED]] step
@@ -89,8 +98,10 @@
 // CHECK:      gpu.return
 
 // CHECK-LABEL: gpu.func @gather
-// CHECK-COUNT-4: scf.if {{.*}} -> (i32) {
-// CHECK-NEXT:      llvm.load
+// CHECK:      scf.if {{.*}} -> (i32) {
+// CHECK-NEXT:   llvm.load
+// CHECK-COUNT-3: scf.if {{.*}} -> (f32, i32) {
+// CHECK:      scf.if {{.*}} -> (f32) {
 // CHECK:      scf.for
 // CHECK:      gpu.return
 
@@ -131,8 +142,9 @@
 // CHECK:      gpu.return
 
 // CHECK-LABEL: gpu.func @carried_address
-// CHECK-COUNT-2: scf.if {{.*}} -> (f32) {
-// CHECK-NEXT:      llvm.load
+// CHECK:      scf.if {{.*}} -> (f32, f32) {
+// CHECK-COUNT-2:   llvm.load
+// CHECK-NEXT:   scf.yield
 // CHECK:      scf.for {{.*}} iter_args
 // CHECK:      gpu.return
 
@@ -144,8 +156,10 @@
 // CHECK:      gpu.return
 
 // CHECK-LABEL: gpu.func @pointer_table
-// CHECK-COUNT-2: scf.if {{.*}} -> (!llvm.ptr<1>) {
-// CHECK-NEXT:      llvm.load
+// CHECK:      scf.if {{.*}} -> (!llvm.ptr<1>) {
+// CHECK-NEXT:   llvm.load
+// CHECK:      scf.if {{.*}} -> (f32, !llvm.ptr<1>) {
+// CHECK:      scf.if {{.*}} -> (f32) {
 // CHECK:      scf.for
 // CHECK:      gpu.return
 

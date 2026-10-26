@@ -61,6 +61,12 @@ def _store_reload(r, i, acc):
     return ArithValue(acc) + ArithValue(_load(r["tmp"], i))
 
 
+def _gather(r, i, acc):
+    # The second load's address comes from the first, so their guards can't be merged into one.
+    j = (fx.Float32(_load(r["in"], i)) * 100.0).to(fx.Int32)
+    return ArithValue(acc) + ArithValue(_load(r["in"], j))
+
+
 def _intrinsic_reduce(r, i, acc):
     bits = arith.bitcast(T.i32, _load(r["in"], i))
     minimum = llvm.call_intrinsic(T.i32, "llvm.amdgcn.wave.reduce.umin", [bits, fx.Int32(0).ir_value()], [], [])
@@ -73,6 +79,7 @@ BODIES = {
     "min": _min,
     "shuffle": _shuffle,
     "store_reload": _store_reload,
+    "gather": _gather,
     "intrinsic_reduce": _intrinsic_reduce,
 }
 INIT = {"min": 1.0e30}
@@ -144,6 +151,8 @@ def _run(launch, n):
         ("shuffle", False),
         ("shuffle", True),
         ("store_reload", False),
+        ("gather", False),
+        ("gather", True),
         ("intrinsic_reduce", False),
         ("intrinsic_reduce", True),
     ],
