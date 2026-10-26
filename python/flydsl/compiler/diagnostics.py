@@ -153,16 +153,20 @@ def install_excepthook() -> None:
 
 @contextmanager
 def dsl_ir_diagnostics(ctx):
-    """Collect MLIR error diagnostics emitted during a ``with`` block.
+    """Collect the MLIR errors emitted during a ``with`` block as a list of :class:`DiagRecord`.
 
-    Yields a list of :class:`DiagRecord`.
-    Only ``ERROR`` severity messages are captured.
+    Warnings and remarks become Python warnings at the user's source line once the block succeeds;
+    the Python bindings would otherwise drop them.
     """
     records: list = []
+    pending_warnings: list = []
 
     def _handler(d):
         if d.severity == ir.DiagnosticSeverity.ERROR:
             records.append(diag_record_from_diagnostic(d))
+            return True
+        if d.severity in (ir.DiagnosticSeverity.WARNING, ir.DiagnosticSeverity.REMARK):
+            pending_warnings.append(diag_record_from_diagnostic(d))
             return True
         return False
 
@@ -172,6 +176,16 @@ def dsl_ir_diagnostics(ctx):
     finally:
         if handler.attached:
             handler.detach()
+
+    # The MLIR callback binding swallows exceptions, including warnings promoted to errors.
+    # Emit only after a successful block so a warning cannot mask a compile error.
+    for record in pending_warnings:
+        if record.chain:
+            frame = record.chain[0]
+            warnings.warn_explicit(record.message, UserWarning, frame.filename, frame.line)
+        else:
+            hint = "set FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1 to see the source line"
+            warnings.warn(f"{record.message} ({hint})", stacklevel=3)
 
 
 def warn_annotation_value_mismatch(param_name, annotation, actual_type, *, context):
