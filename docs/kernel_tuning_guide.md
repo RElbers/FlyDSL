@@ -310,10 +310,11 @@ for i, state in range(fx.Int32(tid), n, fx.Int32(BLOCK), init=[fx.Float32(0.0)],
 ```
 
 The iterations that don't fill a group of N run in a plain loop after the
-pipelined one. The extra loads the pipelined loop issues past the trip count are
-predicated: a buffer load returns 0 past its resource and its result is masked;
-any other load is skipped. `prefetch_depth` cannot be combined with `unroll` or
-`unroll_full`.
+pipelined one. Loads, stores and atomics of iterations past the trip count are
+skipped (each sits under a branch in the loop's prologue and epilogue), so the
+pipelined loop never reads or writes memory the plain loop wouldn't. An address
+carried from one iteration to the next (a pointer bumped after its load) works.
+`prefetch_depth` cannot be combined with `unroll` or `unroll_full`.
 
 **Contract.** Loads move ahead of the stores of earlier iterations, so a load
 must not read what an earlier iteration of the same loop stored (a recurrence
@@ -322,13 +323,17 @@ a load that follows a possible store in the body keeps the loop as it is.
 
 **Loops left unchanged.** The loop is compiled as plain `range`, with a
 `UserWarning` naming the reason (`loop not pipelined (prefetch_depth=8): ...`),
-when it contains a barrier, a global-to-LDS copy, a print or an assert, a load
-after a possible store in the same iteration, or no load at the top level of the
-body. The warning points at the loop's source line when
+when it contains a barrier, a copy into or out of LDS or an asynchronous copy, a
+print or an assert, a load after a possible store in the same iteration, no load
+at the top level of the body, a load whose address comes from a side effect (an
+atomic's result), or a loaded value of a type other than an integer, float,
+vector, index or pointer. The warning points at the loop's source line when
 `FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1`, and only appears when the kernel is actually
 compiled (not on a JIT cache hit). Shuffles, ballots and other lane-exchange ops
-are supported; when the loop bounds may differ across lanes (a grid-stride loop
-starting at the lane id), the compiler adds one wave reduction before the loop.
+are supported; unless the compiler can prove the loop bounds are the same in
+every lane (kernel arguments, constants and block ids, through arithmetic), it
+adds one wave reduction before the loop, as for a grid-stride loop starting at
+the lane id.
 
 **When it pays off.** Each lane must run many more iterations than N, and the
 loop must be waiting on its loads. A loop that runs only a few iterations per
