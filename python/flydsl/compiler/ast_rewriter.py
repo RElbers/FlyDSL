@@ -1021,8 +1021,8 @@ class InsertEmptyYieldForSCFFor(Transformer):
     def _apply_loop_prefetch(for_op, prefetch_depth, unroll, unroll_full, assume_independent):
         """Mark an ``scf.for`` for the ``fly-rocdl-prefetch-loops`` pass.
 
-        ``prefetch_depth=N`` asks for N loads per lane to be in flight at once,
-        overlapping the compute on the previous N. The pass unrolls the loop itself, so
+        ``prefetch_depth=N`` asks for up to N loads per lane to be in flight at once.
+        The pass unrolls the loop itself, so
         it cannot be combined with ``unroll`` / ``unroll_full``. A loop that may
         write memory is left unchanged unless ``prefetch_assume_independent=True``
         asserts that no iteration reads memory an earlier iteration wrote: the
@@ -1041,13 +1041,21 @@ class InsertEmptyYieldForSCFFor(Transformer):
             raise TypeError(
                 f"for-loop `prefetch_depth` must be a Python int constant, got {type(prefetch_depth).__name__}"
             )
-        if not 1 <= prefetch_depth <= 64:
-            raise ValueError(f"for-loop `prefetch_depth` must be between 1 and 64, got {prefetch_depth}")
+        if not 1 <= prefetch_depth <= 32:
+            raise ValueError(f"for-loop `prefetch_depth` must be between 1 and 32, got {prefetch_depth}")
         if unroll != -1 or unroll_full:
             raise ValueError("for-loop `prefetch_depth` and `unroll` / `unroll_full` are mutually exclusive")
         for_op.attributes["fly.prefetch_depth"] = ir.IntegerAttr.get(ir.IntegerType.get_signless(64), prefetch_depth)
         if assume_independent:
             for_op.attributes["fly.prefetch_assume_independent"] = ir.UnitAttr.get()
+        # Without debug info the IR loses its source locations before the pass runs, so record the
+        # loop's line for the remark that says why the loop was left unchanged.
+        from .diagnostics import location_chain
+
+        frames = location_chain(for_op.location)
+        if frames:
+            where = f"{frames[0].filename}:{frames[0].line}:{frames[0].col}"
+            for_op.attributes["fly.prefetch_loc"] = ir.StringAttr.get(where)
 
     @staticmethod
     def scf_range(

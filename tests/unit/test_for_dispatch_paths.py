@@ -435,7 +435,7 @@ def test_for_dispatch_prefetch_depth_with_unroll_rejected(kwargs):
         _for_dispatch_ir(prefetch_depth=4, **kwargs)
 
 
-@pytest.mark.parametrize("depth", [0, -1, 65])
+@pytest.mark.parametrize("depth", [0, -1, 33])
 def test_for_dispatch_prefetch_depth_out_of_range_rejected(depth):
     with pytest.raises(ValueError, match="prefetch_depth"):
         _for_dispatch_ir(prefetch_depth=depth)
@@ -530,7 +530,7 @@ module attributes {{gpu.container_module}} {{
         %v = llvm.load %p : !llvm.ptr<1> -> f32
         {extra}
         llvm.store %v, %p : f32, !llvm.ptr<1>
-      }} {{fly.prefetch_depth = 4 : i64{attrs}}} loc("user_kernel.py":12:8)
+      }} {{fly.prefetch_depth = 4 : i64{attrs}}} {loc}
       gpu.return
     }}
   }}
@@ -538,7 +538,7 @@ module attributes {{gpu.container_module}} {{
 """
 
 
-def _run_prefetch_pass(extra, attrs=", fly.prefetch_assume_independent"):
+def _run_prefetch_pass(extra, attrs=", fly.prefetch_assume_independent", loc='loc("user_kernel.py":12:8)'):
     import warnings
 
     from flydsl._mlir.passmanager import PassManager
@@ -546,7 +546,7 @@ def _run_prefetch_pass(extra, attrs=", fly.prefetch_assume_independent"):
 
     with Context() as ctx, warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        module = Module.parse(_MARKED_LOOP.format(extra=extra, attrs=attrs))
+        module = Module.parse(_MARKED_LOOP.format(extra=extra, attrs=attrs, loc=loc))
         with dsl_ir_diagnostics(ctx):
             PassManager.parse("builtin.module(gpu.module(fly-rocdl-prefetch-loops))").run(module.operation)
     return caught
@@ -557,8 +557,18 @@ def _run_prefetch_pass(extra, attrs=", fly.prefetch_assume_independent"):
 def test_prefetch_loop_left_unchanged_warns_at_user_line():
     caught = _run_prefetch_pass("gpu.barrier")
     assert len(caught) == 1
-    assert str(caught[0].message) == "loop not pipelined (prefetch_depth=4): it contains a barrier"
+    assert str(caught[0].message) == "loop not pipelined (prefetch_depth=4): it contains a barrier (in k)"
     assert (caught[0].filename, caught[0].lineno) == ("user_kernel.py", 12)
+
+
+@pytest.mark.l1b_target_dialect
+@pytest.mark.rocm_lower
+def test_prefetch_loop_warns_at_recorded_line_without_debug_info():
+    # Without debug info the loop's location points into re-parsed IR text; the frontend records the
+    # user's line in fly.prefetch_loc, and the remark uses it.
+    caught = _run_prefetch_pass("gpu.barrier", attrs=', fly.prefetch_loc = "user_kernel.py:21:4"', loc="")
+    assert len(caught) == 1
+    assert (caught[0].filename, caught[0].lineno) == ("user_kernel.py", 21)
 
 
 @pytest.mark.l1b_target_dialect

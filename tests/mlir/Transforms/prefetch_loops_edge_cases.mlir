@@ -582,13 +582,13 @@ gpu.module @prefetch_edges {
     %c0 = arith.constant 0 : i32
     %c1 = arith.constant 1 : i32
     %f0 = arith.constant 0.0 : f32
-    // expected-remark @below {{loop not pipelined (prefetch_depth=65): the depth must be between 1 and 64}}
+    // expected-remark @below {{loop not pipelined (prefetch_depth=33): the depth must be between 1 and 32}}
     %r = scf.for %i = %c0 to %n step %c1 iter_args(%acc = %f0) -> f32 : i32 {
       %p = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
       %v = llvm.load %p : !llvm.ptr<1> -> f32
       %s = arith.addf %acc, %v : f32
       scf.yield %s : f32
-    } {fly.prefetch_depth = 65 : i64}
+    } {fly.prefetch_depth = 33 : i64}
     llvm.store %r, %out : f32, !llvm.ptr<1>
     gpu.return
   }
@@ -635,6 +635,94 @@ gpu.module @prefetch_edges {
       %p = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
       %v = llvm.load %p : !llvm.ptr<1> -> f32
       %s = arith.addf %acc, %v : f32
+      scf.yield %s : f32
+    } {fly.prefetch_depth = 4 : i64}
+    llvm.store %r, %out : f32, !llvm.ptr<1>
+    gpu.return
+  }
+
+  // An explicit wait on a memory counter would also wait for the prefetched loads, so the loop is
+  // left unchanged even with the flag, and the remark names the wait and the kernel.
+  // CHECK-LABEL: gpu.func @counter_wait
+  // CHECK: scf.for
+  // CHECK-NEXT: llvm.getelementptr
+  // CHECK-NEXT: llvm.load
+  // CHECK-NEXT: rocdl.s.waitcnt
+  gpu.func @counter_wait(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %f0 = arith.constant 0.0 : f32
+    // expected-remark @below {{loop not pipelined (prefetch_depth=4): it waits on a memory counter (rocdl.s.waitcnt), which would also wait for the prefetched loads (in counter_wait)}}
+    %r = scf.for %i = %c0 to %n step %c1 iter_args(%a = %f0) -> f32 : i32 {
+      %p = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      %v = llvm.load %p : !llvm.ptr<1> -> f32
+      rocdl.s.waitcnt 0
+      %s = arith.addf %a, %v : f32
+      scf.yield %s : f32
+    } {fly.prefetch_assume_independent, fly.prefetch_depth = 4 : i64}
+    llvm.store %r, %out : f32, !llvm.ptr<1>
+    gpu.return
+  }
+
+  // CHECK-LABEL: gpu.func @counter_wait_asm
+  // CHECK: scf.for
+  // CHECK-NEXT: llvm.getelementptr
+  gpu.func @counter_wait_asm(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %f0 = arith.constant 0.0 : f32
+    // expected-remark @below {{it waits on a memory counter (llvm.inline_asm)}}
+    %r = scf.for %i = %c0 to %n step %c1 iter_args(%a = %f0) -> f32 : i32 {
+      %p = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      %v = llvm.load %p : !llvm.ptr<1> -> f32
+      llvm.inline_asm has_side_effects "s_waitcnt vmcnt(0)", "" : () -> ()
+      %s = arith.addf %a, %v : f32
+      scf.yield %s : f32
+    } {fly.prefetch_assume_independent, fly.prefetch_depth = 4 : i64}
+    llvm.store %r, %out : f32, !llvm.ptr<1>
+    gpu.return
+  }
+
+  // gpu.subgroup_id is lane-local (and wave-uniform), so it doesn't force the wave split.
+  // CHECK-LABEL: gpu.func @subgroup_id_lane_local
+  // CHECK-NOT: wave.reduce
+  // CHECK: scf.for
+  // CHECK: gpu.return
+  gpu.func @subgroup_id_lane_local(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
+    %tid = gpu.thread_id x
+    %lb = arith.index_cast %tid : index to i32
+    %c64 = arith.constant 64 : i32
+    %f0 = arith.constant 0.0 : f32
+    %r = scf.for %i = %lb to %n step %c64 iter_args(%a = %f0) -> f32 : i32 {
+      %p = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      %v = llvm.load %p : !llvm.ptr<1> -> f32
+      %w = gpu.subgroup_id : index
+      %wi = arith.index_cast %w : index to i32
+      %wf = arith.sitofp %wi : i32 to f32
+      %s = arith.addf %a, %v : f32
+      %t = arith.addf %s, %wf : f32
+      scf.yield %t : f32
+    } {fly.prefetch_depth = 4 : i64}
+    llvm.store %r, %out : f32, !llvm.ptr<1>
+    gpu.return
+  }
+
+  // An op the classification tables don't know (here gpu.subgroup_reduce) counts as a lane exchange,
+  // so lane-dependent bounds get the wave split.
+  // CHECK-LABEL: gpu.func @unknown_op_is_lane_exchange
+  // CHECK: llvm.call_intrinsic "llvm.amdgcn.wave.reduce.umin"
+  // CHECK: scf.for
+  // CHECK: gpu.subgroup_reduce
+  gpu.func @unknown_op_is_lane_exchange(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
+    %tid = gpu.thread_id x
+    %lb = arith.index_cast %tid : index to i32
+    %c64 = arith.constant 64 : i32
+    %f0 = arith.constant 0.0 : f32
+    %r = scf.for %i = %lb to %n step %c64 iter_args(%a = %f0) -> f32 : i32 {
+      %p = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      %v = llvm.load %p : !llvm.ptr<1> -> f32
+      %m = gpu.subgroup_reduce add %v : (f32) -> f32
+      %s = arith.addf %a, %m : f32
       scf.yield %s : f32
     } {fly.prefetch_depth = 4 : i64}
     llvm.store %r, %out : f32, !llvm.ptr<1>

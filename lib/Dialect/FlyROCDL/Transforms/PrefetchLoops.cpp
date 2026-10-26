@@ -2,16 +2,16 @@
 // Copyright (c) 2026 FlyDSL Project Contributors
 //
 // Software-pipeline the `scf.for` loops that carry `fly.prefetch_depth = N` (set by
-// `range(..., prefetch_depth=N)`) so N loads per lane are in flight at once. Run inside
+// `range(..., prefetch_depth=N)`) so up to N loads per lane are in flight at once. Run inside
 // gpu.module() AFTER convert-fly-to-rocdl, while the loads are ROCDL ops and the loop is still an
 // scf.for.
 //
 // A rolled runtime-trip loop otherwise waits for each iteration's single load before the next one
 // issues. The pass unrolls the loop by N and then pipelines it in two stages: loads plus their
 // address math first, everything else one iteration later. Each steady-state iteration issues the
-// N loads of the next group together and computes on the previous group while they are in flight.
-// It still waits for them before its backedge, since the loaded values are carried into the next
-// iteration in registers.
+// N loads of the next group together, ahead of the previous group's compute; how much of that
+// compute they overlap is up to register allocation. The loop still waits for them before its
+// backedge, since the loaded values are carried into the next iteration in registers.
 // In the prologue and epilogue of a runtime trip count, `predicateOp` guards reads and side effects
 // so they only run for in-range iterations. Loads move ahead of earlier iterations' writes, so a
 // loop that may write memory is only pipelined when `fly.prefetch_assume_independent` (set by
@@ -53,12 +53,32 @@ constexpr StringLiteral kAssumeIndependentAttr = "fly.prefetch_assume_independen
 // Loads lead their use by one iteration; depth comes from the unroll factor, not from more stages.
 constexpr unsigned kNumStages = 2;
 
-// Unrolling by more grows the IR and the registers without hiding more latency; loads spill
-// registers well before this depth.
-constexpr int64_t kMaxDepth = 64;
+// Unrolling by more grows the IR and the registers without hiding more latency: vec4 bodies already
+// need ~265 VGPRs at 32 and spill at 64 on gfx950.
+constexpr int64_t kMaxDepth = 32;
+// Set by the frontend to the loop's "file:line:col", for remarks when the IR has no source
+// locations (FlyDSL compiles without debug info by default).
+constexpr StringLiteral kSourceLocAttr = "fly.prefetch_loc";
 
 // The AMDGPU private (scratch) address space.
 constexpr unsigned kPrivateAddressSpace = 5;
+
+// -------------------------------------------------------------------------------------------------
+// Op classification. Every decision the pass makes from an op's name is here: ROCDL intrinsics
+// carry almost no traits (barriers and waits declare no memory effects, MFMA declares none at all),
+// so a name is often the only information. Where a wrong answer would miscompile, an op the tables
+// don't know gets the safe answer: it may write memory, and it may exchange values across lanes.
+
+// Whether the op's name, or an intrinsic call's intrinsic, starts with one of `prefixes` after
+// `rocdl.` or `llvm.amdgcn.`.
+bool hasAmdgpuName(Operation *op, ArrayRef<StringRef> prefixes) {
+  StringRef n = op->getName().getStringRef();
+  if (auto intrinsic = dyn_cast<LLVM::CallIntrinsicOp>(op))
+    n = intrinsic.getIntrin();
+  if (!n.consume_front("rocdl.") && !n.consume_front("llvm.amdgcn."))
+    return false;
+  return llvm::any_of(prefixes, [&](StringRef prefix) { return n.starts_with(prefix); });
+}
 
 // A memory read whose issue we want to lead the compute (stage 0). An atomic or volatile load
 // keeps its place.
@@ -71,30 +91,111 @@ bool isPipelineableRead(Operation *op) {
   return n.contains("buffer.load") || n.contains("global.load") || n.contains("ds.read");
 }
 
+// An instruction-scheduling hint (rocdl.sched.barrier, rocdl.sched.group.barrier): it neither
+// synchronizes nor touches memory.
+bool isSchedulingHint(Operation *op) {
+  return op->getName().getStringRef().starts_with("rocdl.sched.");
+}
+
+bool isBarrier(Operation *op) {
+  return op->getName().getStringRef().contains("barrier") && !isSchedulingHint(op);
+}
+
+// A wait on a memory counter (s_waitcnt, s_wait_loadcnt, ...), or inline asm containing one. In a
+// pipelined loop it would wait for the prefetched loads too, so none would stay in flight.
+bool isCounterWait(Operation *op) {
+  if (auto inlineAsm = dyn_cast<LLVM::InlineAsmOp>(op))
+    return inlineAsm.getAsmString().contains("s_wait");
+  return hasAmdgpuName(op, {"s.waitcnt", "s.wait."});
+}
+
+// A copy into or out of LDS issued by the memory unit, or an asynchronous copy whose completion is
+// tied to a separate wait. Pipelining would move it relative to the reads of the same buffer and
+// to its wait.
+bool isLdsOrAsyncCopy(Operation *op) {
+  StringRef n = op->getName().getStringRef();
+  return (n.contains("lds") && (n.contains("load") || n.contains("store"))) ||
+         n.contains("async") || n.contains("tensor.load") || n.contains("tensor.store");
+}
+
+bool isPrintOrAssert(Operation *op) {
+  StringRef n = op->getName().getStringRef();
+  return n.contains("print") || n.contains("assert");
+}
+
+// ROCDL ops and AMDGPU intrinsic calls for matrix, dot, conversion and lane operations, and
+// scheduling hints, declare no memory effects, but none of them accesses memory.
+bool isKnownNonMemoryOp(Operation *op) {
+  return isSchedulingHint(op) ||
+         hasAmdgpuName(op,
+                       {"mfma.",       "smfmac.",    "wmma.",         "swmmac.",     "sdot",
+                        "udot",        "sudot",      "fdot",          "dot4.",       "cvt.",
+                        "mbcnt.",      "readlane",   "readfirstlane", "permlane",    "ds_bpermute",
+                        "ds.bpermute", "ds_swizzle", "ds.swizzle",    "update.dpp",  "mov.dpp",
+                        "ballot",      "icmp",       "fcmp",          "wave.reduce."});
+}
+
 // A matrix op (MFMA, WMMA, SMFMAC) or a transposed load: each lane's result is built from the
 // registers or addresses of other lanes.
-bool isMatrixOrTransposeOp(StringRef n) {
+bool isMatrixOrTransposeOp(Operation *op) {
+  StringRef n = op->getName().getStringRef();
   return n.contains("mfma") || n.contains("wmma") || n.contains("smfmac") ||
          n.contains("load.tr") || n.contains("read.tr");
 }
 
-// An op whose result depends on the values or the set of active lanes of the wave (shuffles,
-// ballots, lane reads, DPP). Unrolling splits the iterations between the main loop and a serial
-// remainder loop, so when lanes have different trip counts, lanes run the same iteration at
-// different times and such an op sees a different set of active lanes than in the original loop.
-// Calls, inline asm and AMDGPU intrinsic calls are opaque (a callee or an `llvm.amdgcn.icmp` can
-// exchange values across lanes), so they count as lane exchanges.
-bool isLaneExchangeOp(Operation *op) {
-  if (isa<LLVM::CallOp, LLVM::InlineAsmOp>(op))
-    return true;
-  if (auto intrinsic = dyn_cast<LLVM::CallIntrinsicOp>(op))
-    return intrinsic.getIntrin().starts_with("llvm.amdgcn.");
+// An op known to give each lane a result from that lane's own operands, independent of the other
+// lanes and of which lanes are active.
+bool isLaneLocal(Operation *op) {
+  if (isMatrixOrTransposeOp(op))
+    return false;
+  StringRef dialect = op->getDialect() ? op->getDialect()->getNamespace() : "";
   StringRef n = op->getName().getStringRef();
-  return n.contains("shuffle") || n.contains("ballot") || n.contains("bpermute") ||
-         n.contains("permlane") || n.contains("readlane") || n.contains("readfirstlane") ||
-         n.contains("dpp") || n.contains("ds_swizzle") || n.contains("subgroup") ||
-         isMatrixOrTransposeOp(n);
+  if (llvm::is_contained(
+          {"arith", "builtin", "cf", "index", "math", "memref", "scf", "ub", "vector"}, dialect))
+    return true;
+  if (dialect == "llvm") {
+    if (auto intrinsic = dyn_cast<LLVM::CallIntrinsicOp>(op))
+      return !intrinsic.getIntrin().starts_with("llvm.amdgcn.");
+    return !isa<LLVM::CallOp, LLVM::InlineAsmOp>(op);
+  }
+  if (dialect == "gpu")
+    return llvm::is_contained({"gpu.thread_id", "gpu.lane_id", "gpu.block_id", "gpu.block_dim",
+                               "gpu.grid_dim", "gpu.global_id", "gpu.cluster_id", "gpu.cluster_dim",
+                               "gpu.cluster_block_id", "gpu.subgroup_id", "gpu.num_subgroups",
+                               "gpu.subgroup_size"},
+                              n);
+  if (dialect == "rocdl")
+    return hasAmdgpuName(op, {"raw.ptr.buffer.",
+                              "raw.buffer.",
+                              "struct.ptr.buffer.",
+                              "struct.buffer.",
+                              "global.",
+                              "ds.read",
+                              "ds.write",
+                              "make.buffer.rsrc",
+                              "cvt.",
+                              "sdot",
+                              "udot",
+                              "sudot",
+                              "fdot",
+                              "dot4.",
+                              "mbcnt.",
+                              "workitem.",
+                              "workgroup.",
+                              "grid.",
+                              "sched.",
+                              "s.sleep",
+                              "s.setprio"});
+  return false;
 }
+
+// An op whose result may depend on other lanes' values or on which lanes are active: everything
+// `isLaneLocal` doesn't know, which covers shuffles, ballots, lane reads, DPP, matrix ops,
+// transposed loads, calls, inline asm and AMDGPU intrinsic calls. Unrolling splits the iterations
+// between the main loop and a serial remainder loop, so when lanes have different trip counts,
+// lanes run the same iteration at different times and such an op sees a different set of active
+// lanes than in the original loop. Treating an unknown op as one only costs a wave reduction.
+bool isLaneExchangeOp(Operation *op) { return !isLaneLocal(op); }
 
 // An operand-free op whose value is the same in every lane of a wave.
 bool isUniformSource(Operation *op) {
@@ -121,6 +222,9 @@ bool propagatesUniformity(Operation *op) {
     return n.contains("make.buffer.rsrc") || n.contains("buffer.load");
   return n == "builtin.unrealized_conversion_cast";
 }
+
+// End of op classification.
+// -------------------------------------------------------------------------------------------------
 
 // Whether every lane of a wave holds the same value of `v`. Conservative: false when unsure. Kernel
 // arguments, constants and block-level ids are uniform; so is a pure or read-only op from
@@ -169,29 +273,6 @@ bool hasLaneExchangeOp(scf::ForOp forOp) {
     return isLaneExchangeOp(op) ? WalkResult::interrupt() : WalkResult::advance();
   });
   return result.wasInterrupted();
-}
-
-// An instruction-scheduling hint (rocdl.sched.barrier, rocdl.sched.group.barrier): it neither
-// synchronizes nor touches memory.
-bool isSchedulingHint(StringRef n) { return n.starts_with("rocdl.sched."); }
-
-// ROCDL ops and AMDGPU intrinsic calls for matrix, dot, conversion and lane operations, and
-// scheduling hints, declare no memory effects, but none of them accesses memory.
-bool isKnownNonMemoryOp(Operation *op) {
-  StringRef n = op->getName().getStringRef();
-  if (isSchedulingHint(n))
-    return true;
-  if (auto intrinsic = dyn_cast<LLVM::CallIntrinsicOp>(op))
-    n = intrinsic.getIntrin();
-  if (!n.consume_front("rocdl.") && !n.consume_front("llvm.amdgcn."))
-    return false;
-  return llvm::any_of(
-      ArrayRef<StringRef>{
-          "mfma.",         "smfmac.",  "wmma.",       "swmmac.",     "sdot",       "udot",
-          "sudot",         "fdot",     "dot4.",       "cvt.",        "mbcnt.",     "readlane",
-          "readfirstlane", "permlane", "ds_bpermute", "ds.bpermute", "ds_swizzle", "ds.swizzle",
-          "update.dpp",    "mov.dpp",  "ballot",      "icmp",        "fcmp",       "wave.reduce."},
-      [&](StringRef prefix) { return n.starts_with(prefix); });
 }
 
 // A leaf op that may write memory: a write effect, or no effect information at all.
@@ -605,14 +686,6 @@ void mergeGuards(RewriterBase &rewriter, ArrayRef<scf::IfOp> guards) {
   }
 }
 
-// A copy into or out of LDS issued by the memory unit, or an asynchronous copy whose completion is
-// tied to a separate wait. Pipelining would move it relative to the reads of the same buffer and
-// to its wait.
-bool isAsyncOrLdsCopy(StringRef n) {
-  return (n.contains("lds") && (n.contains("load") || n.contains("store"))) ||
-         n.contains("async") || n.contains("tensor.load") || n.contains("tensor.store");
-}
-
 // Whether a stage-0 op (a load or its address math) uses a value the last stage computes, in the
 // same iteration or through a loop-carried value: it would run before that value exists. Upstream
 // rejects such a schedule with an error diagnostic, so check it before changing the loop.
@@ -658,14 +731,17 @@ bool readsLateValue(scf::ForOp forOp) {
 // may hold a register array the compiler could not keep in registers, which the user can't see, so
 // it is rejected either way.
 std::string whyNotPipelineable(scf::ForOp forOp, bool assumeIndependent) {
-  StringRef reason;
+  std::string reason;
   forOp.getBody()->walk([&](Operation *op) {
-    StringRef n = op->getName().getStringRef();
-    if (n.contains("barrier") && !isSchedulingHint(n))
+    if (isBarrier(op))
       reason = "it contains a barrier";
-    else if (isAsyncOrLdsCopy(n))
+    else if (isCounterWait(op))
+      reason = ("it waits on a memory counter (" + op->getName().getStringRef() +
+                "), which would also wait for the prefetched loads")
+                   .str();
+    else if (isLdsOrAsyncCopy(op))
       reason = "it contains a copy into or out of LDS, or an asynchronous copy";
-    else if (n.contains("print") || n.contains("assert"))
+    else if (isPrintOrAssert(op))
       reason = "it contains a print or an assert";
     else if (isOrderedOrVolatile(op))
       reason = "it contains a fence, a volatile access or an atomic with acquire or stronger "
@@ -676,7 +752,7 @@ std::string whyNotPipelineable(scf::ForOp forOp, bool assumeIndependent) {
     return reason.empty() ? WalkResult::advance() : WalkResult::interrupt();
   });
   if (!reason.empty())
-    return reason.str();
+    return reason;
   Block *body = forOp.getBody();
   if (llvm::none_of(body->without_terminator(),
                     [](Operation &op) { return isPipelineableRead(&op); }))
@@ -710,6 +786,29 @@ std::string whyNotPipelineable(scf::ForOp forOp, bool assumeIndependent) {
   return {};
 }
 
+// Where a remark about `forOp` goes: the "file:line:col" the frontend recorded on the loop, or the
+// loop's own location. The recorded line wins because without debug info the loop's location points
+// into FlyDSL's re-parsed IR text rather than the user's source.
+Location getRemarkLoc(scf::ForOp forOp) {
+  auto recorded = forOp->getAttrOfType<StringAttr>(kSourceLocAttr);
+  if (!recorded)
+    return forOp.getLoc();
+  auto [rest, col] = recorded.getValue().rsplit(':');
+  auto [file, line] = rest.rsplit(':');
+  unsigned lineNo = 0, colNo = 0;
+  if (file.empty() || line.getAsInteger(10, lineNo) || col.getAsInteger(10, colNo))
+    return forOp.getLoc();
+  return FileLineColLoc::get(forOp.getContext(), file, lineNo, colNo);
+}
+
+// The name of the function (the kernel) containing `op`, or an empty string.
+std::string getEnclosingSymbolName(Operation *op) {
+  for (Operation *parent = op->getParentOp(); parent; parent = parent->getParentOp())
+    if (auto name = parent->getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName()))
+      return name.str();
+  return "";
+}
+
 class FlyROCDLPrefetchLoopsPass
     : public mlir::fly_rocdl::impl::FlyROCDLPrefetchLoopsPassBase<FlyROCDLPrefetchLoopsPass> {
 public:
@@ -728,9 +827,15 @@ public:
       forOp->removeAttr(kPrefetchDepthAttr);
       bool assumeIndependent = forOp->hasAttr(kAssumeIndependentAttr);
       forOp->removeAttr(kAssumeIndependentAttr);
-      // The loop was marked explicitly, so say why it stays as it is.
-      auto notPipelined = [&, depth = depth](scf::ForOp loop, StringRef why) {
-        loop.emitRemark() << "loop not pipelined (prefetch_depth=" << depth << "): " << why;
+      Location remarkLoc = getRemarkLoc(forOp);
+      forOp->removeAttr(kSourceLocAttr);
+      std::string kernel = getEnclosingSymbolName(forOp);
+      // The loop was marked explicitly, so say why it stays as it is, and where.
+      auto notPipelined = [&, depth = depth](scf::ForOp, StringRef why) {
+        InFlightDiagnostic remark = mlir::emitRemark(remarkLoc);
+        remark << "loop not pipelined (prefetch_depth=" << depth << "): " << why;
+        if (!kernel.empty())
+          remark << " (in " << kernel << ")";
       };
       if (depth < 1 || depth > kMaxDepth) {
         notPipelined(forOp, "the depth must be between 1 and " + std::to_string(kMaxDepth));
