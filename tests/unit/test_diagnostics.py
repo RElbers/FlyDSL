@@ -16,6 +16,7 @@ from unittest.mock import Mock
 import pytest
 
 import flydsl.compiler.diagnostics as diagnostics
+from flydsl._mlir import ir
 from flydsl.compiler.diagnostics import DiagRecord, DSLCompileError, SourceFrame, install_excepthook
 
 pytestmark = [pytest.mark.l0_backend_agnostic]
@@ -149,8 +150,6 @@ def test_excepthook_passes_through_non_dsl_errors(monkeypatch, capsys, fresh_exc
 # location_chain: MLIR locations -> source frames
 # --------------------------------------------------------------------------- #
 def test_location_chain_resolves_callsite_name_and_fused_locations():
-    from flydsl._mlir import ir
-
     with ir.Context():
         user = ir.Location.file("user_kernel.py", 7, 4)
         caller = ir.Location.file("caller.py", 3, 1)
@@ -164,64 +163,75 @@ def test_location_chain_resolves_callsite_name_and_fused_locations():
 
 @pytest.mark.parametrize("filename", ["-", "<string>"])
 def test_location_chain_skips_synthetic_sources(filename):
-    from flydsl._mlir import ir
-
     with ir.Context():
         # "-" is what IR re-parsed from text without debug info carries.
         assert diagnostics.location_chain(ir.Location.file(filename, 20, 1)) == []
         assert diagnostics.location_chain(ir.Location.unknown()) == []
 
 
-@pytest.mark.parametrize("severity", ["WARNING", "REMARK"])
-@pytest.mark.parametrize("has_source", [True, False])
-@pytest.mark.parametrize("action", ["always", "ignore", "error"])
-def test_ir_warnings_are_emitted_after_callback(severity, has_source, action):
-    from flydsl._mlir import ir
+def _report(severity, location):
+    """Pass a diagnostic to the handler dsl_ir_diagnostics attaches, as MLIR would."""
+    ctx = Mock()
+    with diagnostics.dsl_ir_diagnostics(ctx):
+        callback = ctx.attach_diagnostic_handler.call_args.args[0]
+        assert callback(SimpleNamespace(severity=severity, message="not pipelined", location=location))
 
+
+@pytest.mark.parametrize("severity", [ir.DiagnosticSeverity.WARNING, ir.DiagnosticSeverity.REMARK])
+def test_ir_warning_is_deferred_until_the_block_exits(severity):
     ctx = Mock()
     handler = ctx.attach_diagnostic_handler.return_value
     with ir.Context(), warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter(action)
-        location = ir.Location.file("user_kernel.py", 12, 8) if has_source else ir.Location.unknown()
-        diagnostic = SimpleNamespace(
-            severity=getattr(ir.DiagnosticSeverity, severity), message="not pipelined", location=location
-        )
-
-        def run():
-            with diagnostics.dsl_ir_diagnostics(ctx) as errors:
-                callback = ctx.attach_diagnostic_handler.call_args.args[0]
-                assert callback(diagnostic)
-                # Emission must wait until MLIR has returned, even under ordinary filters.
-                assert caught == []
-                assert errors == []
-                handler.detach.assert_not_called()
-
-        if action == "error":
-            with pytest.raises(UserWarning, match="not pipelined"):
-                run()
-        else:
-            run()
-
-        handler.detach.assert_called_once()
-        if action != "always":
+        warnings.simplefilter("always")
+        with diagnostics.dsl_ir_diagnostics(ctx) as errors:
+            callback = ctx.attach_diagnostic_handler.call_args.args[0]
+            location = ir.Location.file("user_kernel.py", 12, 8)
+            assert callback(SimpleNamespace(severity=severity, message="not pipelined", location=location))
             assert caught == []
-        else:
-            assert len(caught) == 1
-            assert caught[0].category is UserWarning
-            if has_source:
-                assert str(caught[0].message) == "not pipelined"
-                assert (caught[0].filename, caught[0].lineno) == ("user_kernel.py", 12)
-            else:
-                assert str(caught[0].message) == (
-                    "not pipelined (set FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1 to see the source line)"
+            assert errors == []
+            handler.detach.assert_not_called()
+    handler.detach.assert_called_once()
+    assert len(caught) == 1
+
+
+def test_ir_warning_points_at_the_source_line():
+    with ir.Context(), warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _report(ir.DiagnosticSeverity.REMARK, ir.Location.file("user_kernel.py", 12, 8))
+    assert len(caught) == 1
+    assert caught[0].category is UserWarning
+    assert str(caught[0].message) == "not pipelined"
+    assert (caught[0].filename, caught[0].lineno) == ("user_kernel.py", 12)
+
+
+def test_ir_warning_without_source_suggests_debug_info():
+    with ir.Context(), warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _report(ir.DiagnosticSeverity.REMARK, ir.Location.unknown())
+    assert len(caught) == 1
+    assert str(caught[0].message) == "not pipelined (set FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1 to see the source line)"
+    assert caught[0].filename == __file__
+
+
+def test_ir_warning_filtered_as_error_raises_after_detach():
+    # A warning raised inside the MLIR callback would be swallowed by the binding.
+    ctx = Mock()
+    handler = ctx.attach_diagnostic_handler.return_value
+    with ir.Context(), warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(UserWarning, match="not pipelined"):
+            with diagnostics.dsl_ir_diagnostics(ctx):
+                callback = ctx.attach_diagnostic_handler.call_args.args[0]
+                location = ir.Location.file("user_kernel.py", 12, 8)
+                assert callback(
+                    SimpleNamespace(severity=ir.DiagnosticSeverity.REMARK, message="not pipelined", location=location)
                 )
-                assert caught[0].filename == __file__
+                handler.detach.assert_not_called()
+    handler.detach.assert_called_once()
 
 
 @pytest.mark.parametrize("action", ["always", "error"])
 def test_ir_warning_does_not_replace_compile_error(action):
-    from flydsl._mlir import ir
-
     ctx = Mock()
     with ir.Context(), warnings.catch_warnings(record=True):
         warnings.simplefilter(action)
@@ -245,7 +255,6 @@ def test_ir_warning_does_not_replace_compile_error(action):
 @pytest.mark.l1b_target_dialect
 @pytest.mark.rocm_lower
 def test_mlir_pass_warning_as_error_propagates(capsys):
-    from flydsl._mlir import ir
     from flydsl._mlir.passmanager import PassManager
 
     text = """

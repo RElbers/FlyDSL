@@ -89,7 +89,7 @@ BODIES = {
 INIT = {"min": 1.0e30}
 
 
-def _launcher(body_name, depth, i32_bounds):
+def _body_launcher(body_name, depth, i32_bounds):
     body = BODIES[body_name]
     init = INIT.get(body_name, 0.0)
 
@@ -162,19 +162,30 @@ def _run(launch, n):
     ],
 )
 def test_prefetch_depth_matches_plain_range(body_name, i32_bounds, depth):
-    reference = _launcher(body_name, None, i32_bounds)
-    pipelined = _launcher(body_name, depth, i32_bounds)
+    reference = _body_launcher(body_name, None, i32_bounds)
+    pipelined = _body_launcher(body_name, depth, i32_bounds)
     for n in SIZES:
         want = _run(reference, n)
         got = _run(pipelined, n)
         assert all(torch.equal(a, b) for a, b in zip(got, want)), f"n={n}"
 
 
-def _launch_and_read(launch, *args, out_init=0.0):
+def _launch_and_read(launch, inp, *scalars, out_init=0.0):
     out = torch.full((BLK,), out_init, device="cuda")
-    launch(*args[:1], out, *args[1:], torch.cuda.current_stream())
+    launch(inp, out, *scalars, torch.cuda.current_stream())
     torch.cuda.synchronize()
     return out.cpu()
+
+
+def _compare_on_sizes(reference, pipelined, inp, sizes, out_len):
+    for n in sizes:
+        outs = []
+        for launch in (reference, pipelined):
+            out = torch.zeros(out_len, device="cuda")
+            launch(inp, out, n, torch.cuda.current_stream())
+            torch.cuda.synchronize()
+            outs.append(out.cpu())
+        assert torch.equal(*outs), f"n={n}"
 
 
 def _bounds_launcher(depth):
@@ -345,6 +356,7 @@ def test_prefetch_depth_loop_shapes(make_launcher, sizes, depth):
 
 
 def _scatter_launcher(depth):
+    # The flag requires prefetch_depth, so the plain-range reference goes without it.
     assume = depth is not None
 
     @flyc.kernel(known_block_size=[BLK, 1, 1])
@@ -367,14 +379,7 @@ def test_prefetch_depth_assume_independent_scatter(depth):
     # A loop that stores is only pipelined with the flag; each iteration writes its own element.
     reference, pipelined = _scatter_launcher(None), _scatter_launcher(depth)
     inp = torch.rand(max(SIZES), device="cuda", generator=torch.Generator(device="cuda").manual_seed(0))
-    for n in SIZES:
-        outs = []
-        for launch in (reference, pipelined):
-            out = torch.zeros(max(SIZES), device="cuda")
-            launch(inp, out, n, torch.cuda.current_stream())
-            torch.cuda.synchronize()
-            outs.append(out.cpu())
-        assert torch.equal(*outs), f"n={n}"
+    _compare_on_sizes(reference, pipelined, inp, SIZES, max(SIZES))
 
 
 def _accumulate_in_memory_launcher(depth, assume):
@@ -426,7 +431,7 @@ def test_prefetch_depth_runs_in_the_compile_pipeline(body, depth, tmp_path, monk
     # loads and one in the remainder loop.
     inp = torch.rand(BLK * 8, device="cuda")
     if body == "sum":
-        launch = _launcher("sum", depth, i32_bounds=True)
+        launch = _body_launcher("sum", depth, i32_bounds=True)
         args = (inp, torch.zeros_like(inp), torch.zeros(BLK, device="cuda"), BLK * 8)
     else:
         launch = _scatter_launcher(depth)
@@ -466,14 +471,7 @@ def test_prefetch_depth_multi_wave(threads, blocks, depth):
     reference, pipelined = _multi_wave_launcher(None, threads, blocks), _multi_wave_launcher(depth, threads, blocks)
     inp = torch.rand(BLK * 512, device="cuda", generator=torch.Generator(device="cuda").manual_seed(0))
     total = threads * blocks
-    for n in (0, 5, total * 3 + 77, total * 9 + total // 2):
-        outs = []
-        for launch in (reference, pipelined):
-            out = torch.zeros(total, device="cuda")
-            launch(inp, out, n, torch.cuda.current_stream())
-            torch.cuda.synchronize()
-            outs.append(out.cpu())
-        assert torch.equal(*outs), f"n={n}"
+    _compare_on_sizes(reference, pipelined, inp, (0, 5, total * 3 + 77, total * 9 + total // 2), total)
 
 
 def _nested_launcher(depth):
@@ -554,17 +552,6 @@ def _mfma_launcher(depth, lane_bounds):
         k(inp, out, n).launch(grid=(1, 1, 1), block=(BLK, 1, 1), stream=stream)
 
     return launch
-
-
-def _compare_on_sizes(reference, pipelined, inp, sizes, out_len):
-    for n in sizes:
-        outs = []
-        for launch in (reference, pipelined):
-            out = torch.zeros(out_len, device="cuda")
-            launch(inp, out, n, torch.cuda.current_stream())
-            torch.cuda.synchronize()
-            outs.append(out.cpu())
-        assert torch.equal(*outs), f"n={n}"
 
 
 @pytest.mark.parametrize("depth", [1, 4])

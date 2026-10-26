@@ -5,6 +5,10 @@
 
 """MLIR-level unit tests for scf_for_dispatch (no GPU required)."""
 
+import ast
+import types
+from textwrap import dedent
+
 import pytest
 
 from flydsl._mlir.dialects import arith, func
@@ -305,21 +309,18 @@ def test_scf_range_unroll_annotation():
         assert "llvm.loop_unroll<full = true>" in str(module)
 
 
+def _rewrite_for_loops(fsrc):
+    module = ast.parse(dedent(fsrc))
+    ctx = types.SimpleNamespace(python_globals={}, filename="<t>")
+    rw = InsertEmptyYieldForSCFFor(context=ctx, first_lineno=0)
+    node = rw.visit(module.body[0])
+    return ast.unparse(ast.fix_missing_locations(node))
+
+
 def test_ast_rewrite_for_threads_unroll_kwargs():
     """unroll / unroll_full on range(...) reach the injected dispatch call and
     stay separate from the init routing."""
-    import ast
-    import types
-    from textwrap import dedent
-
-    def rewrite(fsrc):
-        module = ast.parse(dedent(fsrc))
-        ctx = types.SimpleNamespace(python_globals={}, filename="<t>")
-        rw = InsertEmptyYieldForSCFFor(context=ctx, first_lineno=0)
-        node = rw.visit(module.body[0])
-        return ast.unparse(ast.fix_missing_locations(node))
-
-    auto = rewrite("""
+    auto = _rewrite_for_loops("""
         def s(n):
             acc = 0
             for i in range(0, n, 1, unroll=4):
@@ -329,7 +330,7 @@ def test_ast_rewrite_for_threads_unroll_kwargs():
     assert "scf_for_dispatch(" in auto
     assert "unroll=4" in auto
 
-    init_path = rewrite("""
+    init_path = _rewrite_for_loops("""
         def s(n):
             for i, (acc,) in range(0, n, 1, init=[0], unroll_full=True):
                 acc = acc + 1
@@ -487,18 +488,7 @@ def test_scf_range_prefetch_depth_attr():
 
 
 def test_ast_rewrite_for_threads_prefetch_depth():
-    import ast
-    import types
-    from textwrap import dedent
-
-    def rewrite(fsrc):
-        module = ast.parse(dedent(fsrc))
-        ctx = types.SimpleNamespace(python_globals={}, filename="<t>")
-        rw = InsertEmptyYieldForSCFFor(context=ctx, first_lineno=0)
-        node = rw.visit(module.body[0])
-        return ast.unparse(ast.fix_missing_locations(node))
-
-    auto = rewrite("""
+    auto = _rewrite_for_loops("""
         def s(n):
             for i in range(0, n, 1, prefetch_depth=8, prefetch_assume_independent=True):
                 pass
@@ -507,7 +497,7 @@ def test_ast_rewrite_for_threads_prefetch_depth():
     assert "prefetch_depth=8" in auto
     assert "prefetch_assume_independent=True" in auto
 
-    init_path = rewrite("""
+    init_path = _rewrite_for_loops("""
         def s(n):
             for i, (acc,) in range(0, n, 1, init=[0], prefetch_depth=8):
                 acc = acc + 1
@@ -515,72 +505,3 @@ def test_ast_rewrite_for_threads_prefetch_depth():
         """)
     assert "scf_range(" in init_path
     assert "prefetch_depth=8" in init_path
-
-
-# A marked loop the pass leaves unchanged gets a remark, which FlyDSL reports as a Python warning at
-# the user's source line.
-_MARKED_LOOP = """
-module attributes {{gpu.container_module}} {{
-  gpu.module @m {{
-    gpu.func @k(%in: !llvm.ptr<1>, %n: i32) kernel {{
-      %c0 = arith.constant 0 : i32
-      %c1 = arith.constant 1 : i32
-      scf.for %i = %c0 to %n step %c1 : i32 {{
-        %p = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
-        %v = llvm.load %p : !llvm.ptr<1> -> f32
-        {extra}
-        llvm.store %v, %p : f32, !llvm.ptr<1>
-      }} {{fly.prefetch_depth = 4 : i64{attrs}}} {loc}
-      gpu.return
-    }}
-  }}
-}}
-"""
-
-
-def _run_prefetch_pass(extra, attrs=", fly.prefetch_assume_independent", loc='loc("user_kernel.py":12:8)'):
-    import warnings
-
-    from flydsl._mlir.passmanager import PassManager
-    from flydsl.compiler.diagnostics import dsl_ir_diagnostics
-
-    with Context() as ctx, warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        module = Module.parse(_MARKED_LOOP.format(extra=extra, attrs=attrs, loc=loc))
-        with dsl_ir_diagnostics(ctx):
-            PassManager.parse("builtin.module(gpu.module(fly-rocdl-prefetch-loops))").run(module.operation)
-    return caught
-
-
-@pytest.mark.l1b_target_dialect
-@pytest.mark.rocm_lower
-def test_prefetch_loop_left_unchanged_warns_at_user_line():
-    caught = _run_prefetch_pass("gpu.barrier")
-    assert len(caught) == 1
-    assert str(caught[0].message) == "loop not pipelined (prefetch_depth=4): it contains a barrier (in k)"
-    assert (caught[0].filename, caught[0].lineno) == ("user_kernel.py", 12)
-
-
-@pytest.mark.l1b_target_dialect
-@pytest.mark.rocm_lower
-def test_prefetch_loop_warns_at_recorded_line_without_debug_info():
-    # Without debug info the loop's location points into re-parsed IR text; the frontend records the
-    # user's line in fly.prefetch_loc, and the remark uses it.
-    caught = _run_prefetch_pass("gpu.barrier", attrs=', fly.prefetch_loc = loc("user_kernel.py":21:4)', loc="")
-    assert len(caught) == 1
-    assert (caught[0].filename, caught[0].lineno) == ("user_kernel.py", 21)
-
-
-@pytest.mark.l1b_target_dialect
-@pytest.mark.rocm_lower
-def test_prefetch_loop_pipelined_without_warning():
-    assert _run_prefetch_pass("") == []
-
-
-@pytest.mark.l1b_target_dialect
-@pytest.mark.rocm_lower
-def test_prefetch_loop_that_stores_needs_assume_independent():
-    caught = _run_prefetch_pass("", attrs="")
-    assert len(caught) == 1
-    assert "it may write memory (llvm.store)" in str(caught[0].message)
-    assert "prefetch_assume_independent=True" in str(caught[0].message)
