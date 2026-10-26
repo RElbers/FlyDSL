@@ -435,8 +435,8 @@ def test_for_dispatch_prefetch_depth_with_unroll_rejected(kwargs):
         _for_dispatch_ir(prefetch_depth=4, **kwargs)
 
 
-@pytest.mark.parametrize("depth", [0, -1])
-def test_for_dispatch_prefetch_depth_below_one_rejected(depth):
+@pytest.mark.parametrize("depth", [0, -1, 65])
+def test_for_dispatch_prefetch_depth_out_of_range_rejected(depth):
     with pytest.raises(ValueError, match="prefetch_depth"):
         _for_dispatch_ir(prefetch_depth=depth)
 

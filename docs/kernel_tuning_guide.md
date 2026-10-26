@@ -319,7 +319,8 @@ past the trip count are skipped under branches in the prologue and epilogue, so
 the pipelined loop never reads or writes memory the plain loop wouldn't. An
 address carried from one iteration to the next (a pointer bumped after its load)
 works.
-`prefetch_depth` cannot be combined with `unroll` or `unroll_full`.
+N must be between 1 and 64, and `prefetch_depth` cannot be combined with `unroll` or
+`unroll_full`.
 
 **Loops that write memory.** Loads move ahead of the writes of earlier
 iterations, so the transformation is only correct when no iteration reads

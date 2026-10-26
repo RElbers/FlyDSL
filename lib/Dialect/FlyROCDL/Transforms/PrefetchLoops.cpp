@@ -53,6 +53,10 @@ constexpr StringLiteral kAssumeIndependentAttr = "fly.prefetch_assume_independen
 // Loads lead their use by one iteration; depth comes from the unroll factor, not from more stages.
 constexpr unsigned kNumStages = 2;
 
+// Unrolling by more grows the IR and the registers without hiding more latency; loads spill
+// registers well before this depth.
+constexpr int64_t kMaxDepth = 64;
+
 // The AMDGPU private (scratch) address space.
 constexpr unsigned kPrivateAddressSpace = 5;
 
@@ -65,6 +69,13 @@ bool isPipelineableRead(Operation *op) {
     return true;
   StringRef n = op->getName().getStringRef();
   return n.contains("buffer.load") || n.contains("global.load") || n.contains("ds.read");
+}
+
+// A matrix op (MFMA, WMMA, SMFMAC) or a transposed load: each lane's result is built from the
+// registers or addresses of other lanes.
+bool isMatrixOrTransposeOp(StringRef n) {
+  return n.contains("mfma") || n.contains("wmma") || n.contains("smfmac") ||
+         n.contains("load.tr") || n.contains("read.tr");
 }
 
 // An op whose result depends on the values or the set of active lanes of the wave (shuffles,
@@ -81,7 +92,8 @@ bool isLaneExchangeOp(Operation *op) {
   StringRef n = op->getName().getStringRef();
   return n.contains("shuffle") || n.contains("ballot") || n.contains("bpermute") ||
          n.contains("permlane") || n.contains("readlane") || n.contains("readfirstlane") ||
-         n.contains("dpp") || n.contains("ds_swizzle") || n.contains("subgroup");
+         n.contains("dpp") || n.contains("ds_swizzle") || n.contains("subgroup") ||
+         isMatrixOrTransposeOp(n);
 }
 
 // An operand-free op whose value is the same in every lane of a wave.
@@ -121,7 +133,10 @@ bool isWaveUniform(Value v, DenseMap<Value, bool> &memo) {
   bool uniform = false;
   if (auto arg = dyn_cast<BlockArgument>(v)) {
     Operation *parent = arg.getOwner()->getParentOp();
-    if (parent->getName().getStringRef() == "gpu.func" && parent->hasAttr("kernel"))
+    // Matched by name rather than dyn_cast, as elsewhere in FlyROCDL, with both spellings that
+    // GPUFuncOp::isKernel accepts.
+    if (parent->getName().getStringRef() == "gpu.func" &&
+        (parent->hasAttr("kernel") || parent->hasAttr("gpu.kernel")))
       uniform = true;
     else if (auto forOp = dyn_cast<scf::ForOp>(parent); forOp && v == forOp.getInductionVar())
       uniform = isWaveUniform(forOp.getLowerBound(), memo) &&
@@ -156,10 +171,16 @@ bool hasLaneExchangeOp(scf::ForOp forOp) {
   return result.wasInterrupted();
 }
 
-// ROCDL ops and AMDGPU intrinsic calls for matrix, dot, conversion and lane operations declare no
-// memory effects, but none of them accesses memory.
+// An instruction-scheduling hint (rocdl.sched.barrier, rocdl.sched.group.barrier): it neither
+// synchronizes nor touches memory.
+bool isSchedulingHint(StringRef n) { return n.starts_with("rocdl.sched."); }
+
+// ROCDL ops and AMDGPU intrinsic calls for matrix, dot, conversion and lane operations, and
+// scheduling hints, declare no memory effects, but none of them accesses memory.
 bool isKnownNonMemoryOp(Operation *op) {
   StringRef n = op->getName().getStringRef();
+  if (isSchedulingHint(n))
+    return true;
   if (auto intrinsic = dyn_cast<LLVM::CallIntrinsicOp>(op))
     n = intrinsic.getIntrin();
   if (!n.consume_front("rocdl.") && !n.consume_front("llvm.amdgcn."))
@@ -540,7 +561,7 @@ std::string whyNotPipelineable(scf::ForOp forOp, bool assumeIndependent) {
   StringRef reason;
   forOp.getBody()->walk([&](Operation *op) {
     StringRef n = op->getName().getStringRef();
-    if (n.contains("barrier"))
+    if (n.contains("barrier") && !isSchedulingHint(n))
       reason = "it contains a barrier";
     else if (isAsyncOrLdsCopy(n))
       reason = "it contains a copy into or out of LDS, or an asynchronous copy";
@@ -611,8 +632,8 @@ public:
       auto notPipelined = [&, depth = depth](scf::ForOp loop, StringRef why) {
         loop.emitRemark() << "loop not pipelined (prefetch_depth=" << depth << "): " << why;
       };
-      if (depth < 1) {
-        notPipelined(forOp, "the depth must be at least 1");
+      if (depth < 1 || depth > kMaxDepth) {
+        notPipelined(forOp, "the depth must be between 1 and " + std::to_string(kMaxDepth));
         continue;
       }
       if (std::string why = whyNotPipelineable(forOp, assumeIndependent); !why.empty()) {
@@ -637,8 +658,8 @@ public:
       }
       // Unrolling and peeling split each lane's iterations at its own trip count; a lane-exchange
       // op needs that split to fall at the same iteration in every lane of the wave.
-      if (hasLaneExchangeOp(forOp) && !hasWaveUniformTripCount(forOp) &&
-          failed(splitAtWaveUniformTripCount(rewriter, forOp, depth))) {
+      bool split = hasLaneExchangeOp(forOp) && !hasWaveUniformTripCount(forOp);
+      if (split && failed(splitAtWaveUniformTripCount(rewriter, forOp, depth))) {
         notPipelined(forOp, "it exchanges values across lanes and compares its bounds unsigned, so "
                             "its trip count can't be split the same way in every lane");
         continue;
@@ -666,11 +687,13 @@ public:
         // The remainder loop stays serial. Keep a one-iteration main loop alive for the pipeliner.
         FailureOr<UnrolledLoopInfo> info = loopUnrollByFactor(
             forOp, depth, /*annotateFn=*/nullptr, /*shouldPromoteIfSingleIteration=*/false);
-        if (succeeded(info)) {
-          if (!info->mainLoopOp)
-            continue;
+        if (succeeded(info) && info->mainLoopOp) {
           target = *info->mainLoopOp;
           unrolled = true;
+          // The split already ends the main loop at a multiple of the depth, so the unroller's
+          // remainder loop never runs; the plain tail loop after it runs the rest.
+          if (split && info->epilogueLoopOp)
+            rewriter.replaceOp(*info->epilogueLoopOp, info->epilogueLoopOp->getInitArgs());
         }
       }
 

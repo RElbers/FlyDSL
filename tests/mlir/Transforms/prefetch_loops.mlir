@@ -21,7 +21,8 @@
 //   - a loop with a lane-exchange op (gpu.shuffle) is pipelined as is when its bounds are
 //     wave-uniform; when they depend on the lane, its main loop first ends at the wave's shortest
 //     trip count (wave.reduce.umin, as i32 for 32-bit bounds and i64 for index) and a plain tail
-//     loop runs each lane's remaining iterations; a lane id from rocdl.mbcnt counts as
+//     loop runs each lane's remaining iterations, with no unroller remainder loop before it (the
+//     main loop ends at a multiple of the depth); a lane id from rocdl.mbcnt counts as
 //     lane-dependent
 //   - a loop whose loads are all nested (here in an inner loop) is left unchanged, not unrolled
 //   - every marked loop left unchanged gets a remark saying why (checked by -verify-diagnostics)
@@ -76,7 +77,7 @@
 // CHECK-NEXT:      llvm.load
 // CHECK:      scf.for
 // CHECK:        gpu.shuffle
-// CHECK:      scf.for %{{.*}} = %{{.*}} to %[[CLAMPED]] step
+// CHECK-NOT:  to %[[CLAMPED]] step
 // CHECK:      scf.for %{{.*}} = %[[SPLIT]] to %arg2 step
 // CHECK-NEXT:   llvm.getelementptr
 // CHECK-NEXT:   llvm.load

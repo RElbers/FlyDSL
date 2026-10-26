@@ -484,4 +484,107 @@ gpu.module @prefetch_edges {
     } {fly.prefetch_assume_independent, fly.prefetch_depth = 4 : i64}
     gpu.return
   }
+
+  // A scheduling hint is neither a barrier nor a write, so a load-only loop with one is pipelined
+  // without the flag.
+  // CHECK-LABEL: gpu.func @sched_barrier_hint
+  // CHECK: scf.if {{.*}} -> (f32) {
+  // CHECK: scf.for
+  // CHECK: rocdl.sched.barrier
+  // CHECK: gpu.return
+  gpu.func @sched_barrier_hint(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %f0 = arith.constant 0.0 : f32
+    %r = scf.for %i = %c0 to %n step %c1 iter_args(%acc = %f0) -> f32 : i32 {
+      %p = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      %v = llvm.load %p : !llvm.ptr<1> -> f32
+      rocdl.sched.barrier none
+      %s = arith.addf %acc, %v : f32
+      scf.yield %s : f32
+    } {fly.prefetch_depth = 4 : i64}
+    llvm.store %r, %out : f32, !llvm.ptr<1>
+    gpu.return
+  }
+
+  // An MFMA combines the registers of all lanes, so lane-dependent bounds get the wave split.
+  // CHECK-LABEL: gpu.func @mfma_lane_dependent
+  // CHECK: llvm.call_intrinsic "llvm.amdgcn.wave.reduce.umin"
+  // CHECK: scf.for
+  // CHECK: rocdl.mfma.f32.16x16x16f16
+  // CHECK: gpu.return
+  gpu.func @mfma_lane_dependent(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
+    %c64 = arith.constant 64 : i32
+    %zero = arith.constant dense<0.0> : vector<4xf32>
+    %tid = gpu.thread_id x
+    %lane = arith.index_cast %tid : index to i32
+    %result = scf.for %i = %lane to %n step %c64 iter_args(%acc = %zero) -> vector<4xf32> : i32 {
+      %p = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, vector<4xf16>
+      %a = llvm.load %p : !llvm.ptr<1> -> vector<4xf16>
+      %d = rocdl.mfma.f32.16x16x16f16 %a, %a, %acc, 0, 0, none : (vector<4xf16>, vector<4xf16>, vector<4xf32>) -> vector<4xf32>
+      scf.yield %d : vector<4xf32>
+    } {fly.prefetch_depth = 4 : i64}
+    llvm.store %result, %out : vector<4xf32>, !llvm.ptr<1>
+    gpu.return
+  }
+
+  // A transposed load gathers data addressed by other lanes.
+  // CHECK-LABEL: gpu.func @transposed_load_lane_dependent
+  // CHECK: llvm.call_intrinsic "llvm.amdgcn.wave.reduce.umin"
+  // CHECK: scf.for
+  // CHECK: rocdl.global.load.tr4.b64
+  // CHECK: gpu.return
+  gpu.func @transposed_load_lane_dependent(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
+    %c64 = arith.constant 64 : i32
+    %zero = arith.constant dense<0> : vector<2xi32>
+    %tid = gpu.thread_id x
+    %lane = arith.index_cast %tid : index to i32
+    %result = scf.for %i = %lane to %n step %c64 iter_args(%acc = %zero) -> vector<2xi32> : i32 {
+      %p = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, vector<2xi32>
+      %v = rocdl.global.load.tr4.b64 %p : !llvm.ptr<1> -> vector<2xi32>
+      %s = arith.addi %acc, %v : vector<2xi32>
+      scf.yield %s : vector<2xi32>
+    } {fly.prefetch_depth = 4 : i64}
+    llvm.store %result, %out : vector<2xi32>, !llvm.ptr<1>
+    gpu.return
+  }
+
+  // Arguments of a function marked with the gpu.kernel attribute are wave-uniform too, so a shuffle
+  // loop over them needs no wave split.
+  // CHECK-LABEL: gpu.func @kernel_attribute_uniform
+  // CHECK-NOT: wave.reduce
+  // CHECK: scf.for
+  // CHECK: gpu.return
+  gpu.func @kernel_attribute_uniform(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %lo: i32, %hi: i32) attributes {gpu.kernel} {
+    %c1 = arith.constant 1 : i32
+    %c64 = arith.constant 64 : i32
+    %f0 = arith.constant 0.0 : f32
+    %r = scf.for %i = %lo to %hi step %c1 iter_args(%acc = %f0) -> f32 : i32 {
+      %p = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      %v = llvm.load %p : !llvm.ptr<1> -> f32
+      %sh, %valid = gpu.shuffle xor %v, %c1, %c64 : f32
+      %s = arith.addf %acc, %sh : f32
+      scf.yield %s : f32
+    } {fly.prefetch_depth = 4 : i64}
+    llvm.store %r, %out : f32, !llvm.ptr<1>
+    gpu.return
+  }
+
+  // CHECK-LABEL: gpu.func @too_deep
+  // CHECK: scf.for
+  // CHECK-NEXT: llvm.getelementptr
+  gpu.func @too_deep(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %f0 = arith.constant 0.0 : f32
+    // expected-remark @below {{loop not pipelined (prefetch_depth=65): the depth must be between 1 and 64}}
+    %r = scf.for %i = %c0 to %n step %c1 iter_args(%acc = %f0) -> f32 : i32 {
+      %p = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      %v = llvm.load %p : !llvm.ptr<1> -> f32
+      %s = arith.addf %acc, %v : f32
+      scf.yield %s : f32
+    } {fly.prefetch_depth = 65 : i64}
+    llvm.store %r, %out : f32, !llvm.ptr<1>
+    gpu.return
+  }
 }

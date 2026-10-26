@@ -1041,8 +1041,8 @@ class InsertEmptyYieldForSCFFor(Transformer):
             raise TypeError(
                 f"for-loop `prefetch_depth` must be a Python int constant, got {type(prefetch_depth).__name__}"
             )
-        if prefetch_depth < 1:
-            raise ValueError(f"for-loop `prefetch_depth` must be >= 1, got {prefetch_depth}")
+        if not 1 <= prefetch_depth <= 64:
+            raise ValueError(f"for-loop `prefetch_depth` must be between 1 and 64, got {prefetch_depth}")
         if unroll != -1 or unroll_full:
             raise ValueError("for-loop `prefetch_depth` and `unroll` / `unroll_full` are mutually exclusive")
         for_op.attributes["fly.prefetch_depth"] = ir.IntegerAttr.get(ir.IntegerType.get_signless(64), prefetch_depth)
