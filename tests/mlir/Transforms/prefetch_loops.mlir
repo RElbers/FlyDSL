@@ -7,15 +7,22 @@
 //   - a marked loop is unrolled by its depth and pipelined: guarded prologue loads, a steady
 //     state that issues the next group's loads before storing the current group, predicated
 //     epilogue stores, and a serial remainder loop for the runtime trip count
-//   - a raw load in the prologue only issues under scf.if, since it can fault past the trip count;
-//     a buffer load issues unguarded and its result is masked to zero
+//   - every load in the prologue only issues under scf.if, since it can fault past the trip count;
+//     that includes buffer loads, whose resource usually has no size limit
+//   - a load whose address is carried from the previous iteration is pipelined, with the address
+//     update moved ahead with it; a pointer loaded in the loop gets a null placeholder
+//   - a loop is left unchanged when a load's address comes from a side effect (an atomic), or when
+//     it copies into LDS
+//   - the upper bound is clamped to the lower bound before unrolling, so an empty range with ub < lb
+//     stays empty
 //   - a loop with a barrier or a print is left unchanged, and so is a loop that reads after a write
 //     in the same iteration (global or LDS), since the read would move ahead of the write; a read
 //     whose address comes from another read is still pipelined
 //   - a loop with a lane-exchange op (gpu.shuffle) is pipelined as is when its bounds are
 //     wave-uniform; when they depend on the lane, its main loop first ends at the wave's shortest
 //     trip count (wave.reduce.umin, as i32 for 32-bit bounds and i64 for index) and a plain tail
-//     loop runs each lane's remaining iterations
+//     loop runs each lane's remaining iterations; a lane id from rocdl.mbcnt counts as
+//     lane-dependent
 //   - a loop whose loads are all nested (here in an inner loop) is left unchanged, not unrolled
 //   - every marked loop left unchanged gets a remark saying why (checked by -verify-diagnostics)
 //   - the marker is consumed in every case; unmarked loops are untouched
@@ -35,9 +42,8 @@
 // CHECK: gpu.return
 
 // CHECK-LABEL: gpu.func @buffer_scatter
-// CHECK-NOT: scf.if
-// CHECK-COUNT-4: rocdl.raw.ptr.buffer.load
-// CHECK: arith.select
+// CHECK-COUNT-4: scf.if {{.*}} -> (f32) {
+// CHECK-NEXT:      rocdl.raw.ptr.buffer.load
 // CHECK: scf.for
 // CHECK: gpu.return
 
@@ -52,6 +58,7 @@
 // CHECK-NEXT: gpu.return
 
 // CHECK-LABEL: gpu.func @with_shuffle_uniform
+// CHECK-NOT: wave.reduce
 // CHECK-COUNT-4: scf.if {{.*}} -> (f32) {
 // CHECK-NEXT:      llvm.load
 // CHECK: scf.for
@@ -62,11 +69,12 @@
 // CHECK:      gpu.thread_id
 // CHECK:      %[[TRIPS:.*]] = llvm.call_intrinsic "llvm.amdgcn.wave.reduce.umin"({{.*}}) : (i32, i32) -> i32
 // CHECK:      arith.extui %[[TRIPS]] : i32 to i64
+// CHECK:      %[[CLAMPED:[a-z0-9_]+]] = arith.maxsi %{{.*}}, %[[SPLIT:[a-z0-9_]+]] : i32
 // CHECK-COUNT-4: scf.if {{.*}} -> (f32) {
 // CHECK-NEXT:      llvm.load
 // CHECK:      scf.for
 // CHECK:        gpu.shuffle
-// CHECK:      scf.for %{{.*}} = %{{.*}} to %[[SPLIT:[a-z0-9_]+]] step
+// CHECK:      scf.for %{{.*}} = %{{.*}} to %[[CLAMPED]] step
 // CHECK:      scf.for %{{.*}} = %[[SPLIT]] to %arg2 step
 // CHECK-NEXT:   llvm.getelementptr
 // CHECK-NEXT:   llvm.load
@@ -117,6 +125,41 @@
 // CHECK-LABEL: gpu.func @nested_reads
 // CHECK:      scf.for
 // CHECK-NEXT:   scf.for
+// CHECK:      gpu.return
+
+// CHECK-LABEL: gpu.func @carried_address
+// CHECK-COUNT-2: scf.if {{.*}} -> (f32) {
+// CHECK-NEXT:      llvm.load
+// CHECK:      scf.for {{.*}} iter_args
+// CHECK:      gpu.return
+
+// CHECK-LABEL: gpu.func @address_from_atomic
+// CHECK:      scf.for
+// CHECK-NEXT:   llvm.getelementptr
+// CHECK-NEXT:   llvm.load
+// CHECK-NEXT:   llvm.atomicrmw
+// CHECK:      gpu.return
+
+// CHECK-LABEL: gpu.func @pointer_table
+// CHECK-COUNT-2: scf.if {{.*}} -> (!llvm.ptr<1>) {
+// CHECK-NEXT:      llvm.load
+// CHECK:      scf.for
+// CHECK:      gpu.return
+
+// CHECK-LABEL: gpu.func @with_global_load_lds
+// CHECK:      scf.for
+// CHECK-NEXT:   llvm.getelementptr
+// CHECK-NEXT:   rocdl.global.load.lds
+// CHECK:      gpu.return
+
+// CHECK-LABEL: gpu.func @with_shuffle_mbcnt
+// CHECK:      rocdl.mbcnt.hi
+// CHECK:      llvm.call_intrinsic "llvm.amdgcn.wave.reduce.umin"
+// CHECK:      gpu.return
+
+// CHECK-LABEL: gpu.func @runtime_bounds
+// CHECK:      %[[UB:[a-z0-9_]+]] = arith.maxsi %arg1, %arg2 : i32
+// CHECK:      arith.subi %[[UB]], %arg1
 // CHECK:      gpu.return
 
 // CHECK-LABEL: gpu.func @unmarked
@@ -288,6 +331,92 @@ gpu.module @prefetch_loops {
         %q = llvm.getelementptr %out[%k] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
         llvm.store %v, %q : f32, !llvm.ptr<1>
       }
+    } {fly.prefetch_depth = 4 : i64}
+    gpu.return
+  }
+
+  gpu.func @carried_address(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %f0 = arith.constant 0.0 : f32
+    %r:2 = scf.for %i = %c0 to %n step %c1 iter_args(%off = %c0, %acc = %f0) -> (i32, f32) : i32 {
+      %p = llvm.getelementptr %in[%off] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      %v = llvm.load %p : !llvm.ptr<1> -> f32
+      %a = arith.addf %acc, %v : f32
+      %o = arith.addi %off, %c1 : i32
+      scf.yield %o, %a : i32, f32
+    } {fly.prefetch_depth = 2 : i64}
+    llvm.store %r#1, %out : f32, !llvm.ptr<1>
+    gpu.return
+  }
+
+  gpu.func @address_from_atomic(%in: !llvm.ptr<1>, %ctr: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %f0 = arith.constant 0.0 : f32
+    // expected-remark @below {{loop not pipelined (prefetch_depth=2): a load's address depends on a value the loop computes after its loads (in the same iteration or carried from the previous one)}}
+    %r:2 = scf.for %i = %c0 to %n step %c1 iter_args(%off = %c0, %acc = %f0) -> (i32, f32) : i32 {
+      %p = llvm.getelementptr %in[%off] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      %v = llvm.load %p : !llvm.ptr<1> -> f32
+      %o = llvm.atomicrmw add %ctr, %c1 monotonic : !llvm.ptr<1>, i32
+      %a = arith.addf %acc, %v : f32
+      scf.yield %o, %a : i32, f32
+    } {fly.prefetch_depth = 2 : i64}
+    llvm.store %r#1, %out : f32, !llvm.ptr<1>
+    gpu.return
+  }
+
+  gpu.func @pointer_table(%tbl: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    scf.for %i = %c0 to %n step %c1 : i32 {
+      %pp = llvm.getelementptr %tbl[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, !llvm.ptr<1>
+      %p = llvm.load %pp : !llvm.ptr<1> -> !llvm.ptr<1>
+      %v = llvm.load %p : !llvm.ptr<1> -> f32
+      %pout = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      llvm.store %v, %pout : f32, !llvm.ptr<1>
+    } {fly.prefetch_depth = 2 : i64}
+    gpu.return
+  }
+
+  gpu.func @with_global_load_lds(%in: !llvm.ptr<1>, %lds: !llvm.ptr<3>, %out: !llvm.ptr<1>, %n: i32) kernel {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    // expected-remark @below {{loop not pipelined (prefetch_depth=2): it contains a copy into or out of LDS, or an asynchronous copy}}
+    scf.for %i = %c0 to %n step %c1 : i32 {
+      %pin = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      rocdl.global.load.lds %pin, %lds, 4, 0, 0
+      %w = llvm.load %lds : !llvm.ptr<3> -> f32
+      %pout = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      llvm.store %w, %pout : f32, !llvm.ptr<1>
+    } {fly.prefetch_depth = 2 : i64}
+    gpu.return
+  }
+
+  gpu.func @with_shuffle_mbcnt(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %cm1 = arith.constant -1 : i32
+    %c64 = arith.constant 64 : i32
+    %lo = rocdl.mbcnt.lo %cm1, %c0 : (i32, i32) -> i32
+    %lane = rocdl.mbcnt.hi %cm1, %lo : (i32, i32) -> i32
+    scf.for %i = %lane to %n step %c64 : i32 {
+      %pin = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      %v = llvm.load %pin : !llvm.ptr<1> -> f32
+      %s, %valid = gpu.shuffle xor %v, %c1, %c64 : f32
+      %pout = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      llvm.store %s, %pout : f32, !llvm.ptr<1>
+    } {fly.prefetch_depth = 4 : i64}
+    gpu.return
+  }
+
+  gpu.func @runtime_bounds(%in: !llvm.ptr<1>, %lb: i32, %ub: i32, %out: !llvm.ptr<1>) kernel {
+    %c1 = arith.constant 1 : i32
+    scf.for %i = %lb to %ub step %c1 : i32 {
+      %pin = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      %v = llvm.load %pin : !llvm.ptr<1> -> f32
+      %pout = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      llvm.store %v, %pout : f32, !llvm.ptr<1>
     } {fly.prefetch_depth = 4 : i64}
     gpu.return
   }

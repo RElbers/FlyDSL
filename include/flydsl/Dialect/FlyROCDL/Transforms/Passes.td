@@ -36,14 +36,20 @@ def FlyROCDLPrefetchLoopsPass : Pass<"fly-rocdl-prefetch-loops"> {
     Rewrites each `scf.for` carrying `fly.prefetch_depth = N` (set by
     `range(..., prefetch_depth=N)`) so the loads of up to N future iterations
     stay in flight across the backedge, instead of draining `vmcnt(0)` every
-    iteration. The loop is unrolled by N and pipelined in two stages; the
-    prologue and epilogue of a runtime trip count are predicated. Loops with a
-    barrier, an LDS store or a global->LDS DMA are left unchanged. Run inside
-    `gpu.module(...)` after `convert-fly-to-rocdl` and before
-    `convert-scf-to-cf`.
+    iteration. The loop is unrolled by N and pipelined in two stages; in the
+    prologue and epilogue of a runtime trip count, reads and side effects only
+    run for in-range iterations. A loop is left unchanged, with a remark naming
+    the reason, when it contains a barrier, a print or assert, a copy into or
+    out of LDS or an asynchronous copy, a load after a possible store in the
+    same iteration, no top-level load, a load whose address depends on a
+    side-effecting op, or a guarded op of a type it can't stand in for. Loops
+    with a lane-exchange op and lane-dependent bounds are first split at the
+    wave's shortest trip count. Run inside `gpu.module(...)` after
+    `convert-fly-to-rocdl` and before `convert-scf-to-cf`.
   }];
   let dependentDialects = [
     "arith::ArithDialect",
+    "LLVM::LLVMDialect",
     "scf::SCFDialect"
   ];
 }

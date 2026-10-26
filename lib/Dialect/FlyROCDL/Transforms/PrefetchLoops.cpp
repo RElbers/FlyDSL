@@ -10,7 +10,8 @@
 // iteration's single load is waited on before the next one issues. The pass unrolls the loop by N,
 // so the steady state has N distinct loads (N rotating destination registers), and then pipelines
 // it in two stages: loads plus their address math first, everything else one iteration later.
-// The prologue and epilogue of a runtime trip count are predicated by `predicateOp`.
+// In the prologue and epilogue of a runtime trip count, `predicateOp` guards reads and side effects
+// so they only run for in-range iterations.
 
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -19,6 +20,8 @@
 #include "mlir/Dialect/SCF/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/IR/Diagnostics.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 
@@ -70,10 +73,24 @@ bool isUniformSource(Operation *op) {
          n.starts_with("rocdl.workgroup.") || n.starts_with("rocdl.grid.");
 }
 
+// An op known to give the same result in every lane when its operands are the same in every lane.
+// An allowlist: an unknown op could read the lane id (rocdl.mbcnt, an intrinsic call, inline asm).
+bool propagatesUniformity(Operation *op) {
+  StringRef dialect = op->getDialect() ? op->getDialect()->getNamespace() : "";
+  StringRef n = op->getName().getStringRef();
+  if (llvm::is_contained({"arith", "index", "math", "vector"}, dialect))
+    return true;
+  if (dialect == "llvm")
+    return !isa<LLVM::CallOp, LLVM::CallIntrinsicOp, LLVM::InlineAsmOp>(op);
+  if (dialect == "rocdl")
+    return n.contains("make.buffer.rsrc") || n.contains("buffer.load");
+  return n == "builtin.unrealized_conversion_cast";
+}
+
 // Whether every lane of a wave holds the same value of `v`. Conservative: false when unsure. Kernel
-// arguments, constants and block-level ids are uniform; so is a pure or read-only op whose operands
-// all are, and a readfirstlane. Thread / lane ids, atomics, ops with regions and loop-carried
-// values are not.
+// arguments, constants and block-level ids are uniform; so is a pure or read-only op from
+// `propagatesUniformity` whose operands all are, and a readfirstlane. Thread / lane ids, atomics,
+// ops with regions and loop-carried values are not.
 bool isWaveUniform(Value v, DenseMap<Value, bool> &memo) {
   if (auto it = memo.find(v); it != memo.end())
     return it->second;
@@ -93,7 +110,7 @@ bool isWaveUniform(Value v, DenseMap<Value, bool> &memo) {
       uniform = true;
     else if (op->getNumOperands() == 0)
       uniform = isUniformSource(op);
-    else if (op->getNumRegions() == 0 && !isLaneExchangeOp(n) &&
+    else if (op->getNumRegions() == 0 && !isLaneExchangeOp(n) && propagatesUniformity(op) &&
              (isMemoryEffectFree(op) || hasSingleEffect<MemoryEffects::Read>(op)))
       uniform = llvm::all_of(op->getOperands(),
                              [&](Value operand) { return isWaveUniform(operand, memo); });
@@ -137,34 +154,6 @@ bool hasReadAfterWrite(scf::ForOp forOp) {
     return WalkResult::advance();
   });
   return result.wasInterrupted();
-}
-
-// Why `forOp` can't be pipelined, or an empty string when it can. Mechanical whole-loop rotation
-// cannot safely pipeline a loop that contains an intra-loop barrier or a single-buffered
-// global->LDS DMA (`buffer.load.lds`): rotating the DMA across the backedge would clobber the
-// shared buffer (no double buffering), and a dynamic-trip epilogue would have to predicate the
-// barrier, which is illegal. Prints and asserts would run out of order, and a read after a write
-// could move ahead of it.
-StringRef whyNotPipelineable(scf::ForOp forOp) {
-  StringRef reason;
-  forOp.getBody()->walk([&](Operation *op) {
-    StringRef n = op->getName().getStringRef();
-    if (n.contains("barrier"))
-      reason = "it contains a barrier";
-    else if (n.contains("buffer.load.lds"))
-      reason = "it contains a global-to-LDS copy";
-    else if (n.contains("print") || n.contains("assert"))
-      reason = "it contains a print or an assert";
-    return reason.empty() ? WalkResult::advance() : WalkResult::interrupt();
-  });
-  if (!reason.empty())
-    return reason;
-  if (llvm::none_of(forOp.getBody()->without_terminator(),
-                    [](Operation &op) { return isPipelineableRead(&op); }))
-    return "its body has no load at the top level to issue early";
-  if (hasReadAfterWrite(forOp))
-    return "a load follows a possible store in the same iteration and would move ahead of it";
-  return {};
 }
 
 Value toI64(RewriterBase &rewriter, Location loc, Value v) {
@@ -233,76 +222,79 @@ LogicalResult splitAtWaveUniformTripCount(RewriterBase &rewriter, scf::ForOp for
   return success();
 }
 
-// Stage 0 = reads + the pure address math feeding them; last stage = everything else.
+// Stage 0 = reads + the pure address math feeding them, including the math that computes a
+// loop-carried address for the next iteration (a pointer bumped after its load); last stage =
+// everything else.
 void buildLoadComputeSchedule(scf::ForOp forOp,
                               std::vector<std::pair<Operation *, unsigned>> &schedule) {
+  Block *body = forOp.getBody();
   llvm::SmallPtrSet<Operation *, 16> stage0;
-  for (Operation &op : forOp.getBody()->without_terminator()) {
+  SmallVector<Value> worklist;
+  for (Operation &op : body->without_terminator()) {
     if (!isPipelineableRead(&op))
       continue;
     stage0.insert(&op);
-    SetVector<Operation *> slice;
-    BackwardSliceOptions sliceOpts;
-    sliceOpts.inclusive = true;
-    sliceOpts.filter = [&](Operation *o) {
-      return o->getBlock() == forOp.getBody() && isMemoryEffectFree(o);
-    };
-    // Root the slice at the read's operands, not the read itself: getBackwardSlice returns an empty
-    // slice when the root fails the filter (a read is not memory-effect-free), which would leave
-    // the address math in the last stage ("operation scheduled before its operands").
-    for (Value operand : op.getOperands())
-      (void)getBackwardSlice(operand, &slice, sliceOpts);
-    stage0.insert(slice.begin(), slice.end());
+    llvm::append_range(worklist, op.getOperands());
   }
-  for (Operation &op : forOp.getBody()->without_terminator())
+  BackwardSliceOptions sliceOpts;
+  sliceOpts.inclusive = true;
+  sliceOpts.filter = [&](Operation *o) { return o->getBlock() == body && isMemoryEffectFree(o); };
+  // Slice from the reads' operands, not the reads: getBackwardSlice returns an empty slice when the
+  // root fails the filter (a read is not memory-effect-free), which would leave the address math in
+  // the last stage ("operation scheduled before its operands").
+  DenseSet<Value> seen;
+  while (!worklist.empty()) {
+    Value v = worklist.pop_back_val();
+    if (!seen.insert(v).second)
+      continue;
+    if (auto arg = dyn_cast<BlockArgument>(v); arg && arg.getOwner() == body) {
+      if (arg != forOp.getInductionVar())
+        worklist.push_back(body->getTerminator()->getOperand(arg.getArgNumber() - 1));
+      continue;
+    }
+    SetVector<Operation *> slice;
+    (void)getBackwardSlice(v, &slice, sliceOpts);
+    for (Operation *o : slice)
+      if (stage0.insert(o).second)
+        llvm::append_range(worklist, o->getOperands());
+  }
+  for (Operation &op : body->without_terminator())
     schedule.push_back({&op, stage0.contains(&op) ? 0u : kNumStages - 1});
 }
 
-// A buffer load past its resource returns 0 instead of faulting, so it may issue unguarded.
-bool isBoundsCheckedRead(Operation *op) {
-  return op->getName().getStringRef().contains("buffer.load");
+// A type `zeroValue` can build a placeholder for.
+bool hasZeroValue(Type t) {
+  return isa<IntegerType, IndexType, FloatType, VectorType, LLVM::LLVMPointerType>(t);
 }
+
+Value zeroValue(OpBuilder &b, Location loc, Type t) {
+  if (isa<LLVM::LLVMPointerType>(t))
+    return LLVM::ZeroOp::create(b, loc, t);
+  return arith::ConstantOp::create(b, loc, cast<TypedAttr>(b.getZeroAttr(t)));
+}
+
+// Whether predicateOp must guard `op` when it is cloned into the prologue or epilogue.
+bool needsPredication(Operation *op) { return isPipelineableRead(op) || !isMemoryEffectFree(op); }
 
 // Predicate an op cloned into the prologue/epilogue of a dynamic-trip loop.
 //
-// A buffer read is masked to zero (`select(pred, load, 0)`); any other read is sunk into
-// `scf.if(pred)` yielding zero, because it can fault when issued past the trip count. Pure ops run
-// unchanged on the zeroed inputs. The zeros never reach the loop results: the pipeliner selects
-// each epilogue live-out against the previous iteration's value under the same predicate. Any
-// other side-effecting op (a store, an atomicrmw, an scf.if or scf.for that reads) is sunk into
-// `scf.if(pred)`, yielding zeros when it does not run; those zeros are discarded the same way. A
-// side-effecting op with a result type that cannot be zeroed returns nullptr, which makes
-// pipelineForLoop leave the loop un-pipelined.
+// Reads and side-effecting ops (stores, atomics, an scf.if or scf.for that reads) are sunk into
+// `scf.if(pred)` and yield placeholder zeros when the iteration is out of range: a read issued past
+// the trip count can fault, buffer loads included, since a buffer resource is usually created
+// without a size limit. Pure ops run unchanged on the zeros. The zeros never reach the loop
+// results: the pipeliner selects each epilogue live-out against the previous iteration's value
+// under the same predicate. `whyNotPipelineable` rejects a loop with an op this can't guard, so it
+// never returns nullptr after the pipeliner has changed the IR.
 //
 // The pipeliner calls this on each clone before any later op uses its results, and maps the
 // original op's results to the returned op's results by position.
 Operation *predicateOp(RewriterBase &rewriter, Operation *op, Value pred) {
-  Location loc = op->getLoc();
-  if (isPipelineableRead(op) && op->getNumResults() == 1) {
-    Type ty = op->getResult(0).getType();
-    if (!isa<IntegerType, FloatType, VectorType>(ty))
-      return isBoundsCheckedRead(op) ? op : nullptr;
-    OpBuilder::InsertionGuard g(rewriter);
-    rewriter.setInsertionPointAfter(op);
-    auto zero = arith::ConstantOp::create(rewriter, loc, cast<TypedAttr>(rewriter.getZeroAttr(ty)));
-    if (isBoundsCheckedRead(op))
-      return arith::SelectOp::create(rewriter, loc, pred, op->getResult(0), zero);
-    auto ifOp = scf::IfOp::create(rewriter, loc, TypeRange{ty}, pred, /*withElseRegion=*/true);
-    op->moveBefore(ifOp.thenBlock(), ifOp.thenBlock()->end());
-    zero->moveBefore(ifOp.elseBlock(), ifOp.elseBlock()->end());
-    rewriter.setInsertionPointToEnd(ifOp.thenBlock());
-    scf::YieldOp::create(rewriter, loc, op->getResults());
-    rewriter.setInsertionPointToEnd(ifOp.elseBlock());
-    scf::YieldOp::create(rewriter, loc, zero.getResult());
-    return ifOp;
-  }
-  if (isMemoryEffectFree(op))
+  // A constant-true predicate (a constant trip count) needs no guard.
+  if (!needsPredication(op) || matchPattern(pred, m_One()))
     return op;
-
-  bool zeroable = llvm::all_of(op->getResultTypes(),
-                               [](Type t) { return isa<IntegerType, FloatType, VectorType>(t); });
-  if (!zeroable)
+  if (!llvm::all_of(op->getResultTypes(), hasZeroValue))
     return nullptr;
+  Location loc = op->getLoc();
   OpBuilder::InsertionGuard g(rewriter);
   rewriter.setInsertionPointAfter(op);
   if (op->getNumResults() == 0) {
@@ -310,8 +302,7 @@ Operation *predicateOp(RewriterBase &rewriter, Operation *op, Value pred) {
     op->moveBefore(ifOp.thenBlock()->getTerminator());
     return ifOp;
   }
-  // With result types the builder leaves both blocks unterminated, so build the yields here. The
-  // else-branch zeros only reach ops of the same out-of-range iteration.
+  // With result types the builder leaves both blocks unterminated, so build the yields here.
   auto ifOp = scf::IfOp::create(rewriter, loc, op->getResultTypes(), pred, /*withElseRegion=*/true);
   op->moveBefore(ifOp.thenBlock(), ifOp.thenBlock()->end());
   rewriter.setInsertionPointToEnd(ifOp.thenBlock());
@@ -319,10 +310,86 @@ Operation *predicateOp(RewriterBase &rewriter, Operation *op, Value pred) {
   rewriter.setInsertionPointToEnd(ifOp.elseBlock());
   SmallVector<Value> zeros;
   for (Type t : op->getResultTypes())
-    zeros.push_back(
-        arith::ConstantOp::create(rewriter, loc, cast<TypedAttr>(rewriter.getZeroAttr(t))));
+    zeros.push_back(zeroValue(rewriter, loc, t));
   scf::YieldOp::create(rewriter, loc, zeros);
   return ifOp;
+}
+
+// A copy into or out of LDS issued by the memory unit, or an asynchronous copy whose completion is
+// tied to a separate wait. Pipelining would move it relative to the reads of the same buffer and
+// to its wait.
+bool isAsyncOrLdsCopy(StringRef n) {
+  return (n.contains("lds") && (n.contains("load") || n.contains("store"))) ||
+         n.contains("async") || n.contains("tensor.load") || n.contains("tensor.store");
+}
+
+// Whether a stage-0 op (a load or its address math) uses a value the last stage computes, in the
+// same iteration or through a loop-carried value: it would run before that value exists. Upstream
+// rejects such a schedule with an error diagnostic, so check it before changing the loop.
+bool readsLateValue(scf::ForOp forOp) {
+  std::vector<std::pair<Operation *, unsigned>> schedule;
+  buildLoadComputeSchedule(forOp, schedule);
+  DenseMap<Operation *, unsigned> stageOf(schedule.begin(), schedule.end());
+  Block *body = forOp.getBody();
+  auto isLate = [&](Value v) {
+    if (auto arg = dyn_cast<BlockArgument>(v); arg && arg.getOwner() == body) {
+      if (arg == forOp.getInductionVar())
+        return false;
+      v = body->getTerminator()->getOperand(arg.getArgNumber() - 1);
+    }
+    Operation *def = v.getDefiningOp();
+    if (!def || !forOp->isProperAncestor(def))
+      return false;
+    def = body->findAncestorOpInBlock(*def);
+    return def && def != body->getTerminator() && stageOf.lookup(def) > 0;
+  };
+  return llvm::any_of(schedule, [&](auto &entry) {
+    if (entry.second != 0)
+      return false;
+    WalkResult result = entry.first->walk([&](Operation *nested) {
+      for (Value operand : nested->getOperands())
+        if (isLate(operand))
+          return WalkResult::interrupt();
+      return WalkResult::advance();
+    });
+    return result.wasInterrupted();
+  });
+}
+
+// Why `forOp` can't be pipelined, or an empty string when it can. Mechanical whole-loop rotation
+// cannot safely pipeline a loop that contains an intra-loop barrier or a single-buffered copy into
+// LDS: rotating the copy across the backedge would clobber the shared buffer (no double buffering),
+// and a dynamic-trip epilogue would have to predicate the barrier, which is illegal. Prints and
+// asserts would run out of order, and a read after a write could move ahead of it.
+StringRef whyNotPipelineable(scf::ForOp forOp) {
+  StringRef reason;
+  forOp.getBody()->walk([&](Operation *op) {
+    StringRef n = op->getName().getStringRef();
+    if (n.contains("barrier"))
+      reason = "it contains a barrier";
+    else if (isAsyncOrLdsCopy(n))
+      reason = "it contains a copy into or out of LDS, or an asynchronous copy";
+    else if (n.contains("print") || n.contains("assert"))
+      reason = "it contains a print or an assert";
+    return reason.empty() ? WalkResult::advance() : WalkResult::interrupt();
+  });
+  if (!reason.empty())
+    return reason;
+  Block *body = forOp.getBody();
+  if (llvm::none_of(body->without_terminator(),
+                    [](Operation &op) { return isPipelineableRead(&op); }))
+    return "its body has no load at the top level to issue early";
+  if (hasReadAfterWrite(forOp))
+    return "a load follows a possible store in the same iteration and would move ahead of it";
+  if (llvm::any_of(body->without_terminator(), [](Operation &op) {
+        return needsPredication(&op) && !llvm::all_of(op.getResultTypes(), hasZeroValue);
+      }))
+    return "a load or side-effecting op returns a type the out-of-range iterations can't stand in "
+           "for (only integers, floats, vectors, index and pointers)";
+  if (readsLateValue(forOp))
+    return "a load's address depends on a value the loop computes after its loads (in the same "
+           "iteration or carried from the previous one)";
+  return {};
 }
 
 class FlyROCDLPrefetchLoopsPass
@@ -364,6 +431,16 @@ public:
 
       scf::ForOp target = forOp;
       if (depth > 1) {
+        // loopUnrollByFactor computes a runtime trip count as (ub - lb + step - 1) / step without
+        // a sign check, which wraps for an empty range with ub < lb. Clamping ub to lb gives the
+        // same zero iterations without the wrap.
+        rewriter.setInsertionPoint(forOp);
+        Value lb = forOp.getLowerBound(), ub = forOp.getUpperBound();
+        // createOrFold keeps a constant trip count constant, so its loop needs no predication.
+        Value clamped = forOp.getUnsignedCmp()
+                            ? rewriter.createOrFold<arith::MaxUIOp>(forOp.getLoc(), lb, ub)
+                            : rewriter.createOrFold<arith::MaxSIOp>(forOp.getLoc(), lb, ub);
+        forOp.setUpperBound(clamped);
         // The remainder loop for a runtime trip count stays serial.
         FailureOr<UnrolledLoopInfo> info = loopUnrollByFactor(forOp, depth);
         if (succeeded(info) && info->mainLoopOp)
@@ -378,10 +455,27 @@ public:
       options.getScheduleFn = buildLoadComputeSchedule;
       rewriter.setInsertionPoint(target);
       bool modified = false;
-      if (failed(scf::pipelineForLoop(rewriter, target, options, &modified))) {
-        if (modified)
-          return signalPassFailure(); // IR mutated, then failed
-        notPipelined(target, "the pipeliner rejected its schedule (the loop is only unrolled)");
+      // whyNotPipelineable rejects the loops the pipeliner can't handle, so it should not fail
+      // here. If it does, keep its diagnostic away from callers: an error the pass then ignores
+      // aborts a Python PassManager.run, which asserts that no captured error goes unreported.
+      std::string pipelinerMessage;
+      LogicalResult pipelined = failure();
+      {
+        ScopedDiagnosticHandler capture(&getContext(), [&](Diagnostic &diag) {
+          if (pipelinerMessage.empty())
+            pipelinerMessage = diag.str();
+          return success();
+        });
+        pipelined = scf::pipelineForLoop(rewriter, target, options, &modified);
+      }
+      if (failed(pipelined)) {
+        if (modified) {
+          target.emitError() << "prefetch_depth=" << depth
+                             << ": pipelining failed after changing the loop: " << pipelinerMessage;
+          return signalPassFailure();
+        }
+        notPipelined(target, "the pipeliner rejected it (" + pipelinerMessage +
+                                 "); the loop is only unrolled");
       }
     }
   }
