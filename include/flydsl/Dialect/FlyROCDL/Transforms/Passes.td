@@ -37,14 +37,18 @@ def FlyROCDLPrefetchLoopsPass : Pass<"fly-rocdl-prefetch-loops"> {
     `range(..., prefetch_depth=N)`) so the loads of up to N future iterations
     stay in flight across the backedge, instead of draining `vmcnt(0)` every
     iteration. The loop is unrolled by N and pipelined in two stages; in the
-    prologue and epilogue of a runtime trip count, reads and side effects only
-    run for in-range iterations. A loop is left unchanged, with a remark naming
-    the reason, when it contains a barrier, a print or assert, a copy into or
+    prologue and epilogue of a runtime trip count, reads, side effects and
+    integer division or remainder only run for in-range iterations. A loop is left
+    unchanged, with a remark naming the reason, when it contains a barrier, a
+    print or assert, a copy into or
     out of LDS or an asynchronous copy, a load after a possible store in the
     same iteration, no top-level load, a load whose address depends on a
-    side-effecting op, or a guarded op of a type it can't stand in for. Loops
-    with a lane-exchange op and lane-dependent bounds are first split at the
-    wave's shortest trip count. Run inside `gpu.module(...)` after
+    side-effecting op, or a guarded op of a type it can't stand in for. Narrow
+    integer bounds are widened to i64; a loop is left unchanged if its step
+    times the depth overflows a signed 64-bit integer (a runtime 64-bit step is
+    assumed not to). Loops with a lane-exchange op (including calls, inline
+    asm and AMDGPU intrinsic calls) and lane-dependent bounds are first split
+    at the wave's shortest trip count. Run inside `gpu.module(...)` after
     `convert-fly-to-rocdl` and before `convert-scf-to-cf`.
   }];
   let dependentDialects = [

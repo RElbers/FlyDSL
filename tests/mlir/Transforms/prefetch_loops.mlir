@@ -30,7 +30,7 @@
 // CHECK-LABEL: gpu.func @scatter
 // CHECK-COUNT-4: scf.if {{.*}} -> (f32) {
 // CHECK-NEXT:      llvm.load
-// CHECK: scf.for {{.*}} iter_args(%[[V0:[a-z0-9_]+]] = {{.*}}) -> (f32, i32, f32, i32, f32, i32, f32)
+// CHECK: scf.for {{.*}} iter_args(%{{[a-z0-9_]+}} = %{{[a-z0-9_]+}}, %[[V0:[a-z0-9_]+]] = {{.*}}) -> (i32, f32, i32, f32, i32, f32, i32, f32)
 // CHECK:   llvm.load
 // CHECK:   llvm.store %[[V0]],
 // CHECK-COUNT-3: llvm.load
@@ -69,7 +69,9 @@
 // CHECK:      gpu.thread_id
 // CHECK:      %[[TRIPS:.*]] = llvm.call_intrinsic "llvm.amdgcn.wave.reduce.umin"({{.*}}) : (i32, i32) -> i32
 // CHECK:      arith.extui %[[TRIPS]] : i32 to i64
-// CHECK:      %[[CLAMPED:[a-z0-9_]+]] = arith.maxsi %{{.*}}, %[[SPLIT:[a-z0-9_]+]] : i32
+// CHECK:      %[[SPLIT:[a-z0-9_]+]] = arith.trunci {{.*}} : i64 to i32
+// CHECK:      %[[WIDE_SPLIT:[a-z0-9_]+]] = arith.extsi %[[SPLIT]] : i32 to i64
+// CHECK:      %[[CLAMPED:[a-z0-9_]+]] = arith.maxsi %{{.*}}, %[[WIDE_SPLIT]] : i64
 // CHECK-COUNT-4: scf.if {{.*}} -> (f32) {
 // CHECK-NEXT:      llvm.load
 // CHECK:      scf.for
@@ -158,8 +160,10 @@
 // CHECK:      gpu.return
 
 // CHECK-LABEL: gpu.func @runtime_bounds
-// CHECK:      %[[UB:[a-z0-9_]+]] = arith.maxsi %arg1, %arg2 : i32
-// CHECK:      arith.subi %[[UB]], %arg1
+// CHECK:      %[[LB64:[a-z0-9_]+]] = arith.extsi %arg1 : i32 to i64
+// CHECK:      %[[UB64:[a-z0-9_]+]] = arith.extsi %arg2 : i32 to i64
+// CHECK:      %[[UB:[a-z0-9_]+]] = arith.maxsi %[[LB64]], %[[UB64]] : i64
+// CHECK:      arith.subi %[[UB]], %[[LB64]]
 // CHECK:      gpu.return
 
 // CHECK-LABEL: gpu.func @unmarked

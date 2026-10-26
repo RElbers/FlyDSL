@@ -13,17 +13,20 @@
 // In the prologue and epilogue of a runtime trip count, `predicateOp` guards reads and side effects
 // so they only run for in-range iterations.
 
-#include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Transforms/RegionUtils.h"
+
+#include <limits>
 
 #include "flydsl/Dialect/FlyROCDL/Transforms/Passes.h"
 
@@ -55,7 +58,14 @@ bool isPipelineableRead(Operation *op) {
 // ballots, lane reads, DPP). Unrolling splits the iterations between the main loop and a serial
 // remainder loop, so when lanes have different trip counts, lanes run the same iteration at
 // different times and such an op sees a different set of active lanes than in the original loop.
-bool isLaneExchangeOp(StringRef n) {
+// Calls, inline asm and AMDGPU intrinsic calls are opaque (a callee or an `llvm.amdgcn.icmp` can
+// exchange values across lanes), so they count as lane exchanges.
+bool isLaneExchangeOp(Operation *op) {
+  if (isa<LLVM::CallOp, LLVM::InlineAsmOp>(op))
+    return true;
+  if (auto intrinsic = dyn_cast<LLVM::CallIntrinsicOp>(op))
+    return intrinsic.getIntrin().starts_with("llvm.amdgcn.");
+  StringRef n = op->getName().getStringRef();
   return n.contains("shuffle") || n.contains("ballot") || n.contains("bpermute") ||
          n.contains("permlane") || n.contains("readlane") || n.contains("readfirstlane") ||
          n.contains("dpp") || n.contains("ds_swizzle") || n.contains("subgroup");
@@ -110,7 +120,7 @@ bool isWaveUniform(Value v, DenseMap<Value, bool> &memo) {
       uniform = true;
     else if (op->getNumOperands() == 0)
       uniform = isUniformSource(op);
-    else if (op->getNumRegions() == 0 && !isLaneExchangeOp(n) && propagatesUniformity(op) &&
+    else if (op->getNumRegions() == 0 && !isLaneExchangeOp(op) && propagatesUniformity(op) &&
              (isMemoryEffectFree(op) || hasSingleEffect<MemoryEffects::Read>(op)))
       uniform = llvm::all_of(op->getOperands(),
                              [&](Value operand) { return isWaveUniform(operand, memo); });
@@ -128,8 +138,7 @@ bool hasWaveUniformTripCount(scf::ForOp forOp) {
 
 bool hasLaneExchangeOp(scf::ForOp forOp) {
   WalkResult result = forOp.getBody()->walk([](Operation *op) {
-    return isLaneExchangeOp(op->getName().getStringRef()) ? WalkResult::interrupt()
-                                                          : WalkResult::advance();
+    return isLaneExchangeOp(op) ? WalkResult::interrupt() : WalkResult::advance();
   });
   return result.wasInterrupted();
 }
@@ -171,6 +180,29 @@ Value fromI64(RewriterBase &rewriter, Location loc, Value v, Type ty) {
   if (ty.getIntOrFloatBitWidth() < 64)
     return arith::TruncIOp::create(rewriter, loc, ty, v);
   return v;
+}
+
+// Keep the unroller's scaled step and the pipeliner's peeled bounds out of narrow integer types.
+// The body still sees the original induction type, including its original wrapping arithmetic.
+void widenLoopBounds(RewriterBase &rewriter, scf::ForOp forOp) {
+  auto ty = dyn_cast<IntegerType>(forOp.getLowerBound().getType());
+  if (!ty || ty.getWidth() >= 64)
+    return;
+  OpBuilder::InsertionGuard g(rewriter);
+  rewriter.setInsertionPoint(forOp);
+  auto extend = [&](Value v) -> Value {
+    if (forOp.getUnsignedCmp())
+      return rewriter.createOrFold<arith::ExtUIOp>(forOp.getLoc(), rewriter.getI64Type(), v);
+    return rewriter.createOrFold<arith::ExtSIOp>(forOp.getLoc(), rewriter.getI64Type(), v);
+  };
+  forOp.setLowerBound(extend(forOp.getLowerBound()));
+  forOp.setUpperBound(extend(forOp.getUpperBound()));
+  forOp.setStep(extend(forOp.getStep()));
+  Value iv = forOp.getInductionVar();
+  iv.setType(rewriter.getI64Type());
+  rewriter.setInsertionPointToStart(forOp.getBody());
+  auto narrow = arith::TruncIOp::create(rewriter, forOp.getLoc(), ty, iv);
+  rewriter.replaceAllUsesExcept(iv, narrow.getResult(), narrow);
 }
 
 // Ends `forOp` after the wave's shortest trip count, rounded down to a multiple of `depth`, and
@@ -236,12 +268,7 @@ void buildLoadComputeSchedule(scf::ForOp forOp,
     stage0.insert(&op);
     llvm::append_range(worklist, op.getOperands());
   }
-  BackwardSliceOptions sliceOpts;
-  sliceOpts.inclusive = true;
-  sliceOpts.filter = [&](Operation *o) { return o->getBlock() == body && isMemoryEffectFree(o); };
-  // Slice from the reads' operands, not the reads: getBackwardSlice returns an empty slice when the
-  // root fails the filter (a read is not memory-effect-free), which would leave the address math in
-  // the last stage ("operation scheduled before its operands").
+  // Visit each value once, following pure address math, region captures and loop-carried edges.
   DenseSet<Value> seen;
   while (!worklist.empty()) {
     Value v = worklist.pop_back_val();
@@ -252,11 +279,13 @@ void buildLoadComputeSchedule(scf::ForOp forOp,
         worklist.push_back(body->getTerminator()->getOperand(arg.getArgNumber() - 1));
       continue;
     }
-    SetVector<Operation *> slice;
-    (void)getBackwardSlice(v, &slice, sliceOpts);
-    for (Operation *o : slice)
-      if (stage0.insert(o).second)
-        llvm::append_range(worklist, o->getOperands());
+    Operation *op = v.getDefiningOp();
+    if (!op || op->getBlock() != body || !isMemoryEffectFree(op) || !stage0.insert(op).second)
+      continue;
+    llvm::append_range(worklist, op->getOperands());
+    SetVector<Value> captures;
+    getUsedValuesDefinedAbove(op->getRegions(), captures);
+    llvm::append_range(worklist, captures);
   }
   for (Operation &op : body->without_terminator())
     schedule.push_back({&op, stage0.contains(&op) ? 0u : kNumStages - 1});
@@ -274,17 +303,22 @@ Value zeroValue(OpBuilder &b, Location loc, Type t) {
 }
 
 // Whether predicateOp must guard `op` when it is cloned into the prologue or epilogue.
-bool needsPredication(Operation *op) { return isPipelineableRead(op) || !isMemoryEffectFree(op); }
+// Upstream marks floordivsi, srem and urem speculatable although a zero divisor is undefined
+// behavior, so guard them explicitly.
+bool needsPredication(Operation *op) {
+  return isPipelineableRead(op) || !isMemoryEffectFree(op) || !isSpeculatable(op) ||
+         isa<arith::FloorDivSIOp, LLVM::SRemOp, LLVM::URemOp>(op);
+}
 
 // Predicate an op cloned into the prologue/epilogue of a dynamic-trip loop.
 //
 // Reads and side-effecting ops (stores, atomics, an scf.if or scf.for that reads) are sunk into
 // `scf.if(pred)` and yield placeholder zeros when the iteration is out of range: a read issued past
 // the trip count can fault, buffer loads included, since a buffer resource is usually created
-// without a size limit. Pure ops run unchanged on the zeros. The zeros never reach the loop
-// results: the pipeliner selects each epilogue live-out against the previous iteration's value
-// under the same predicate. `whyNotPipelineable` rejects a loop with an op this can't guard, so it
-// never returns nullptr after the pipeliner has changed the IR.
+// without a size limit. Only safely speculatable ops run unchanged on the zeros. The zeros never
+// reach the loop results: the pipeliner selects each epilogue live-out against the previous
+// iteration's value under the same predicate. `whyNotPipelineable` rejects a loop with an op this
+// can't guard, so it never returns nullptr after the pipeliner has changed the IR.
 //
 // The pipeliner calls this on each clone before any later op uses its results, and maps the
 // original op's results to the returned op's results by position.
@@ -420,6 +454,22 @@ public:
         notPipelined(forOp, why);
         continue;
       }
+      if (depth > 1) {
+        // Narrow bounds are widened below, so a narrow runtime step is bounded by its type. A
+        // runtime 64-bit or index step is assumed to stay below 2^63 / depth.
+        std::optional<int64_t> maxStep = getConstantIntValue(forOp.getStep());
+        if (!maxStep) {
+          if (auto ty = dyn_cast<IntegerType>(forOp.getStep().getType()); ty && ty.getWidth() < 64)
+            maxStep = forOp.getUnsignedCmp()
+                          ? APInt::getMaxValue(ty.getWidth()).getZExtValue()
+                          : APInt::getSignedMaxValue(ty.getWidth()).getSExtValue();
+        }
+        if (maxStep && (*maxStep <= 0 || depth > std::numeric_limits<int64_t>::max() / *maxStep)) {
+          notPipelined(forOp,
+                       "its step multiplied by the depth may overflow a signed 64-bit integer");
+          continue;
+        }
+      }
       // Unrolling and peeling split each lane's iterations at its own trip count; a lane-exchange
       // op needs that split to fall at the same iteration in every lane of the wave.
       if (hasLaneExchangeOp(forOp) && !hasWaveUniformTripCount(forOp) &&
@@ -429,22 +479,26 @@ public:
         continue;
       }
 
+      widenLoopBounds(rewriter, forOp);
+      // Both unrolling and peeling assume a nonnegative span. Clamp even at depth one, where
+      // subtracting a step from an empty range's original upper bound could underflow.
+      rewriter.setInsertionPoint(forOp);
+      Value lb = forOp.getLowerBound(), ub = forOp.getUpperBound();
+      // createOrFold keeps a constant trip count constant, so its loop needs no predication.
+      Value clamped = forOp.getUnsignedCmp()
+                          ? rewriter.createOrFold<arith::MaxUIOp>(forOp.getLoc(), lb, ub)
+                          : rewriter.createOrFold<arith::MaxSIOp>(forOp.getLoc(), lb, ub);
+      forOp.setUpperBound(clamped);
       scf::ForOp target = forOp;
       if (depth > 1) {
-        // loopUnrollByFactor computes a runtime trip count as (ub - lb + step - 1) / step without
-        // a sign check, which wraps for an empty range with ub < lb. Clamping ub to lb gives the
-        // same zero iterations without the wrap.
-        rewriter.setInsertionPoint(forOp);
-        Value lb = forOp.getLowerBound(), ub = forOp.getUpperBound();
-        // createOrFold keeps a constant trip count constant, so its loop needs no predication.
-        Value clamped = forOp.getUnsignedCmp()
-                            ? rewriter.createOrFold<arith::MaxUIOp>(forOp.getLoc(), lb, ub)
-                            : rewriter.createOrFold<arith::MaxSIOp>(forOp.getLoc(), lb, ub);
-        forOp.setUpperBound(clamped);
-        // The remainder loop for a runtime trip count stays serial.
-        FailureOr<UnrolledLoopInfo> info = loopUnrollByFactor(forOp, depth);
-        if (succeeded(info) && info->mainLoopOp)
+        // The remainder loop stays serial. Keep a one-iteration main loop alive for the pipeliner.
+        FailureOr<UnrolledLoopInfo> info = loopUnrollByFactor(
+            forOp, depth, /*annotateFn=*/nullptr, /*shouldPromoteIfSingleIteration=*/false);
+        if (succeeded(info)) {
+          if (!info->mainLoopOp)
+            continue;
           target = *info->mainLoopOp;
+        }
       }
 
       scf::PipeliningOption options;

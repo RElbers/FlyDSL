@@ -17,6 +17,7 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, gpu, rocdl
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
@@ -60,7 +61,20 @@ def _store_reload(r, i, acc):
     return ArithValue(acc) + ArithValue(_load(r["tmp"], i))
 
 
-BODIES = {"sum": _sum, "raw_sum": _raw_sum, "min": _min, "shuffle": _shuffle, "store_reload": _store_reload}
+def _intrinsic_reduce(r, i, acc):
+    bits = arith.bitcast(T.i32, _load(r["in"], i))
+    minimum = llvm.call_intrinsic(T.i32, "llvm.amdgcn.wave.reduce.umin", [bits, fx.Int32(0).ir_value()], [], [])
+    return ArithValue(acc) + ArithValue(arith.bitcast(T.f32, minimum))
+
+
+BODIES = {
+    "sum": _sum,
+    "raw_sum": _raw_sum,
+    "min": _min,
+    "shuffle": _shuffle,
+    "store_reload": _store_reload,
+    "intrinsic_reduce": _intrinsic_reduce,
+}
 INIT = {"min": 1.0e30}
 
 
@@ -130,6 +144,8 @@ def _run(launch, n):
         ("shuffle", False),
         ("shuffle", True),
         ("store_reload", False),
+        ("intrinsic_reduce", False),
+        ("intrinsic_reduce", True),
     ],
 )
 def test_prefetch_depth_matches_plain_range(body_name, i32_bounds, depth):
@@ -169,11 +185,48 @@ def _bounds_launcher(depth):
 def test_prefetch_depth_runtime_bounds(depth):
     # An empty range with ub < lb must stay empty (the unroller's trip count wraps without a clamp).
     reference, pipelined = _bounds_launcher(None), _bounds_launcher(depth)
-    inp = torch.arange(1024, device="cuda", dtype=torch.float32)
-    for bounds in [(100, 90, 4), (100, 99, 1), (5, 5, 1), (0, 3, 1), (90, 100, 4), (3, 1000, 7)]:
+    inp = torch.arange(1, 1025, device="cuda", dtype=torch.float32)
+    for bounds in [
+        (100, 90, 4),
+        (100, 99, 1),
+        (5, 5, 1),
+        (0, 3, 1),
+        (90, 100, 4),
+        (3, 1000, 7),
+        (0, -(1 << 31), 1),
+        (-(1 << 31), -(1 << 31), 1),
+        (0, 1, 1 << 30),
+        (0, 1, (1 << 31) - 1),
+    ]:
         want = _launch_and_read(reference, inp, *bounds, out_init=-1.0)
         got = _launch_and_read(pipelined, inp, *bounds, out_init=-1.0)
         assert torch.equal(got, want), bounds
+
+
+def _static_launcher(depth, trips):
+    @flyc.kernel(known_block_size=[BLK, 1, 1])
+    def k(inp: fx.Tensor, out: fx.Tensor) -> None:
+        rin = buffer_ops.create_buffer_resource(inp, max_size=True)
+        tid = arith.index_cast(T.i32, gpu.thread_id("x"))
+        acc = fx.Float32(0.0)
+        for i in range(trips, prefetch_depth=depth):
+            acc = ArithValue(acc) + ArithValue(_load(rin, ArithValue(tid) + ArithValue(i) * BLK))
+        buffer_ops.buffer_store(acc, buffer_ops.create_buffer_resource(out, max_size=True), tid)
+
+    @flyc.jit
+    def launch(inp: fx.Tensor, out: fx.Tensor, stream: fx.Stream):
+        k(inp, out).launch(grid=(1, 1, 1), block=(BLK, 1, 1), stream=stream)
+
+    return launch
+
+
+@pytest.mark.parametrize("depth", [1, 4])
+@pytest.mark.parametrize("trips", [0, 1, 3, 4, 5, 8])
+def test_prefetch_depth_static_bounds(depth, trips):
+    inp = torch.arange(BLK * 8, device="cuda", dtype=torch.float32)
+    want = _launch_and_read(_static_launcher(None, trips), inp)
+    got = _launch_and_read(_static_launcher(depth, trips), inp)
+    assert torch.equal(got, want)
 
 
 def _strided_launcher(depth):

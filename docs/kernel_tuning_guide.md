@@ -310,10 +310,12 @@ for i, state in range(fx.Int32(tid), n, fx.Int32(BLOCK), init=[fx.Float32(0.0)],
 ```
 
 The iterations that don't fill a group of N run in a plain loop after the
-pipelined one. Loads, stores and atomics of iterations past the trip count are
-skipped (each sits under a branch in the loop's prologue and epilogue), so the
-pipelined loop never reads or writes memory the plain loop wouldn't. An address
-carried from one iteration to the next (a pointer bumped after its load) works.
+pipelined one. Loads, stores, atomics and arithmetic that is undefined for some
+inputs (integer division and remainder, including `//` and `%`) of iterations
+past the trip count are skipped under branches in the prologue and epilogue, so
+the pipelined loop never reads or writes memory the plain loop wouldn't. An
+address carried from one iteration to the next (a pointer bumped after its load)
+works.
 `prefetch_depth` cannot be combined with `unroll` or `unroll_full`.
 
 **Contract.** Loads move ahead of the stores of earlier iterations, so a load
@@ -326,14 +328,18 @@ a load that follows a possible store in the body keeps the loop as it is.
 when it contains a barrier, a copy into or out of LDS or an asynchronous copy, a
 print or an assert, a load after a possible store in the same iteration, no load
 at the top level of the body, a load whose address comes from a side effect (an
-atomic's result), or a loaded value of a type other than an integer, float,
-vector, index or pointer. The warning points at the loop's source line when
-`FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1`, and only appears when the kernel is actually
-compiled (not on a JIT cache hit). Shuffles, ballots and other lane-exchange ops
-are supported; unless the compiler can prove the loop bounds are the same in
-every lane (kernel arguments, constants and block ids, through arithmetic), it
-adds one wave reduction before the loop, as for a grid-stride loop starting at
-the lane id.
+atomic's result), or an operation that needs guarding but returns a type other
+than an integer, float, vector, index or pointer. Narrow integer loop bounds are
+widened to i64 while the body keeps its original induction type. For N > 1, the
+loop is also left unchanged if a constant `step * N` overflows a signed 64-bit
+integer; a runtime i64/index step is assumed to stay below `2**63 / N`. The
+warning points at the loop's source line when `FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1`,
+and only appears when the kernel is actually compiled (not on a JIT cache hit).
+Shuffles, ballots and other lane-exchange ops are supported; calls (including
+`ffi`), inline asm and AMDGPU intrinsic calls count as lane exchanges. Unless the
+compiler can prove the loop bounds are the same in every lane (kernel arguments,
+constants and block ids, through arithmetic), such a loop gets one wave
+reduction before it, as for a grid-stride loop starting at the lane id.
 
 **When it pays off.** Each lane must run many more iterations than N, and the
 loop must be waiting on its loads. A loop that runs only a few iterations per
