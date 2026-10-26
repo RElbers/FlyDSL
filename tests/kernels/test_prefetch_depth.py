@@ -21,7 +21,7 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, gpu, rocdl
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
-from flydsl.runtime.device import get_warp_size
+from flydsl.runtime.device import get_warp_size, is_rdna_arch
 from kernels.common import buffer_ops, mem_ops
 
 pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
@@ -418,3 +418,164 @@ def test_prefetch_depth_runs_in_the_compile_pipeline(body, depth, tmp_path, monk
         args = (inp, torch.zeros_like(inp), BLK * 8)
     want = 1 if depth is None else 2 * depth + 1
     assert _buffer_loads_in_llvm_ir(launch, args, tmp_path, monkeypatch) == want
+
+
+def _multi_wave_launcher(depth, threads, blocks):
+    # A grid-stride loop over all threads of the grid; the shuffle needs the wave-uniform split, which
+    # works per wave.
+    @flyc.kernel(known_block_size=[threads, 1, 1])
+    def k(inp: fx.Tensor, out: fx.Tensor, n: fx.Int32) -> None:
+        rin = buffer_ops.create_buffer_resource(inp, max_size=True)
+        tid = arith.index_cast(T.i32, gpu.thread_id("x"))
+        g = ArithValue(arith.index_cast(T.i32, gpu.block_id("x"))) * threads + ArithValue(tid)
+        acc = fx.Float32(0.0)
+        for i in range(fx.Int32(g), n, fx.Int32(threads * blocks), prefetch_depth=depth):
+            x = _load(rin, i)
+            acc = ArithValue(acc) + ArithValue(x) * ArithValue(gpu.shuffle_xor(x, 1, BLK))
+        buffer_ops.buffer_store(acc, buffer_ops.create_buffer_resource(out, max_size=True), g)
+
+    @flyc.jit
+    def launch(inp: fx.Tensor, out: fx.Tensor, n: fx.Int32, stream: fx.Stream):
+        k(inp, out, n).launch(grid=(blocks, 1, 1), block=(threads, 1, 1), stream=stream)
+
+    return launch
+
+
+@pytest.mark.parametrize("depth", [1, 4, 16])
+@pytest.mark.parametrize(
+    "threads, blocks",
+    [(BLK * 4, 4), (BLK * 3 // 4, 1)],
+    ids=["4_waves_4_blocks", "partial_wave"],
+)
+def test_prefetch_depth_multi_wave(threads, blocks, depth):
+    reference, pipelined = _multi_wave_launcher(None, threads, blocks), _multi_wave_launcher(depth, threads, blocks)
+    inp = torch.rand(BLK * 512, device="cuda", generator=torch.Generator(device="cuda").manual_seed(0))
+    total = threads * blocks
+    for n in (0, 5, total * 3 + 77, total * 9 + total // 2):
+        outs = []
+        for launch in (reference, pipelined):
+            out = torch.zeros(total, device="cuda")
+            launch(inp, out, n, torch.cuda.current_stream())
+            torch.cuda.synchronize()
+            outs.append(out.cpu())
+        assert torch.equal(*outs), f"n={n}"
+
+
+def _nested_launcher(depth):
+    # Both loops are marked; the inner one runs a constant 7 trips, below most depths.
+    @flyc.kernel(known_block_size=[BLK, 1, 1])
+    def k(inp: fx.Tensor, out: fx.Tensor, n: fx.Int32) -> None:
+        rin = buffer_ops.create_buffer_resource(inp, max_size=True)
+        tid = arith.index_cast(T.i32, gpu.thread_id("x"))
+        acc = fx.Float32(0.0)
+        for j in range(fx.Int32(0), n, fx.Int32(1), prefetch_depth=depth):
+            inner = fx.Float32(_load(rin, ArithValue(j) * BLK + ArithValue(tid)))
+            for i in range(fx.Int32(0), fx.Int32(7), fx.Int32(1), prefetch_depth=depth):
+                inner = ArithValue(inner) + ArithValue(
+                    _load(rin, (ArithValue(j) + ArithValue(i)) * BLK + ArithValue(tid))
+                )
+            acc = ArithValue(acc) + ArithValue(inner)
+        buffer_ops.buffer_store(acc, buffer_ops.create_buffer_resource(out, max_size=True), tid)
+
+    @flyc.jit
+    def launch(inp: fx.Tensor, out: fx.Tensor, n: fx.Int32, stream: fx.Stream):
+        k(inp, out, n).launch(grid=(1, 1, 1), block=(BLK, 1, 1), stream=stream)
+
+    return launch
+
+
+LAYOUT_ROW = BLK * 4  # each lane copies 4 floats of a row
+
+
+def _layout_launcher(depth):
+    # The layout API: a buffer tensor, a tiled copy into a register fragment, one row per iteration.
+    @flyc.kernel(known_block_size=[BLK, 1, 1])
+    def k(A: fx.Tensor, Out: fx.Tensor, n: fx.Int32):
+        tid = fx.thread_idx.x
+        tiles = fx.zipped_divide(fx.rocdl.make_buffer_tensor(A), (1, LAYOUT_ROW))
+        copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
+        tile_mn, tv = fx.make_layout_tv(fx.make_layout((1, BLK), (1, 1)), fx.make_layout((1, 4), (1, 1)))
+        thr_copy = fx.make_tiled_copy(copy_atom, tv, tile_mn).get_slice(tid)
+        acc = fx.Float32(0.0)
+        for t, st in range(fx.Int32(0), n, fx.Int32(1), init=[fx.Float32(0.0)], prefetch_depth=depth):
+            src = thr_copy.partition_S(fx.slice(tiles, (None, t)))
+            frag = fx.make_fragment_like(src)
+            fx.copy(copy_atom, src, frag)
+            total = st[0]
+            for a in fx.range_constexpr(4):
+                total = total + frag[a]
+            acc = yield [total]
+        Out[tid] = acc
+
+    @flyc.jit
+    def launch(A: fx.Tensor, Out: fx.Tensor, n: fx.Int32, stream: fx.Stream):
+        k(A, Out, n).launch(grid=(1, 1, 1), block=(BLK, 1, 1), stream=stream)
+
+    return launch
+
+
+def _mfma_launcher(depth, lane_bounds):
+    # Each iteration loads a vec4 of f16 per lane and accumulates one 16x16x16 MFMA. The guarded
+    # prologue and epilogue feed the MFMA zeros for out-of-range iterations. With lane_bounds the
+    # lower bound is computed from the lane id (tid // BLK, 0 in every lane), so the pass can't prove
+    # it uniform and splits the loop at the wave's shortest trip count. The trip counts still match:
+    # an MFMA ignores the exec mask, so with lanes on different trip counts even plain range would
+    # leave unspecified values in the inactive lanes.
+    @flyc.kernel(known_block_size=[BLK, 1, 1])
+    def k(inp: fx.Tensor, out: fx.Tensor, n: fx.Int32) -> None:
+        rin = buffer_ops.create_buffer_resource(inp, max_size=True)
+        tid = arith.index_cast(T.i32, gpu.thread_id("x"))
+        lo = ArithValue(tid) // BLK if lane_bounds else fx.Int32(0)
+        zero = arith.constant_vector(0.0, T.vec(4, T.f32))
+        acc = zero
+        for i, st in range(lo, n, fx.Int32(1), init=[zero], prefetch_depth=depth):
+            e = ArithValue(arith.index_cast(T.i32, i)) * BLK + ArithValue(tid)
+            a = buffer_ops.buffer_load(rin, e * 4, vec_width=4, dtype=T.f16)
+            acc = yield [rocdl.mfma_f32_16x16x16f16(T.vec(4, T.f32), [a, a, st[0]])]
+        buffer_ops.buffer_store(acc, buffer_ops.create_buffer_resource(out, max_size=True), ArithValue(tid) * 4)
+
+    @flyc.jit
+    def launch(inp: fx.Tensor, out: fx.Tensor, n: fx.Int32, stream: fx.Stream):
+        k(inp, out, n).launch(grid=(1, 1, 1), block=(BLK, 1, 1), stream=stream)
+
+    return launch
+
+
+def _compare_on_sizes(reference, pipelined, inp, sizes, out_len):
+    for n in sizes:
+        outs = []
+        for launch in (reference, pipelined):
+            out = torch.zeros(out_len, device="cuda")
+            launch(inp, out, n, torch.cuda.current_stream())
+            torch.cuda.synchronize()
+            outs.append(out.cpu())
+        assert torch.equal(*outs), f"n={n}"
+
+
+@pytest.mark.parametrize("depth", [1, 4])
+def test_prefetch_depth_nested_loops(depth):
+    inp = torch.rand(BLK * 64, device="cuda", generator=torch.Generator(device="cuda").manual_seed(0))
+    _compare_on_sizes(_nested_launcher(None), _nested_launcher(depth), inp, (0, 1, 3, 37), BLK)
+
+
+@pytest.mark.parametrize("depth", [1, 4, 16])
+def test_prefetch_depth_layout_api(depth):
+    inp = torch.rand(300, LAYOUT_ROW, device="cuda", generator=torch.Generator(device="cuda").manual_seed(0))
+    _compare_on_sizes(_layout_launcher(None), _layout_launcher(depth), inp, (0, 1, 3, 4, 5, 37, 300), BLK)
+
+
+def test_prefetch_depth_layout_api_is_pipelined(tmp_path, monkeypatch):
+    # The fragment of fx.copy is promoted to registers before the pass, so its load is pipelined.
+    inp = torch.rand(8, LAYOUT_ROW, device="cuda")
+    args = (inp, torch.zeros(BLK, device="cuda"), 8)
+    assert _buffer_loads_in_llvm_ir(_layout_launcher(4), args, tmp_path, monkeypatch) == 9
+
+
+@pytest.mark.skipif(is_rdna_arch() or BLK != 64, reason="MFMA needs a CDNA GPU")
+@pytest.mark.parametrize("depth", [1, 4, 16])
+@pytest.mark.parametrize("lane_bounds", [False, True], ids=["uniform_bounds", "lane_id_bounds"])
+def test_prefetch_depth_mfma(lane_bounds, depth):
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    inp = torch.rand(BLK * 4 * 64, device="cuda", generator=gen).to(torch.float16)
+    reference, pipelined = _mfma_launcher(None, lane_bounds), _mfma_launcher(depth, lane_bounds)
+    _compare_on_sizes(reference, pipelined, inp, (0, 1, 3, 5, 37), BLK * 4)
