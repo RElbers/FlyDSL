@@ -1021,8 +1021,8 @@ class InsertEmptyYieldForSCFFor(Transformer):
     def _apply_loop_prefetch(for_op, prefetch_depth, unroll, unroll_full, assume_independent):
         """Mark an ``scf.for`` for the ``fly-rocdl-prefetch-loops`` pass.
 
-        ``prefetch_depth=N`` asks for the loads of up to N future iterations to
-        stay in flight across the backedge. The pass unrolls the loop itself, so
+        ``prefetch_depth=N`` asks for N loads per lane to be in flight at once,
+        overlapping the compute on the previous N. The pass unrolls the loop itself, so
         it cannot be combined with ``unroll`` / ``unroll_full``. A loop that may
         write memory is left unchanged unless ``prefetch_assume_independent=True``
         asserts that no iteration reads memory an earlier iteration wrote: the

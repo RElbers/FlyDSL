@@ -298,10 +298,13 @@ Three pitfalls (all covered in `/prefetch-data-load`):
 
 For a loop that waits on its global loads, the compiler can do the prefetch
 above itself. `prefetch_depth=N` unrolls the loop by N and software-pipelines
-it: each pass issues the loads of the next N iterations before computing on the
-previous N, so up to N loads per lane stay in flight across the backedge instead
-of one load and a `s_waitcnt vmcnt(0)` per iteration. It works on runtime trip
-counts, with or without `init=`:
+it: each pass issues the loads of the next N iterations together and computes on
+the previous N while they are in flight, so N loads per lane overlap each other
+and that compute instead of one load being waited on per iteration. The loop
+still waits for the group (`s_waitcnt vmcnt`) before its backedge, because the
+loaded values are carried into the next pass in registers; the gain comes from
+the N loads in flight at once, so a deeper N hides more latency. It works on
+runtime trip counts, with or without `init=`:
 
 ```python
 for i, state in range(fx.Int32(tid), n, fx.Int32(BLOCK), init=[fx.Float32(0.0)], prefetch_depth=8):

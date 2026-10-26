@@ -381,3 +381,31 @@ def test_prefetch_depth_accumulator_in_memory_left_unchanged(depth, assume):
         want = _launch_and_read(reference, inp, n)
         got = _launch_and_read(candidate, inp, n)
         assert torch.equal(got, want), f"n={n}"
+
+
+def _buffer_loads_in_llvm_ir(launch, args, tmp_path, monkeypatch):
+    monkeypatch.setenv("FLYDSL_DUMP_IR", "1")
+    monkeypatch.setenv("FLYDSL_DUMP_DIR", str(tmp_path))
+    monkeypatch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
+    launch(*args, torch.cuda.current_stream())
+    torch.cuda.synchronize()
+    dumped = list(tmp_path.glob("*/*_llvm_ir.ll"))
+    assert len(dumped) == 1, dumped
+    return sum("call" in line and "buffer.load" in line for line in dumped[0].read_text().splitlines())
+
+
+@pytest.mark.parametrize("depth", [None, 4])
+@pytest.mark.parametrize("body", ["sum", "scatter"])
+def test_prefetch_depth_runs_in_the_compile_pipeline(body, depth, tmp_path, monkeypatch):
+    # The other tests only compare against plain range, which also passes if the pass never runs.
+    # Pipelined at depth N, the loop's one load becomes N guarded prologue loads, N steady-state
+    # loads and one in the remainder loop.
+    inp = torch.rand(BLK * 8, device="cuda")
+    if body == "sum":
+        launch = _launcher("sum", depth, i32_bounds=True)
+        args = (inp, torch.zeros_like(inp), torch.zeros(BLK, device="cuda"), BLK * 8)
+    else:
+        launch = _scatter_launcher(depth)
+        args = (inp, torch.zeros_like(inp), BLK * 8)
+    want = 1 if depth is None else 2 * depth + 1
+    assert _buffer_loads_in_llvm_ir(launch, args, tmp_path, monkeypatch) == want

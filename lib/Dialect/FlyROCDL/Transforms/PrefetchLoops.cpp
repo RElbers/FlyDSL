@@ -2,14 +2,16 @@
 // Copyright (c) 2026 FlyDSL Project Contributors
 //
 // Software-pipeline the `scf.for` loops that carry `fly.prefetch_depth = N` (set by
-// `range(..., prefetch_depth=N)`) so the loads of up to N future iterations stay in flight across
-// the backedge. Run inside gpu.module() AFTER convert-fly-to-rocdl, while the loads are ROCDL ops
-// and the loop is still an scf.for.
+// `range(..., prefetch_depth=N)`) so N loads per lane are in flight at once. Run inside
+// gpu.module() AFTER convert-fly-to-rocdl, while the loads are ROCDL ops and the loop is still an
+// scf.for.
 //
-// A rolled runtime-trip loop otherwise drains `s_waitcnt vmcnt(0)` at every backedge: each
-// iteration's single load is waited on before the next one issues. The pass unrolls the loop by N,
-// so the steady state has N distinct loads (N rotating destination registers), and then pipelines
-// it in two stages: loads plus their address math first, everything else one iteration later.
+// A rolled runtime-trip loop otherwise waits for each iteration's single load before the next one
+// issues. The pass unrolls the loop by N and then pipelines it in two stages: loads plus their
+// address math first, everything else one iteration later. Each steady-state iteration issues the
+// N loads of the next group together and computes on the previous group while they are in flight.
+// It still waits for them before its backedge, since the loaded values are carried into the next
+// iteration in registers.
 // In the prologue and epilogue of a runtime trip count, `predicateOp` guards reads and side effects
 // so they only run for in-range iterations. Loads move ahead of earlier iterations' writes, so a
 // loop that may write memory is only pipelined when `fly.prefetch_assume_independent` (set by
@@ -24,6 +26,7 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/TypeUtilities.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/RegionUtils.h"
@@ -324,6 +327,9 @@ void widenLoopBounds(RewriterBase &rewriter, scf::ForOp forOp) {
   forOp.setLowerBound(extend(forOp.getLowerBound()));
   forOp.setUpperBound(extend(forOp.getUpperBound()));
   forOp.setStep(extend(forOp.getStep()));
+  // Zero-extended bounds are below 2^32, so a signed i64 comparison gives the same trip count, and
+  // the unroller and the pipeliner only handle signed ones.
+  forOp.setUnsignedCmp(false);
   Value iv = forOp.getInductionVar();
   iv.setType(rewriter.getI64Type());
   rewriter.setInsertionPointToStart(forOp.getBody());
@@ -419,11 +425,14 @@ void buildLoadComputeSchedule(scf::ForOp forOp,
 
 // A type `zeroValue` can build a placeholder for.
 bool hasZeroValue(Type t) {
-  return isa<IntegerType, IndexType, FloatType, VectorType, LLVM::LLVMPointerType>(t);
+  if (auto vec = dyn_cast<VectorType>(t))
+    t = vec.getElementType();
+  return isa<IntegerType, IndexType, FloatType, LLVM::LLVMPointerType>(t);
 }
 
 Value zeroValue(OpBuilder &b, Location loc, Type t) {
-  if (isa<LLVM::LLVMPointerType>(t))
+  // getZeroAttr has no pointer attribute, for a pointer or a vector of them.
+  if (isa<LLVM::LLVMPointerType>(getElementTypeOrSelf(t)))
     return LLVM::ZeroOp::create(b, loc, t);
   return arith::ConstantOp::create(b, loc, cast<TypedAttr>(b.getZeroAttr(t)));
 }
@@ -636,6 +645,12 @@ public:
       }
 
       widenLoopBounds(rewriter, forOp);
+      // Widening made narrow unsigned loops signed; a 64-bit unsigned one can't be widened.
+      if (forOp.getUnsignedCmp()) {
+        notPipelined(forOp, "it compares 64-bit bounds unsigned, which the pipeliner does not "
+                            "support");
+        continue;
+      }
       // Both unrolling and peeling assume a nonnegative span. Clamp even at depth one, where
       // subtracting a step from an empty range's original upper bound could underflow.
       rewriter.setInsertionPoint(forOp);
@@ -646,6 +661,7 @@ public:
                           : rewriter.createOrFold<arith::MaxSIOp>(forOp.getLoc(), lb, ub);
       forOp.setUpperBound(clamped);
       scf::ForOp target = forOp;
+      bool unrolled = false;
       if (depth > 1) {
         // The remainder loop stays serial. Keep a one-iteration main loop alive for the pipeliner.
         FailureOr<UnrolledLoopInfo> info = loopUnrollByFactor(
@@ -654,6 +670,7 @@ public:
           if (!info->mainLoopOp)
             continue;
           target = *info->mainLoopOp;
+          unrolled = true;
         }
       }
 
@@ -684,8 +701,12 @@ public:
                              << ": pipelining failed after changing the loop: " << pipelinerMessage;
           return signalPassFailure();
         }
-        notPipelined(target, "the pipeliner rejected it (" + pipelinerMessage +
-                                 "); the loop is only unrolled");
+        std::string why = "the pipeliner rejected it";
+        if (!pipelinerMessage.empty())
+          why += " (" + pipelinerMessage + ")";
+        if (unrolled)
+          why += "; the loop is only unrolled";
+        notPipelined(target, why);
       }
     }
   }

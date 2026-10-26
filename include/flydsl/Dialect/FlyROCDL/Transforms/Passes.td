@@ -34,9 +34,11 @@ def FlyROCDLPrefetchLoopsPass : Pass<"fly-rocdl-prefetch-loops"> {
   let summary = "Software-pipeline scf.for loops marked with fly.prefetch_depth";
   let description = [{
     Rewrites each `scf.for` carrying `fly.prefetch_depth = N` (set by
-    `range(..., prefetch_depth=N)`) so the loads of up to N future iterations
-    stay in flight across the backedge, instead of draining `vmcnt(0)` every
-    iteration. The loop is unrolled by N and pipelined in two stages; in the
+    `range(..., prefetch_depth=N)`) so N loads per lane are in flight at once,
+    instead of waiting for each iteration's load before the next one issues.
+    The loop is unrolled by N and pipelined in two stages: each steady-state
+    iteration issues the next N loads together and computes on the previous N
+    while they are in flight (it still waits for them before its backedge). In the
     prologue and epilogue of a runtime trip count, reads, side effects and
     integer division or remainder only run for in-range iterations. Loads move
     ahead of earlier iterations' writes, so a loop that may write memory is only

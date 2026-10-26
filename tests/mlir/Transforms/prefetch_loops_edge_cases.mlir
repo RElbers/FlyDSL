@@ -414,4 +414,74 @@ gpu.module @prefetch_edges {
     llvm.store %final, %out : f32, !llvm.ptr<1>
     gpu.return
   }
+
+  // A guarded load of a vector of pointers gets a zero placeholder from llvm.mlir.zero, since
+  // getZeroAttr has no pointer attribute.
+  // CHECK-LABEL: gpu.func @vector_of_pointers
+  // CHECK: llvm.mlir.zero : vector<2x!llvm.ptr<1>>
+  // CHECK: scf.for
+  // CHECK: gpu.return
+  gpu.func @vector_of_pointers(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    scf.for %i = %c0 to %n step %c1 : i32 {
+      %p = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, vector<2x!llvm.ptr<1>>
+      %v = llvm.load %p : !llvm.ptr<1> -> vector<2x!llvm.ptr<1>>
+      %q = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, vector<2x!llvm.ptr<1>>
+      llvm.store %v, %q : vector<2x!llvm.ptr<1>>, !llvm.ptr<1>
+    } {fly.prefetch_assume_independent, fly.prefetch_depth = 2 : i64}
+    gpu.return
+  }
+
+  // Narrow unsigned bounds are zero-extended to i64 and compared signed, which the unroller and
+  // the pipeliner handle; the static loop is unrolled by 4 with a two-iteration remainder.
+  // CHECK-LABEL: gpu.func @unsigned_static
+  // CHECK-NOT: scf.for unsigned
+  // CHECK: scf.for %{{.*}} = %c8_i64 to %c10_i64 step %c1_i64 : i64
+  // CHECK: gpu.return
+  gpu.func @unsigned_static(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>) kernel {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c10 = arith.constant 10 : i32
+    scf.for unsigned %i = %c0 to %c10 step %c1 : i32 {
+      %p = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      %v = llvm.load %p : !llvm.ptr<1> -> f32
+      %q = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      llvm.store %v, %q : f32, !llvm.ptr<1>
+    } {fly.prefetch_assume_independent, fly.prefetch_depth = 4 : i64}
+    gpu.return
+  }
+
+  // CHECK-LABEL: gpu.func @unsigned_dynamic
+  // CHECK: arith.extui %arg2 : i32 to i64
+  // CHECK-NOT: scf.for unsigned
+  // CHECK: scf.if {{.*}} -> (f32
+  // CHECK: scf.for {{.*}} : i64
+  // CHECK: gpu.return
+  gpu.func @unsigned_dynamic(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    scf.for unsigned %i = %c0 to %n step %c1 : i32 {
+      %p = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      %v = llvm.load %p : !llvm.ptr<1> -> f32
+      %q = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      llvm.store %v, %q : f32, !llvm.ptr<1>
+    } {fly.prefetch_assume_independent, fly.prefetch_depth = 4 : i64}
+    gpu.return
+  }
+
+  // CHECK-LABEL: gpu.func @unsigned_wide
+  // CHECK: scf.for unsigned
+  gpu.func @unsigned_wide(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i64) kernel {
+    %c0 = arith.constant 0 : i64
+    %c1 = arith.constant 1 : i64
+    // expected-remark @below {{loop not pipelined (prefetch_depth=4): it compares 64-bit bounds unsigned, which the pipeliner does not support}}
+    scf.for unsigned %i = %c0 to %n step %c1 : i64 {
+      %p = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i64) -> !llvm.ptr<1>, f32
+      %v = llvm.load %p : !llvm.ptr<1> -> f32
+      %q = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i64) -> !llvm.ptr<1>, f32
+      llvm.store %v, %q : f32, !llvm.ptr<1>
+    } {fly.prefetch_assume_independent, fly.prefetch_depth = 4 : i64}
+    gpu.return
+  }
 }
