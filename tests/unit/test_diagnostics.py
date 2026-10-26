@@ -266,3 +266,33 @@ def test_ir_warning_does_not_replace_compile_error(action):
 
         assert raised.value.diagnostics == [DiagRecord("bad op", [SourceFrame("user_kernel.py", 12, 8, 8)])]
         ctx.attach_diagnostic_handler.return_value.detach.assert_called_once()
+
+
+@pytest.mark.l1b_target_dialect
+@pytest.mark.rocm_lower
+def test_mlir_pass_warning_as_error_propagates(capsys):
+    from flydsl._mlir.passmanager import PassManager
+
+    text = """
+    gpu.module @m {
+      gpu.func @k(%p: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
+        %c0 = arith.constant 0 : i32
+        %c1 = arith.constant 1 : i32
+        scf.for %i = %c0 to %n step %c1 : i32 {
+          %v = llvm.load %p : !llvm.ptr<1> -> i32
+          gpu.barrier
+          llvm.store %v, %out : i32, !llvm.ptr<1>
+        } {fly.prefetch_depth = 4 : i64} loc("user_kernel.py":12:8)
+        gpu.return
+      }
+    }
+    """
+    with ir.Context() as ctx, warnings.catch_warnings():
+        warnings.simplefilter("error")
+        module = ir.Module.parse(text)
+        with pytest.raises(UserWarning, match="loop not pipelined.*it contains a barrier"):
+            with diagnostics.dsl_ir_diagnostics(ctx) as errors:
+                PassManager.parse("builtin.module(gpu.module(fly-rocdl-prefetch-loops))").run(module.operation)
+        assert errors == []
+
+    assert "Diagnostic handler raised exception" not in capsys.readouterr().err

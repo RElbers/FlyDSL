@@ -155,8 +155,9 @@ def install_excepthook() -> None:
 def dsl_ir_diagnostics(ctx):
     """Collect the MLIR errors emitted during a ``with`` block as a list of :class:`DiagRecord`.
 
-    Warnings and remarks become Python warnings at the user's source line once the block succeeds;
-    the Python bindings would otherwise drop them.
+    Warnings and remarks (for example a loop marked with ``prefetch_depth`` that a pass leaves
+    unchanged) become Python warnings at the user's source line once the block succeeds; the Python
+    bindings would otherwise drop them.
     """
     records: list = []
     pending_warnings: list = []
