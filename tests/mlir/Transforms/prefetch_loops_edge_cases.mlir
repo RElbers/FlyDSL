@@ -592,4 +592,52 @@ gpu.module @prefetch_edges {
     llvm.store %r, %out : f32, !llvm.ptr<1>
     gpu.return
   }
+
+  // A Python range counting down lowers to a negative step, which scf.for does not allow; the
+  // remark names that rather than an overflow, at any depth.
+  // CHECK-LABEL: gpu.func @negative_step
+  // CHECK: scf.for
+  // CHECK-NEXT: llvm.getelementptr
+  // CHECK: scf.for
+  // CHECK-NEXT: llvm.getelementptr
+  gpu.func @negative_step(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
+    %c0 = arith.constant 0 : i32
+    %cm1 = arith.constant -1 : i32
+    %f0 = arith.constant 0.0 : f32
+    // expected-remark @below {{loop not pipelined (prefetch_depth=4): its step is not positive, which scf.for does not allow}}
+    %r = scf.for %i = %n to %c0 step %cm1 iter_args(%acc = %f0) -> f32 : i32 {
+      %p = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      %v = llvm.load %p : !llvm.ptr<1> -> f32
+      %s = arith.addf %acc, %v : f32
+      scf.yield %s : f32
+    } {fly.prefetch_depth = 4 : i64}
+    // expected-remark @below {{loop not pipelined (prefetch_depth=1): its step is not positive, which scf.for does not allow}}
+    %r1 = scf.for %i = %n to %c0 step %cm1 iter_args(%acc = %r) -> f32 : i32 {
+      %p = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      %v = llvm.load %p : !llvm.ptr<1> -> f32
+      %s = arith.addf %acc, %v : f32
+      scf.yield %s : f32
+    } {fly.prefetch_depth = 1 : i64}
+    llvm.store %r1, %out : f32, !llvm.ptr<1>
+    gpu.return
+  }
+
+  // An unsigned loop compares its step unsigned, so an all-ones i32 step is 2^32 - 1, not -1. It is
+  // widened to i64, so step * depth fits and the loop is pipelined.
+  // CHECK-LABEL: gpu.func @unsigned_large_step
+  // CHECK: scf.if
+  // CHECK: scf.for {{.*}} : i64
+  gpu.func @unsigned_large_step(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
+    %c0 = arith.constant 0 : i32
+    %big = arith.constant -1 : i32
+    %f0 = arith.constant 0.0 : f32
+    %r = scf.for unsigned %i = %c0 to %n step %big iter_args(%acc = %f0) -> f32 : i32 {
+      %p = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      %v = llvm.load %p : !llvm.ptr<1> -> f32
+      %s = arith.addf %acc, %v : f32
+      scf.yield %s : f32
+    } {fly.prefetch_depth = 4 : i64}
+    llvm.store %r, %out : f32, !llvm.ptr<1>
+    gpu.return
+  }
 }

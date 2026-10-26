@@ -332,6 +332,19 @@ Value fromI64(RewriterBase &rewriter, Location loc, Value v, Type ty) {
   return v;
 }
 
+// The loop's constant step as the loop compares it: zero-extended for an unsigned loop (clamped to
+// INT64_MAX when it doesn't fit), sign-extended otherwise.
+std::optional<int64_t> getConstantStep(scf::ForOp forOp) {
+  APInt step;
+  if (!matchPattern(forOp.getStep(), m_ConstantInt(&step)))
+    return std::nullopt;
+  if (!forOp.getUnsignedCmp())
+    return step.getSExtValue();
+  if (step.getActiveBits() >= 64)
+    return std::numeric_limits<int64_t>::max();
+  return static_cast<int64_t>(step.getZExtValue());
+}
+
 // Keep the unroller's scaled step and the pipeliner's peeled bounds out of narrow integer types.
 // The body still sees the original induction type, including its original wrapping arithmetic.
 void widenLoopBounds(RewriterBase &rewriter, scf::ForOp forOp) {
@@ -727,17 +740,23 @@ public:
         notPipelined(forOp, why);
         continue;
       }
+      // A Python range that counts down (range(n, 0, -1)) lowers to such a step.
+      std::optional<int64_t> step = getConstantStep(forOp);
+      if (step && *step <= 0) {
+        notPipelined(forOp, "its step is not positive, which scf.for does not allow");
+        continue;
+      }
       if (depth > 1) {
         // Narrow bounds are widened below, so a narrow runtime step is bounded by its type. A
         // runtime 64-bit or index step is assumed to stay below 2^63 / depth.
-        std::optional<int64_t> maxStep = getConstantIntValue(forOp.getStep());
+        std::optional<int64_t> maxStep = step;
         if (!maxStep) {
           if (auto ty = dyn_cast<IntegerType>(forOp.getStep().getType()); ty && ty.getWidth() < 64)
             maxStep = forOp.getUnsignedCmp()
                           ? APInt::getMaxValue(ty.getWidth()).getZExtValue()
                           : APInt::getSignedMaxValue(ty.getWidth()).getSExtValue();
         }
-        if (maxStep && (*maxStep <= 0 || depth > std::numeric_limits<int64_t>::max() / *maxStep)) {
+        if (maxStep && depth > std::numeric_limits<int64_t>::max() / *maxStep) {
           notPipelined(forOp,
                        "its step multiplied by the depth may overflow a signed 64-bit integer");
           continue;
