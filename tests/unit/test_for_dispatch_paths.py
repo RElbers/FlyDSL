@@ -5,6 +5,10 @@
 
 """MLIR-level unit tests for scf_for_dispatch (no GPU required)."""
 
+import ast
+import types
+from textwrap import dedent
+
 import pytest
 
 from flydsl._mlir.dialects import arith, func
@@ -223,7 +227,7 @@ def test_ast_rewrite_for_multi_var_generates_dispatch():
 # ---------------------------------------------------------------------------
 
 
-def _for_dispatch_ir(*, unroll=-1, unroll_full=False):
+def _for_dispatch_ir(*, unroll=-1, unroll_full=False, prefetch_depth=None, prefetch_assume_independent=False):
     """Build a single-iter-arg scf.for via dispatch and return its module text."""
     with Context(), Location.unknown():
         module = Module.create()
@@ -246,6 +250,8 @@ def _for_dispatch_ir(*, unroll=-1, unroll_full=False):
                     result_values=(acc,),
                     unroll=unroll,
                     unroll_full=unroll_full,
+                    prefetch_depth=prefetch_depth,
+                    prefetch_assume_independent=prefetch_assume_independent,
                 )
                 func.ReturnOp([r.ir_value()])
         assert module.operation.verify()
@@ -303,21 +309,18 @@ def test_scf_range_unroll_annotation():
         assert "llvm.loop_unroll<full = true>" in str(module)
 
 
+def _rewrite_for_loops(fsrc):
+    module = ast.parse(dedent(fsrc))
+    ctx = types.SimpleNamespace(python_globals={}, filename="<t>")
+    rw = InsertEmptyYieldForSCFFor(context=ctx, first_lineno=0)
+    node = rw.visit(module.body[0])
+    return ast.unparse(ast.fix_missing_locations(node))
+
+
 def test_ast_rewrite_for_threads_unroll_kwargs():
     """unroll / unroll_full on range(...) reach the injected dispatch call and
     stay separate from the init routing."""
-    import ast
-    import types
-    from textwrap import dedent
-
-    def rewrite(fsrc):
-        module = ast.parse(dedent(fsrc))
-        ctx = types.SimpleNamespace(python_globals={}, filename="<t>")
-        rw = InsertEmptyYieldForSCFFor(context=ctx, first_lineno=0)
-        node = rw.visit(module.body[0])
-        return ast.unparse(ast.fix_missing_locations(node))
-
-    auto = rewrite("""
+    auto = _rewrite_for_loops("""
         def s(n):
             acc = 0
             for i in range(0, n, 1, unroll=4):
@@ -327,7 +330,7 @@ def test_ast_rewrite_for_threads_unroll_kwargs():
     assert "scf_for_dispatch(" in auto
     assert "unroll=4" in auto
 
-    init_path = rewrite("""
+    init_path = _rewrite_for_loops("""
         def s(n):
             for i, (acc,) in range(0, n, 1, init=[0], unroll_full=True):
                 acc = acc + 1
@@ -410,3 +413,95 @@ def test_no_unroll_hint_after_lowering_by_default():
     ir_text = _for_dispatch_lowered_to_llvm()
     assert "loop_annotation" not in ir_text
     assert "llvm.loop_unroll" not in ir_text
+
+
+# ---------------------------------------------------------------------------
+# prefetch_depth: marks the loop for the fly-rocdl-prefetch-loops pass.
+# ---------------------------------------------------------------------------
+
+
+def test_for_dispatch_prefetch_depth_attr():
+    ir_text = _for_dispatch_ir(prefetch_depth=4)
+    assert "fly.prefetch_depth = 4 : i64" in ir_text
+    assert "loop_annotation" not in ir_text
+
+
+def test_for_dispatch_no_prefetch_depth_by_default():
+    assert "fly.prefetch_depth" not in _for_dispatch_ir()
+
+
+@pytest.mark.parametrize("kwargs", [{"unroll": 4}, {"unroll": 1}, {"unroll_full": True}])
+def test_for_dispatch_prefetch_depth_with_unroll_rejected(kwargs):
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _for_dispatch_ir(prefetch_depth=4, **kwargs)
+
+
+@pytest.mark.parametrize("depth", [0, -1, 33])
+def test_for_dispatch_prefetch_depth_out_of_range_rejected(depth):
+    with pytest.raises(ValueError, match="prefetch_depth"):
+        _for_dispatch_ir(prefetch_depth=depth)
+
+
+@pytest.mark.parametrize("depth", [True, "4", 4.0])
+def test_for_dispatch_prefetch_depth_non_int_rejected(depth):
+    with pytest.raises(TypeError, match="prefetch_depth"):
+        _for_dispatch_ir(prefetch_depth=depth)
+
+
+def test_for_dispatch_prefetch_assume_independent_attr():
+    ir_text = _for_dispatch_ir(prefetch_depth=4, prefetch_assume_independent=True)
+    assert "fly.prefetch_assume_independent" in ir_text
+    assert "fly.prefetch_assume_independent" not in _for_dispatch_ir(prefetch_depth=4)
+
+
+def test_for_dispatch_prefetch_assume_independent_requires_depth():
+    with pytest.raises(ValueError, match="requires `prefetch_depth`"):
+        _for_dispatch_ir(prefetch_assume_independent=True)
+
+
+@pytest.mark.parametrize("value", [1, "yes", None])
+def test_for_dispatch_prefetch_assume_independent_non_bool_rejected(value):
+    with pytest.raises(TypeError, match="prefetch_assume_independent"):
+        _for_dispatch_ir(prefetch_depth=4, prefetch_assume_independent=value)
+
+
+def test_scf_range_prefetch_depth_attr():
+    """The init-carrying generator path also honors prefetch_depth."""
+    from flydsl._mlir.dialects import scf
+
+    with Context(), Location.unknown():
+        module = Module.create()
+        i32 = IntegerType.get_signless(32)
+        with InsertionPoint(module.body):
+            f = func.FuncOp("t", FunctionType.get([], []))
+            entry = f.add_entry_block()
+            with InsertionPoint(entry):
+                zero = Int32(arith.ConstantOp(i32, 0).result)
+                for _iv, _args in InsertEmptyYieldForSCFFor.scf_range(
+                    0, 8, 1, init=[zero.ir_value()], prefetch_depth=2, prefetch_assume_independent=True
+                ):
+                    scf.YieldOp(list(_args))
+                func.ReturnOp([])
+        assert module.operation.verify()
+        assert "fly.prefetch_depth = 2 : i64" in str(module)
+        assert "fly.prefetch_assume_independent" in str(module)
+
+
+def test_ast_rewrite_for_threads_prefetch_depth():
+    auto = _rewrite_for_loops("""
+        def s(n):
+            for i in range(0, n, 1, prefetch_depth=8, prefetch_assume_independent=True):
+                pass
+        """)
+    assert "scf_for_dispatch(" in auto
+    assert "prefetch_depth=8" in auto
+    assert "prefetch_assume_independent=True" in auto
+
+    init_path = _rewrite_for_loops("""
+        def s(n):
+            for i, (acc,) in range(0, n, 1, init=[0], prefetch_depth=8):
+                acc = acc + 1
+            return acc
+        """)
+    assert "scf_range(" in init_path
+    assert "prefetch_depth=8" in init_path
