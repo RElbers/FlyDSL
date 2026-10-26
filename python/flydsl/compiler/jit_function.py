@@ -795,9 +795,18 @@ def _run_pipeline(module: ir.Module, fragments: list, *, verifier: bool, print_a
     pm = PassManager.parse(pipeline)
     pm.enable_verifier(verifier)
     pm.enable_ir_printing(print_after_all=print_after_all)
+    _run_pass_manager(pm, module)
+
+
+def _run_pass_manager(pm: PassManager, module: ir.Module) -> None:
+    """Run *pm* on *module*, raising a failure as a DSLCompileError that points at the user's source."""
     with dsl_ir_diagnostics(module.context) as diags:
         try:
             pm.run(module.operation)
+        except ir.MLIRError as exc:
+            # PassManager.run captures the errors into the MLIRError before any other handler sees them.
+            records = diag_records_from_mlir_error(exc)
+            raise DSLCompileError(str(exc), diagnostics=records) from exc
         except Exception as exc:
             raise DSLCompileError(str(exc), diagnostics=diags) from exc
 
@@ -810,12 +819,15 @@ class MlirCompiler:
         try:
             module.operation.verify()
         except ir.MLIRError as exc:
-            raise DSLCompileError("MLIR verification failed", diagnostics=diag_records_from_mlir_error(exc)) from exc
+            records = diag_records_from_mlir_error(exc)
+            raise DSLCompileError("MLIR verification failed", diagnostics=records) from exc
 
         backend = get_backend(arch=arch)
 
         compile_hints = CompilationContext.get_compile_hints()
-        module = ir.Module.parse(module.operation.get_asm(enable_debug_info=env.debug.enable_debug_info))
+        # Keep source locations so pass diagnostics point at user code. They only become DWARF when
+        # the debug-info pass runs.
+        module = ir.Module.parse(module.operation.get_asm(enable_debug_info=True))
         backend.lower_compile_hints(module, compile_hints=compile_hints)
         cfg = _pipeline_fragments_for_mode(backend, compile_hints=compile_hints)
         fragments = cfg.fragments
@@ -869,11 +881,7 @@ class MlirCompiler:
                     stage_name = f"{stage_num:02d}_{_stage_label_from_fragment(frag)}"
                     pm = PassManager.parse(f"builtin.module({frag})")
                     pm.enable_verifier(env.debug.enable_verifier)
-                    with dsl_ir_diagnostics(module.context) as diags:
-                        try:
-                            pm.run(module.operation)
-                        except Exception as exc:
-                            raise DSLCompileError(str(exc), diagnostics=diags) from exc
+                    _run_pass_manager(pm, module)
 
                     stage_asm = module.operation.get_asm(enable_debug_info=True)
                     out = _dump_ir(stage_name, dump_dir=dump_dir, asm=stage_asm)
