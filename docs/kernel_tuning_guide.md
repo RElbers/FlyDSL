@@ -405,15 +405,14 @@ gets slower: the extra prologue, epilogue and remainder code costs more than the
 overlap.
 
 **Compared with `unroll=N`.** Unrolling alone also issues N independent loads
-back to back once LLVM can count the loop's trips and prove the loads don't
-depend on earlier stores. Today it rarely can: FlyDSL emits a loop with 32-bit
-bounds without the no-overflow flag LLVM needs to count the trips, so
-`range(..., unroll=N)` keeps one load in flight there. Where LLVM can count the
-trips, `unroll=N` matches `prefetch_depth=N` on a load-only loop with about half
-the registers. For a loop that stores, LLVM can't prove the input and output
+back to back when the loads don't depend on earlier stores, since LLVM can count
+the trips of a runtime loop (FlyDSL marks each loop increment as not
+overflowing). On a load-only loop, `range(..., unroll=N)` then keeps about as
+many loads in flight as `prefetch_depth=N`, with about half the registers, so
+try it first. For a loop that stores, LLVM can't prove the input and output
 buffers don't overlap, so only `prefetch_depth` with
 `prefetch_assume_independent=True` gets the loads in flight (the MoE sorting
-scatter loop: 29–37% faster, against ±3% for `unroll`). Profile both ways.
+scatter loop: about 30% faster, against ±3% for `unroll`). Profile both ways.
 
 ### Async copy (global → LDS DMA)
 
