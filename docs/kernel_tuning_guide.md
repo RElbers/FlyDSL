@@ -298,18 +298,24 @@ Three pitfalls (all covered in `/prefetch-data-load`):
 
 For a loop that waits on its global loads, the compiler can do the prefetch
 above itself. `prefetch_depth=N` unrolls the loop by N and software-pipelines
-it: each pass issues the loads of the next N iterations together and computes on
-the previous N while they are in flight, so N loads per lane overlap each other
-and that compute instead of one load being waited on per iteration. The loop
-still waits for the group (`s_waitcnt vmcnt`) before its backedge, because the
-loaded values are carried into the next pass in registers; the gain comes from
-the N loads in flight at once, so a deeper N hides more latency. It works on
-runtime trip counts, with or without `init=`:
+it: each pass issues the loads of the next N iterations together, so up to N
+loads per lane are in flight at once instead of one load being waited on per
+iteration. The loop still waits for the group (`s_waitcnt vmcnt`) before its
+backedge, because the loaded values are carried into the next pass in
+registers, and how much of the compute the loads overlap depends on register
+allocation: check the waits in the ISA. It works on runtime trip counts, with or
+without `init=`:
 
 ```python
-for i, state in range(fx.Int32(tid), n, fx.Int32(BLOCK), init=[fx.Float32(0.0)], prefetch_depth=8):
-    x = buffer_ops.buffer_load(rsrc, i, vec_width=1, dtype=T.f32)
-    acc = yield [state[0] + x]
+rows = fx.zipped_divide(fx.rocdl.make_buffer_tensor(A), (1, BLOCK * 4))
+copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
+tile, tv = fx.make_layout_tv(fx.make_layout((1, BLOCK), (1, 1)), fx.make_layout((1, 4), (1, 1)))
+thr_copy = fx.make_tiled_copy(copy_atom, tv, tile).get_slice(tid)
+for r, state in range(fx.Int32(0), n_rows, fx.Int32(1), init=[fx.Float32(0.0)], prefetch_depth=4):
+    src = thr_copy.partition_S(fx.slice(rows, (None, r)))
+    frag = fx.make_fragment_like(src)
+    fx.copy(copy_atom, src, frag)
+    acc = yield [state[0] + frag[0] + frag[1] + frag[2] + frag[3]]
 ```
 
 The iterations that don't fill a group of N run in a plain loop after the
@@ -318,9 +324,8 @@ inputs (integer division and remainder, including `//` and `%`) of iterations
 past the trip count are skipped under branches in the prologue and epilogue, so
 the pipelined loop never reads or writes memory the plain loop wouldn't. An
 address carried from one iteration to the next (a pointer bumped after its load)
-works.
-N must be between 1 and 64, and `prefetch_depth` cannot be combined with `unroll` or
-`unroll_full`.
+works. N must be between 1 and 32, and `prefetch_depth` cannot be combined with
+`unroll` or `unroll_full`.
 
 **Loops that write memory.** Loads move ahead of the writes of earlier
 iterations, so the transformation is only correct when no iteration reads
@@ -329,11 +334,17 @@ that for separate buffers (two tensor arguments may be the same memory), so by
 default a loop that may write memory (a store, an atomic, a call) is left
 unchanged. Pass `prefetch_assume_independent=True` to assert that no iteration
 reads what an earlier one wrote; the loop is then pipelined, and a violation
-gives wrong results:
+gives wrong results. With the layout API, write such a loop with an empty
+`init=` (a plain `for` over copy objects doesn't trace today):
 
 ```python
-for i in range(fx.Int32(tid), n, fx.Int32(BLOCK), prefetch_depth=8, prefetch_assume_independent=True):
-    buffer_ops.buffer_store(f(buffer_ops.buffer_load(rsrc_in, i, vec_width=1, dtype=T.f32)), rsrc_out, i)
+for r, _ in range(fx.Int32(0), n_rows, fx.Int32(1), init=[], prefetch_depth=4, prefetch_assume_independent=True):
+    src = thr_copy.partition_S(fx.slice(rows_in, (None, r)))
+    frag = fx.make_fragment_like(src)
+    fx.copy(copy_atom, src, frag)
+    frag.store(frag.load() * 2.0)
+    fx.copy(copy_atom, frag, thr_copy.partition_D(fx.slice(rows_out, (None, r))))
+    yield []
 ```
 
 A loop that only loads and accumulates in registers, like the reduction above,
@@ -343,31 +354,66 @@ load from the same address in every iteration of a buffer the loop writes (an
 accumulator kept in memory).
 
 **Loops left unchanged.** The loop is compiled as plain `range`, with a
-`UserWarning` naming the reason (`loop not pipelined (prefetch_depth=8): ...`),
-when it contains a barrier, a copy into or out of LDS or an asynchronous copy, a
-print or an assert, a fence, a volatile access or an atomic with acquire or
-stronger ordering, any access to private memory (where the compiler may keep a
-register array it could not hold in registers), no load at the top level of the
-body, a load whose address comes from a side effect (an atomic's result), or an
-operation that needs guarding but returns a type other than an integer, float,
-vector, index or pointer; also in the cases above for loops that write memory.
-Atomic and volatile loads are never moved early. Narrow integer loop bounds are
-widened to i64 while the body keeps its original induction type. For N > 1, the
-loop is also left unchanged if a constant `step * N` overflows a signed 64-bit
-integer; a runtime i64/index step is assumed to stay below `2**63 / N`. The
-warning points at the loop's source line when `FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1`,
-and only appears when the kernel is actually compiled (not on a JIT cache hit).
-Shuffles, ballots and other lane-exchange ops are supported; calls (including
-`ffi`), inline asm and AMDGPU intrinsic calls count as lane exchanges. Unless the
-compiler can prove the loop bounds are the same in every lane (kernel arguments,
-constants and block ids, through arithmetic), such a loop gets one wave
-reduction before it, as for a grid-stride loop starting at the lane id.
+`UserWarning` at the loop's source line naming the reason and the kernel
+(`loop not pipelined (prefetch_depth=4): ... (in my_kernel)`). The warning only
+appears when the kernel is actually compiled, not on a JIT cache hit. The pass
+leaves a loop unchanged when:
 
-**When it pays off.** Each lane must run many more iterations than N, and the
-loop must be waiting on its loads. A loop that runs only a few iterations per
-lane gets slower: the extra prologue, epilogue and remainder code costs more than
-the overlap. Registers grow with N (a vec4 load body uses ~140 VGPRs at N=16 and
-spills at N=64 on gfx950); check with `/isa-resource-diff`. Profile both ways.
+- it contains a barrier, a print or an assert, or a copy into or out of LDS or
+  an asynchronous copy;
+- it waits on a memory counter (`s_waitcnt`, `s_wait_loadcnt` and the like, or
+  inline asm containing one), which would also wait for the prefetched loads:
+  drop the explicit wait or keep the loop unpipelined;
+- it contains a fence, a volatile access, an atomic with acquire or stronger
+  ordering, or any access to private memory (where the compiler may keep a
+  register array it could not hold in registers);
+- it may write memory without `prefetch_assume_independent=True`, or shows one of
+  the recurrences above;
+- its body has no load at the top level, or a load's address comes from a side
+  effect (an atomic's result);
+- an op that needs guarding returns a type other than an integer, float, vector,
+  index or pointer;
+- its constant step is not positive, or a constant `step * N` overflows a signed
+  64-bit integer (a runtime i64/index step is assumed to stay below
+  `2**63 / N`); narrow integer bounds are widened to i64 for the loop's control.
+
+Atomic and volatile loads are never moved early. A loop with an op that may
+exchange values across lanes (shuffles, ballots, DPP, MFMA/WMMA, transposed
+loads, calls including `ffi`, inline asm, AMDGPU intrinsic calls, and any op the
+compiler doesn't know) is supported: unless the compiler can prove the loop
+bounds are the same in every lane (kernel arguments, constants and block ids,
+through arithmetic), it adds one wave reduction before the loop, as for a
+grid-stride loop starting at the lane id.
+
+**When it pays off.** The loop must be waiting on its loads, with few waves per
+SIMD to hide that latency, and each lane must run many more iterations than N.
+Measured on gfx950 (MI355X, 256-thread blocks, 64 or more iterations per lane):
+
+| Body | 1 block per CU | 4 blocks per CU (near peak bandwidth) |
+|---|---|---|
+| scalar f32 sum, N=4 / 8 / 16 | 3.0× / 4.8× / 5.5× faster | 2.1× / 2.0× / 1.9× |
+| scalar load and store (with the flag) | 2.5× / 3.2× / 3.3× | 1.8× / 1.6× / 1.6× |
+| vec4 sum | 1.7× | 0.87× / 0.78× / 0.65× (slower) |
+| vec4 load and store | 1.1–1.2× | 0.77× / 0.77× / 0.68× (slower) |
+
+Narrow loads at low occupancy gain the most; wide loads near peak bandwidth get
+slower, and a deeper N does not help there. Start with N=2 or 4 and measure
+deeper. Registers grow with N, to about twice those of `unroll=N` for the same
+body (a vec4 load and store uses ~50 VGPRs at N=4, ~158 at N=16, ~304 at N=32);
+check with `/isa-resource-diff`. A loop that runs only a few iterations per lane
+gets slower: the extra prologue, epilogue and remainder code costs more than the
+overlap.
+
+**Compared with `unroll=N`.** Unrolling alone also issues N independent loads
+back to back once LLVM can count the loop's trips and prove the loads don't
+depend on earlier stores. Today it rarely can: FlyDSL emits a loop with 32-bit
+bounds without the no-overflow flag LLVM needs to count the trips, so
+`range(..., unroll=N)` keeps one load in flight there. Where LLVM can count the
+trips, `unroll=N` matches `prefetch_depth=N` on a load-only loop with about half
+the registers. For a loop that stores, LLVM can't prove the input and output
+buffers don't overlap, so only `prefetch_depth` with
+`prefetch_assume_independent=True` gets the loads in flight (the MoE sorting
+scatter loop: 29–37% faster, against ±3% for `unroll`). Profile both ways.
 
 ### Async copy (global → LDS DMA)
 

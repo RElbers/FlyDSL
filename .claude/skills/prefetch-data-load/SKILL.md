@@ -32,9 +32,11 @@ does this transformation automatically, including runtime trip counts; see
 "Compiler prefetch with `range(..., prefetch_depth=N)`" in
 `docs/kernel_tuning_guide.md` for its contract and when it pays off. A loop that
 stores needs `prefetch_assume_independent=True`, which asserts that no iteration
-reads memory an earlier one wrote. Hand-write
-the prefetch below when the loop is left unchanged (the compiler warns why) or
-when the schedule needs control the directive does not give.
+reads memory an earlier one wrote. It pays off most for narrow loads at low
+occupancy and can be slower for wide loads near peak bandwidth, so measure it
+against plain `range` and `unroll=N`. Hand-write the prefetch below when the loop
+is left unchanged (the compiler warns why) or when the schedule needs control the
+directive does not give.
 
 ## Core Principle
 
