@@ -50,37 +50,28 @@ def location_chain(loc) -> List[SourceFrame]:
     """
     if loc is None:
         return []
-    try:
-        if loc.is_a_callsite():
-            return location_chain(loc.callee) + location_chain(loc.caller)
-        if loc.is_a_name():
-            return location_chain(loc.child_loc)
-        if loc.is_a_fused():
-            out: List[SourceFrame] = []
-            for child in loc.locations:
-                out.extend(location_chain(child))
-            return out
-        if loc.is_a_file():
-            filename, line = loc.filename, loc.start_line
-            if not filename or filename.startswith("<") or not line:
-                return []  # synthetic source we cannot point a user at
-            end_col = getattr(loc, "end_col", 0) or 0
-            return [SourceFrame(filename, line, getattr(loc, "start_col", 0) or 0, end_col or None)]
-    except Exception:
-        return []
+    # Diagnostics carried by an MLIRError hold a plain Location; rebuild it as its typed subclass.
+    loc = ir.Location.from_attr(loc.attr, loc.context)
+    if isinstance(loc, ir.CallSiteLoc):
+        return location_chain(loc.callee) + location_chain(loc.caller)
+    if isinstance(loc, ir.NameLoc):
+        return location_chain(loc.child_loc)
+    if isinstance(loc, ir.FusedLoc):
+        out: List[SourceFrame] = []
+        for child in loc.locations:
+            out.extend(location_chain(child))
+        return out
+    if isinstance(loc, ir.FileLineColLoc):
+        if not loc.filename or loc.filename.startswith("<") or not loc.start_line:
+            return []  # synthetic source we cannot point a user at
+        return [SourceFrame(loc.filename, loc.start_line, loc.start_col, loc.end_col or None)]
     return []  # unknown / opaque location: nothing locatable
 
 
 def diag_record_from_diagnostic(d) -> DiagRecord:
     message = str(getattr(d, "message", "") or d)
-    chain = []
     loc = getattr(d, "location", None)
-    if loc is not None:
-        try:
-            chain = location_chain(loc)
-        except Exception:
-            chain = []
-    return DiagRecord(message=message, chain=chain)
+    return DiagRecord(message=message, chain=location_chain(loc))
 
 
 def diag_records_from_mlir_error(err) -> List[DiagRecord]:
