@@ -7,7 +7,9 @@ Each case is one loop body, compiled with plain range and with prefetch_depth. T
 edges of the pipelined loop's prologue, epilogue and remainder: no iterations, lanes with no
 iterations, fewer iterations than the depth, and lanes whose trip counts differ by one on either
 side of a multiple of the depth (where a lane-exchange op would see the wrong lanes unless the
-pass splits the loop at the wave's shortest trip count).
+pass splits the loop at the wave's shortest trip count). Further tests cover runtime bounds with
+empty ranges, loads issued past the trip count, lane-dependent bounds from mbcnt, and an address
+carried from one iteration to the next.
 """
 
 import pytest
@@ -15,7 +17,7 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, gpu
+from flydsl.expr import arith, gpu, rocdl
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_warp_size
@@ -137,3 +139,129 @@ def test_prefetch_depth_matches_plain_range(body_name, i32_bounds, depth):
         want = _run(reference, n)
         got = _run(pipelined, n)
         assert all(torch.equal(a, b) for a, b in zip(got, want)), f"n={n}"
+
+
+def _launch_and_read(launch, *args, out_init=0.0):
+    out = torch.full((BLK,), out_init, device="cuda")
+    launch(*args[:1], out, *args[1:], torch.cuda.current_stream())
+    torch.cuda.synchronize()
+    return out.cpu()
+
+
+def _bounds_launcher(depth):
+    @flyc.kernel(known_block_size=[BLK, 1, 1])
+    def k(inp: fx.Tensor, out: fx.Tensor, lb: fx.Int32, ub: fx.Int32, step: fx.Int32) -> None:
+        rin = buffer_ops.create_buffer_resource(inp, max_size=True)
+        tid = arith.index_cast(T.i32, gpu.thread_id("x"))
+        acc = fx.Float32(0.0)
+        for i in range(lb, ub, step, prefetch_depth=depth):
+            acc = ArithValue(acc) + ArithValue(_load(rin, i))
+        buffer_ops.buffer_store(acc, buffer_ops.create_buffer_resource(out, max_size=True), tid)
+
+    @flyc.jit
+    def launch(inp: fx.Tensor, out: fx.Tensor, lb: fx.Int32, ub: fx.Int32, step: fx.Int32, stream: fx.Stream):
+        k(inp, out, lb, ub, step).launch(grid=(1, 1, 1), block=(BLK, 1, 1), stream=stream)
+
+    return launch
+
+
+@pytest.mark.parametrize("depth", [1, 4, 16])
+def test_prefetch_depth_runtime_bounds(depth):
+    # An empty range with ub < lb must stay empty (the unroller's trip count wraps without a clamp).
+    reference, pipelined = _bounds_launcher(None), _bounds_launcher(depth)
+    inp = torch.arange(1024, device="cuda", dtype=torch.float32)
+    for bounds in [(100, 90, 4), (100, 99, 1), (5, 5, 1), (0, 3, 1), (90, 100, 4), (3, 1000, 7)]:
+        want = _launch_and_read(reference, inp, *bounds, out_init=-1.0)
+        got = _launch_and_read(pipelined, inp, *bounds, out_init=-1.0)
+        assert torch.equal(got, want), bounds
+
+
+def _strided_launcher(depth):
+    @flyc.kernel(known_block_size=[BLK, 1, 1])
+    def k(inp: fx.Tensor, out: fx.Tensor, n: fx.Int32, stride: fx.Int32) -> None:
+        rin = buffer_ops.create_buffer_resource(inp, max_size=True)
+        tid = arith.index_cast(T.i32, gpu.thread_id("x"))
+        acc = fx.Float32(0.0)
+        for i in range(fx.Int32(0), n, fx.Int32(1), prefetch_depth=depth):
+            acc = ArithValue(acc) + ArithValue(_load(rin, ArithValue(i) * ArithValue(stride) + ArithValue(tid)))
+        buffer_ops.buffer_store(acc, buffer_ops.create_buffer_resource(out, max_size=True), tid)
+
+    @flyc.jit
+    def launch(inp: fx.Tensor, out: fx.Tensor, n: fx.Int32, stride: fx.Int32, stream: fx.Stream):
+        k(inp, out, n, stride).launch(grid=(1, 1, 1), block=(BLK, 1, 1), stream=stream)
+
+    return launch
+
+
+@pytest.mark.parametrize("depth", [1, 4, 16])
+def test_prefetch_depth_does_not_load_past_the_trip_count(depth):
+    # Iterations are 1 GiB apart and the buffer holds one row, with an unbounded (max_size) buffer
+    # resource: an out-of-range iteration the pipelined loop let through would fault the GPU.
+    inp = torch.ones(BLK, device="cuda")
+    for n in (0, 1):
+        want = _launch_and_read(_strided_launcher(None), inp, n, 1 << 28)
+        got = _launch_and_read(_strided_launcher(depth), inp, n, 1 << 28)
+        assert torch.equal(got, want), f"n={n}"
+
+
+def _lane_id():
+    lo = rocdl.mbcnt_lo(T.i32, fx.Int32(-1).ir_value(), fx.Int32(0).ir_value())
+    if BLK == 32:
+        return fx.Int32(lo)
+    return fx.Int32(rocdl.mbcnt_hi(T.i32, fx.Int32(-1).ir_value(), lo))
+
+
+def _mbcnt_shuffle_launcher(depth):
+    @flyc.kernel(known_block_size=[BLK, 1, 1])
+    def k(inp: fx.Tensor, out: fx.Tensor, n: fx.Int32) -> None:
+        rin = buffer_ops.create_buffer_resource(inp, max_size=True)
+        lane = _lane_id()
+        acc = fx.Float32(0.0)
+        for i in range(lane, n, fx.Int32(BLK), prefetch_depth=depth):
+            x = _load(rin, i)
+            acc = ArithValue(acc) + ArithValue(x) * ArithValue(gpu.shuffle_xor(x, 1, BLK))
+        buffer_ops.buffer_store(acc, buffer_ops.create_buffer_resource(out, max_size=True), lane)
+
+    @flyc.jit
+    def launch(inp: fx.Tensor, out: fx.Tensor, n: fx.Int32, stream: fx.Stream):
+        k(inp, out, n).launch(grid=(1, 1, 1), block=(BLK, 1, 1), stream=stream)
+
+    return launch
+
+
+def _carried_offset_launcher(depth):
+    @flyc.kernel(known_block_size=[BLK, 1, 1])
+    def k(inp: fx.Tensor, out: fx.Tensor, n: fx.Int32) -> None:
+        rin = buffer_ops.create_buffer_resource(inp, max_size=True)
+        tid = arith.index_cast(T.i32, gpu.thread_id("x"))
+        acc = fx.Float32(0.0)
+        for i, st in range(0, n, 1, init=[fx.Int32(tid), fx.Float32(0.0)], prefetch_depth=depth):
+            x = _load(rin, st[0])
+            new_off, acc = yield [ArithValue(st[0]) + BLK, ArithValue(st[1]) + ArithValue(x)]
+        buffer_ops.buffer_store(acc, buffer_ops.create_buffer_resource(out, max_size=True), tid)
+
+    @flyc.jit
+    def launch(inp: fx.Tensor, out: fx.Tensor, n: fx.Int32, stream: fx.Stream):
+        k(inp, out, n).launch(grid=(1, 1, 1), block=(BLK, 1, 1), stream=stream)
+
+    return launch
+
+
+@pytest.mark.parametrize("depth", [1, 4, 16])
+@pytest.mark.parametrize(
+    "make_launcher, sizes",
+    [
+        # Lane-dependent bounds from mbcnt, not gpu.thread_id: the loop needs the wave-uniform split.
+        (_mbcnt_shuffle_launcher, SIZES),
+        # The load address is carried from the previous iteration and bumped after the load.
+        (_carried_offset_launcher, [n // BLK for n in SIZES]),
+    ],
+    ids=["mbcnt_shuffle", "carried_offset"],
+)
+def test_prefetch_depth_loop_shapes(make_launcher, sizes, depth):
+    reference, pipelined = make_launcher(None), make_launcher(depth)
+    inp = torch.rand(max(SIZES), device="cuda", generator=torch.Generator(device="cuda").manual_seed(0))
+    for n in sizes:
+        want = _launch_and_read(reference, inp, n)
+        got = _launch_and_read(pipelined, inp, n)
+        assert torch.equal(got, want), f"n={n}"
