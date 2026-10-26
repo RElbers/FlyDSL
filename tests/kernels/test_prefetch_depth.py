@@ -12,6 +12,10 @@ empty ranges, loads issued past the trip count, lane-dependent bounds from mbcnt
 carried from one iteration to the next, and loops that store, which need prefetch_assume_independent.
 """
 
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -255,15 +259,26 @@ def _strided_launcher(depth):
     return launch
 
 
-@pytest.mark.parametrize("depth", [1, 4, 16])
-def test_prefetch_depth_does_not_load_past_the_trip_count(depth):
-    # Iterations are 1 GiB apart and the buffer holds one row, with an unbounded (max_size) buffer
-    # resource: an out-of-range iteration the pipelined loop let through would fault the GPU.
+def _check_no_load_past_the_trip_count(depth):
     inp = torch.ones(BLK, device="cuda")
     for n in (0, 1):
         want = _launch_and_read(_strided_launcher(None), inp, n, 1 << 28)
         got = _launch_and_read(_strided_launcher(depth), inp, n, 1 << 28)
         assert torch.equal(got, want), f"n={n}"
+
+
+@pytest.mark.parametrize("depth", [1, 4, 16])
+def test_prefetch_depth_does_not_load_past_the_trip_count(depth):
+    # Iterations are 1 GiB apart and the buffer holds one row, with an unbounded (max_size) buffer
+    # resource: an out-of-range iteration the pipelined loop let through would fault the GPU. The
+    # check runs in a subprocess, so a fault fails this test instead of aborting the pytest run.
+    here = Path(__file__).resolve().parent
+    code = (
+        f"import sys; sys.path.insert(0, {str(here)!r}); "
+        f"import test_prefetch_depth as t; t._check_no_load_past_the_trip_count({depth})"
+    )
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=600)
+    assert result.returncode == 0, result.stderr[-4000:]
 
 
 def _lane_id():
