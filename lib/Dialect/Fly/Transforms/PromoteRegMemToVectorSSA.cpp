@@ -503,6 +503,8 @@ private:
         builder, oldFor.getLoc(), mapping.lookupOrDefault(oldFor.getLowerBound()),
         mapping.lookupOrDefault(oldFor.getUpperBound()), mapping.lookupOrDefault(oldFor.getStep()),
         newInitArgs, [](OpBuilder &, Location, Value, ValueRange) {}, oldFor.getUnsignedCmp());
+    // Keep discardable loop attrs (loop_annotation, fly.prefetch_*) that later passes consume.
+    newFor->setDiscardableAttrs(oldFor->getDiscardableAttrDictionary());
 
     IRMapping bodyMapping = mapping;
     Block *oldBody = oldFor.getBody();

@@ -26,6 +26,18 @@ the current atom form (`mma = fx.make_mma_atom(...)`, then `fx.gemm(mma, d, a,
 b, c)`); the raw `rocdl.mfma_*` intrinsics take `(result_type, operands)`, not
 `(a, b, acc)`. See the **kernel-code-cleanup** skill for the full mapping.
 
+**Try the compiler first.** For a loop whose loads come straight from global
+memory (no barrier or LDS round trip in the body), `range(..., prefetch_depth=N)`
+does this transformation automatically, including runtime trip counts; see
+"Compiler prefetch with `range(..., prefetch_depth=N)`" in
+`docs/kernel_tuning_guide.md` for its contract and when it pays off. A loop that
+stores needs `prefetch_assume_independent=True`, which asserts that no iteration
+reads memory an earlier one wrote. It pays off most for narrow loads at low
+occupancy and can be slower for wide loads near peak bandwidth, so measure it
+against plain `range` and `unroll=N`. Hand-write the prefetch below when the loop
+is left unchanged (the compiler warns why) or when the schedule needs control the
+directive does not give.
+
 ## Core Principle
 
 GPU global memory loads (`buffer_ops.buffer_load`, `buffer_load_dwordx4`)

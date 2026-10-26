@@ -92,6 +92,24 @@ def FlyIntSwizzleSimplifyPass : Pass<"fly-int-swizzle-simplify"> {
   ];
 }
 
+def FlyConvertSCFToCFPass : Pass<"fly-convert-scf-to-cf"> {
+  let summary = "Lower SCF to CF, marking scf.for increments as not wrapping";
+  let description = [{
+    The same conversion as upstream `convert-scf-to-cf`, plus `nsw` (or `nuw` for
+    an unsigned loop) on each scf.for induction variable increment. scf.for
+    makes overflow of the last increment undefined, so the flag only states
+    what the loop guarantees; without it LLVM can't compute the trip count of a
+    loop with bounds narrower than 64 bits, and so can't unroll it with a
+    runtime trip count.
+  }];
+
+  let dependentDialects = [
+    "arith::ArithDialect",
+    "cf::ControlFlowDialect",
+    "LLVM::LLVMDialect"
+  ];
+}
+
 def FlyPromoteRegMemToVectorSSAPass : Pass<"fly-promote-regmem-to-vectorssa"> {
   let summary = "Promote register memory to vector SSA values";
   let description = [{
