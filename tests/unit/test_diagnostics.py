@@ -140,3 +140,30 @@ def test_excepthook_passes_through_non_dsl_errors(monkeypatch, capsys, fresh_exc
 
     assert previous_called  # non-DSL errors delegate to the original hook
     assert capsys.readouterr().err == ""
+
+
+# --------------------------------------------------------------------------- #
+# location_chain: MLIR locations -> source frames
+# --------------------------------------------------------------------------- #
+def test_location_chain_resolves_callsite_name_and_fused_locations():
+    from flydsl._mlir import ir
+
+    with ir.Context():
+        user = ir.Location.file("user_kernel.py", 7, 4)
+        caller = ir.Location.file("caller.py", 3, 1)
+        user_frame = SourceFrame("user_kernel.py", 7, 4, 4)
+        caller_frame = SourceFrame("caller.py", 3, 1, 1)
+
+        assert diagnostics.location_chain(ir.Location.callsite(user, [caller])) == [user_frame, caller_frame]
+        assert diagnostics.location_chain(ir.Location.name("op", user)) == [user_frame]
+        assert diagnostics.location_chain(ir.Location.fused([user, caller])) == [user_frame, caller_frame]
+
+
+@pytest.mark.parametrize("filename", ["-", "<string>"])
+def test_location_chain_skips_synthetic_sources(filename):
+    from flydsl._mlir import ir
+
+    with ir.Context():
+        # "-" is what IR re-parsed from text without debug info carries.
+        assert diagnostics.location_chain(ir.Location.file(filename, 20, 1)) == []
+        assert diagnostics.location_chain(ir.Location.unknown()) == []

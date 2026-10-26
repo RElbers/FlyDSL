@@ -41,6 +41,22 @@ class DiagRecord:
     chain: List[SourceFrame] = field(default_factory=list)
 
 
+_LOCATION_KINDS = (("callsite", "CallSiteLoc"), ("name", "NameLoc"), ("fused", "FusedLoc"), ("file", "FileLineColLoc"))
+
+
+def _location_kind(loc) -> Optional[str]:
+    """The kind of an MLIR ``Location``: typed subclasses (``CallSiteLoc``, ...) in current
+    bindings, ``Location.is_a_*()`` in older ones."""
+    for kind, cls_name in _LOCATION_KINDS:
+        cls = getattr(ir, cls_name, None)
+        if cls is not None and isinstance(loc, cls):
+            return kind
+        is_a = getattr(loc, f"is_a_{kind}", None)
+        if is_a is not None and is_a():
+            return kind
+    return None
+
+
 def location_chain(loc) -> List[SourceFrame]:
     """Flatten an MLIR ``Location`` into ``[innermost, ..., outermost]`` frames.
 
@@ -51,19 +67,20 @@ def location_chain(loc) -> List[SourceFrame]:
     if loc is None:
         return []
     try:
-        if loc.is_a_callsite():
+        kind = _location_kind(loc)
+        if kind == "callsite":
             return location_chain(loc.callee) + location_chain(loc.caller)
-        if loc.is_a_name():
+        if kind == "name":
             return location_chain(loc.child_loc)
-        if loc.is_a_fused():
+        if kind == "fused":
             out: List[SourceFrame] = []
             for child in loc.locations:
                 out.extend(location_chain(child))
             return out
-        if loc.is_a_file():
+        if kind == "file":
             filename, line = loc.filename, loc.start_line
-            if not filename or filename.startswith("<") or not line:
-                return []  # synthetic source we cannot point a user at
+            if not filename or filename.startswith("<") or filename == "-" or not line:
+                return []  # synthetic source (or IR re-parsed from text) we cannot point a user at
             end_col = getattr(loc, "end_col", 0) or 0
             return [SourceFrame(filename, line, getattr(loc, "start_col", 0) or 0, end_col or None)]
     except Exception:
