@@ -318,18 +318,36 @@ address carried from one iteration to the next (a pointer bumped after its load)
 works.
 `prefetch_depth` cannot be combined with `unroll` or `unroll_full`.
 
-**Contract.** Loads move ahead of the stores of earlier iterations, so a load
-must not read what an earlier iteration of the same loop stored (a recurrence
-through memory gives wrong results). The compiler does check the same iteration:
-a load that follows a possible store in the body keeps the loop as it is.
+**Loops that write memory.** Loads move ahead of the writes of earlier
+iterations, so the transformation is only correct when no iteration reads
+memory an earlier iteration of the same loop wrote. The compiler cannot prove
+that for separate buffers (two tensor arguments may be the same memory), so by
+default a loop that may write memory (a store, an atomic, a call) is left
+unchanged. Pass `prefetch_assume_independent=True` to assert that no iteration
+reads what an earlier one wrote; the loop is then pipelined, and a violation
+gives wrong results:
+
+```python
+for i in range(fx.Int32(tid), n, fx.Int32(BLOCK), prefetch_depth=8, prefetch_assume_independent=True):
+    buffer_ops.buffer_store(f(buffer_ops.buffer_load(rsrc_in, i, vec_width=1, dtype=T.f32)), rsrc_out, i)
+```
+
+A loop that only loads and accumulates in registers, like the reduction above,
+needs no flag. Even with the flag the compiler keeps a loop unchanged when it
+can see a recurrence: a load after a possible store in the same iteration, or a
+load from the same address in every iteration of a buffer the loop writes (an
+accumulator kept in memory).
 
 **Loops left unchanged.** The loop is compiled as plain `range`, with a
 `UserWarning` naming the reason (`loop not pipelined (prefetch_depth=8): ...`),
 when it contains a barrier, a copy into or out of LDS or an asynchronous copy, a
-print or an assert, a load after a possible store in the same iteration, no load
-at the top level of the body, a load whose address comes from a side effect (an
-atomic's result), or an operation that needs guarding but returns a type other
-than an integer, float, vector, index or pointer. Narrow integer loop bounds are
+print or an assert, a fence, a volatile access or an atomic with acquire or
+stronger ordering, any access to private memory (where the compiler may keep a
+register array it could not hold in registers), no load at the top level of the
+body, a load whose address comes from a side effect (an atomic's result), or an
+operation that needs guarding but returns a type other than an integer, float,
+vector, index or pointer; also in the cases above for loops that write memory.
+Atomic and volatile loads are never moved early. Narrow integer loop bounds are
 widened to i64 while the body keeps its original induction type. For N > 1, the
 loop is also left unchanged if a constant `step * N` overflows a signed 64-bit
 integer; a runtime i64/index step is assumed to stay below `2**63 / N`. The

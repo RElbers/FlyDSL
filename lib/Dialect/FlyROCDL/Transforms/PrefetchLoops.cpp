@@ -11,7 +11,9 @@
 // so the steady state has N distinct loads (N rotating destination registers), and then pipelines
 // it in two stages: loads plus their address math first, everything else one iteration later.
 // In the prologue and epilogue of a runtime trip count, `predicateOp` guards reads and side effects
-// so they only run for in-range iterations.
+// so they only run for in-range iterations. Loads move ahead of earlier iterations' writes, so a
+// loop that may write memory is only pipelined when `fly.prefetch_assume_independent` (set by
+// `prefetch_assume_independent=True`) asserts that no iteration reads memory an earlier one wrote.
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -42,13 +44,21 @@ namespace fly_rocdl {
 namespace {
 
 constexpr StringLiteral kPrefetchDepthAttr = "fly.prefetch_depth";
+// Set by `prefetch_assume_independent=True`: no iteration reads memory an earlier one wrote.
+constexpr StringLiteral kAssumeIndependentAttr = "fly.prefetch_assume_independent";
 
 // Loads lead their use by one iteration; depth comes from the unroll factor, not from more stages.
 constexpr unsigned kNumStages = 2;
 
-// A memory read whose issue we want to lead the compute (stage 0).
+// The AMDGPU private (scratch) address space.
+constexpr unsigned kPrivateAddressSpace = 5;
+
+// A memory read whose issue we want to lead the compute (stage 0). An atomic or volatile load
+// keeps its place.
 bool isPipelineableRead(Operation *op) {
-  if (isa<LLVM::LoadOp, vector::TransferReadOp, vector::LoadOp>(op))
+  if (auto load = dyn_cast<LLVM::LoadOp>(op))
+    return load.getOrdering() == LLVM::AtomicOrdering::not_atomic && !load.getVolatile_();
+  if (isa<vector::TransferReadOp, vector::LoadOp>(op))
     return true;
   StringRef n = op->getName().getStringRef();
   return n.contains("buffer.load") || n.contains("global.load") || n.contains("ds.read");
@@ -143,10 +153,126 @@ bool hasLaneExchangeOp(scf::ForOp forOp) {
   return result.wasInterrupted();
 }
 
+// ROCDL ops and AMDGPU intrinsic calls for matrix, dot, conversion and lane operations declare no
+// memory effects, but none of them accesses memory.
+bool isKnownNonMemoryOp(Operation *op) {
+  StringRef n = op->getName().getStringRef();
+  if (auto intrinsic = dyn_cast<LLVM::CallIntrinsicOp>(op))
+    n = intrinsic.getIntrin();
+  if (!n.consume_front("rocdl.") && !n.consume_front("llvm.amdgcn."))
+    return false;
+  return llvm::any_of(
+      ArrayRef<StringRef>{
+          "mfma.",         "smfmac.",  "wmma.",       "swmmac.",     "sdot",       "udot",
+          "sudot",         "fdot",     "dot4.",       "cvt.",        "mbcnt.",     "readlane",
+          "readfirstlane", "permlane", "ds_bpermute", "ds.bpermute", "ds_swizzle", "ds.swizzle",
+          "update.dpp",    "mov.dpp",  "ballot",      "icmp",        "fcmp",       "wave.reduce."},
+      [&](StringRef prefix) { return n.starts_with(prefix); });
+}
+
 // A leaf op that may write memory: a write effect, or no effect information at all.
 bool mayWriteMemory(Operation *op) {
   return !isPipelineableRead(op) && !isMemoryEffectFree(op) &&
-         !hasSingleEffect<MemoryEffects::Read>(op);
+         !hasSingleEffect<MemoryEffects::Read>(op) && !isKnownNonMemoryOp(op);
+}
+
+// A fence, a volatile access, or an atomic whose ordering also orders other memory accesses:
+// moving loads across it changes what they may observe.
+bool isOrderedOrVolatile(Operation *op) {
+  auto orders = [](LLVM::AtomicOrdering o) {
+    return o != LLVM::AtomicOrdering::not_atomic && o != LLVM::AtomicOrdering::unordered &&
+           o != LLVM::AtomicOrdering::monotonic;
+  };
+  if (isa<LLVM::FenceOp>(op))
+    return true;
+  if (auto load = dyn_cast<LLVM::LoadOp>(op))
+    return load.getVolatile_() || orders(load.getOrdering());
+  if (auto store = dyn_cast<LLVM::StoreOp>(op))
+    return store.getVolatile_() || orders(store.getOrdering());
+  if (auto rmw = dyn_cast<LLVM::AtomicRMWOp>(op))
+    return rmw.getVolatile_() || orders(rmw.getOrdering());
+  if (auto cmpxchg = dyn_cast<LLVM::AtomicCmpXchgOp>(op))
+    return cmpxchg.getVolatile_() || orders(cmpxchg.getSuccessOrdering()) ||
+           orders(cmpxchg.getFailureOrdering());
+  return false;
+}
+
+bool isPrivatePointer(Type t) {
+  auto ptr = dyn_cast<LLVM::LLVMPointerType>(t);
+  return ptr && ptr.getAddressSpace() == kPrivateAddressSpace;
+}
+
+// The pointer or buffer an access goes through, looking through GEPs and buffer resources, or
+// null when unknown. A ROCDL buffer or global intrinsic takes its resource or address as its first
+// pointer operand (after the data of a store or atomic).
+Value getAccessRoot(Operation *op) {
+  Value ptr;
+  if (auto load = dyn_cast<LLVM::LoadOp>(op))
+    ptr = load.getAddr();
+  else if (auto store = dyn_cast<LLVM::StoreOp>(op))
+    ptr = store.getAddr();
+  else if (auto rmw = dyn_cast<LLVM::AtomicRMWOp>(op))
+    ptr = rmw.getPtr();
+  else if (auto cmpxchg = dyn_cast<LLVM::AtomicCmpXchgOp>(op))
+    ptr = cmpxchg.getPtr();
+  else if (op->getName().getStringRef().starts_with("rocdl."))
+    for (Value operand : op->getOperands())
+      if (isa<LLVM::LLVMPointerType>(operand.getType())) {
+        ptr = operand;
+        break;
+      }
+  while (ptr) {
+    Operation *def = ptr.getDefiningOp();
+    if (auto gep = dyn_cast_or_null<LLVM::GEPOp>(def))
+      ptr = gep.getBase();
+    else if (auto cast = dyn_cast_or_null<LLVM::AddrSpaceCastOp>(def))
+      ptr = cast.getArg();
+    else if (def && def->getName().getStringRef() == "rocdl.make.buffer.rsrc")
+      ptr = def->getOperand(0);
+    else
+      break;
+  }
+  return ptr;
+}
+
+// Whether `v` has the same value in every iteration: defined outside the loop, or computed in it
+// by pure ops from such values.
+bool isLoopInvariant(Value v, scf::ForOp forOp, DenseMap<Value, bool> &memo) {
+  Operation *def = v.getDefiningOp();
+  if (!forOp->isAncestor(def ? def : cast<BlockArgument>(v).getOwner()->getParentOp()))
+    return true;
+  if (!def)
+    return false;
+  if (auto it = memo.find(v); it != memo.end())
+    return it->second;
+  memo[v] = false;
+  bool invariant = def->getNumRegions() == 0 && isMemoryEffectFree(def) &&
+                   llvm::all_of(def->getOperands(), [&](Value operand) {
+                     return isLoopInvariant(operand, forOp, memo);
+                   });
+  memo[v] = invariant;
+  return invariant;
+}
+
+// A load whose address is the same in every iteration, from a buffer the loop writes: unless every
+// write misses that address, each iteration reads what an earlier one wrote (an accumulator kept in
+// memory), and the pipelined load would read before that write.
+bool readsInvariantAddressOfWrittenBuffer(scf::ForOp forOp) {
+  DenseSet<Value> written;
+  forOp.getBody()->walk([&](Operation *op) {
+    if (op->getNumRegions() == 0 && mayWriteMemory(op))
+      if (Value root = getAccessRoot(op))
+        written.insert(root);
+  });
+  DenseMap<Value, bool> memo;
+  return llvm::any_of(forOp.getBody()->without_terminator(), [&](Operation &op) {
+    if (!isPipelineableRead(&op))
+      return false;
+    Value root = getAccessRoot(&op);
+    return root && written.contains(root) && llvm::all_of(op.getOperands(), [&](Value operand) {
+             return isLoopInvariant(operand, forOp, memo);
+           });
+  });
 }
 
 // Stage 0 runs a top-level read one iteration group ahead of everything else, so a read that
@@ -395,7 +521,13 @@ bool readsLateValue(scf::ForOp forOp) {
 // LDS: rotating the copy across the backedge would clobber the shared buffer (no double buffering),
 // and a dynamic-trip epilogue would have to predicate the barrier, which is illegal. Prints and
 // asserts would run out of order, and a read after a write could move ahead of it.
-StringRef whyNotPipelineable(scf::ForOp forOp) {
+//
+// Loads move ahead of earlier iterations' writes, which is only correct when no iteration reads
+// memory an earlier one wrote. Without `assumeIndependent` a loop that may write memory is left
+// unchanged; with it, only a load that certainly reads such a write is rejected. Private memory
+// may hold a register array the compiler could not keep in registers, which the user can't see, so
+// it is rejected either way.
+std::string whyNotPipelineable(scf::ForOp forOp, bool assumeIndependent) {
   StringRef reason;
   forOp.getBody()->walk([&](Operation *op) {
     StringRef n = op->getName().getStringRef();
@@ -405,16 +537,38 @@ StringRef whyNotPipelineable(scf::ForOp forOp) {
       reason = "it contains a copy into or out of LDS, or an asynchronous copy";
     else if (n.contains("print") || n.contains("assert"))
       reason = "it contains a print or an assert";
+    else if (isOrderedOrVolatile(op))
+      reason = "it contains a fence, a volatile access or an atomic with acquire or stronger "
+               "ordering";
+    else if (llvm::any_of(op->getOperandTypes(), isPrivatePointer) ||
+             llvm::any_of(op->getResultTypes(), isPrivatePointer))
+      reason = "it accesses private memory, which an earlier iteration may have written";
     return reason.empty() ? WalkResult::advance() : WalkResult::interrupt();
   });
   if (!reason.empty())
-    return reason;
+    return reason.str();
   Block *body = forOp.getBody();
   if (llvm::none_of(body->without_terminator(),
                     [](Operation &op) { return isPipelineableRead(&op); }))
     return "its body has no load at the top level to issue early";
+  if (!assumeIndependent) {
+    Operation *write = nullptr;
+    body->walk([&](Operation *op) {
+      if (op->getNumRegions() == 0 && mayWriteMemory(op))
+        write = op;
+      return write ? WalkResult::interrupt() : WalkResult::advance();
+    });
+    if (write)
+      return ("it may write memory (" + write->getName().getStringRef() +
+              ") and its loads would move ahead of earlier iterations' writes; set "
+              "prefetch_assume_independent=True if no iteration reads memory an earlier one wrote")
+          .str();
+  }
   if (hasReadAfterWrite(forOp))
     return "a load follows a possible store in the same iteration and would move ahead of it";
+  if (readsInvariantAddressOfWrittenBuffer(forOp))
+    return "a load reads the same address in every iteration from a buffer the loop writes, so it "
+           "would read before an earlier iteration's write";
   if (llvm::any_of(body->without_terminator(), [](Operation &op) {
         return needsPredication(&op) && !llvm::all_of(op.getResultTypes(), hasZeroValue);
       }))
@@ -442,6 +596,8 @@ public:
     IRRewriter rewriter(&getContext());
     for (auto [forOp, depth] : requested) {
       forOp->removeAttr(kPrefetchDepthAttr);
+      bool assumeIndependent = forOp->hasAttr(kAssumeIndependentAttr);
+      forOp->removeAttr(kAssumeIndependentAttr);
       // The loop was marked explicitly, so say why it stays as it is.
       auto notPipelined = [&, depth = depth](scf::ForOp loop, StringRef why) {
         loop.emitRemark() << "loop not pipelined (prefetch_depth=" << depth << "): " << why;
@@ -450,7 +606,7 @@ public:
         notPipelined(forOp, "the depth must be at least 1");
         continue;
       }
-      if (StringRef why = whyNotPipelineable(forOp); !why.empty()) {
+      if (std::string why = whyNotPipelineable(forOp, assumeIndependent); !why.empty()) {
         notPipelined(forOp, why);
         continue;
       }

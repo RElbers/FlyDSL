@@ -967,7 +967,7 @@ class InsertEmptyYieldForSCFFor(Transformer):
     # a loop is emitted; they are NOT loop-carried state (``init``) nor the
     # positional start/stop/step. To add a new directive, add its name here and a
     # matching keyword-only parameter on the builders -- no other change needed.
-    _LOOP_DIRECTIVE_KWARGS = ("unroll", "unroll_full", "prefetch_depth")
+    _LOOP_DIRECTIVE_KWARGS = ("unroll", "unroll_full", "prefetch_depth", "prefetch_assume_independent")
 
     @staticmethod
     def _to_index(val):
@@ -1018,16 +1018,24 @@ class InsertEmptyYieldForSCFFor(Transformer):
         for_op.attributes["loop_annotation"] = ir.Attribute.parse(f"#llvm.loop_annotation<unroll = {body}>")
 
     @staticmethod
-    def _apply_loop_prefetch(for_op, prefetch_depth, unroll, unroll_full):
+    def _apply_loop_prefetch(for_op, prefetch_depth, unroll, unroll_full, assume_independent):
         """Mark an ``scf.for`` for the ``fly-rocdl-prefetch-loops`` pass.
 
         ``prefetch_depth=N`` asks for the loads of up to N future iterations to
-        stay in flight across the backedge. The pass reorders loads ahead of
-        earlier iterations' stores and issues masked loads past the trip count,
-        so it is not a plain hint. It unrolls the loop itself, so it cannot be
-        combined with ``unroll`` / ``unroll_full``.
+        stay in flight across the backedge. The pass unrolls the loop itself, so
+        it cannot be combined with ``unroll`` / ``unroll_full``. A loop that may
+        write memory is left unchanged unless ``prefetch_assume_independent=True``
+        asserts that no iteration reads memory an earlier iteration wrote: the
+        pass moves loads ahead of earlier iterations' writes.
         """
+        if not isinstance(assume_independent, bool):
+            raise TypeError(
+                "for-loop `prefetch_assume_independent` must be a Python bool constant, "
+                f"got {type(assume_independent).__name__}"
+            )
         if prefetch_depth is None:
+            if assume_independent:
+                raise ValueError("for-loop `prefetch_assume_independent` requires `prefetch_depth`")
             return
         if isinstance(prefetch_depth, bool) or not isinstance(prefetch_depth, int):
             raise TypeError(
@@ -1038,9 +1046,21 @@ class InsertEmptyYieldForSCFFor(Transformer):
         if unroll != -1 or unroll_full:
             raise ValueError("for-loop `prefetch_depth` and `unroll` / `unroll_full` are mutually exclusive")
         for_op.attributes["fly.prefetch_depth"] = ir.IntegerAttr.get(ir.IntegerType.get_signless(64), prefetch_depth)
+        if assume_independent:
+            for_op.attributes["fly.prefetch_assume_independent"] = ir.UnitAttr.get()
 
     @staticmethod
-    def scf_range(start, stop=None, step=None, *, init=None, unroll=-1, unroll_full=False, prefetch_depth=None):
+    def scf_range(
+        start,
+        stop=None,
+        step=None,
+        *,
+        init=None,
+        unroll=-1,
+        unroll_full=False,
+        prefetch_depth=None,
+        prefetch_assume_independent=False,
+    ):
         if stop is None:
             stop = start
             start = 0
@@ -1054,7 +1074,9 @@ class InsertEmptyYieldForSCFFor(Transformer):
             loc = capture_user_location()
             for_op = scf.ForOp(start_val, stop_val, step_val, init, loc=loc)
             InsertEmptyYieldForSCFFor._apply_loop_unroll(for_op, unroll, unroll_full)
-            InsertEmptyYieldForSCFFor._apply_loop_prefetch(for_op, prefetch_depth, unroll, unroll_full)
+            InsertEmptyYieldForSCFFor._apply_loop_prefetch(
+                for_op, prefetch_depth, unroll, unroll_full, prefetch_assume_independent
+            )
             _locate_block_args(for_op.body, loc)
             with ir.InsertionPoint(for_op.body):
                 yield for_op.induction_variable, list(for_op.inner_iter_args)
@@ -1062,7 +1084,9 @@ class InsertEmptyYieldForSCFFor(Transformer):
             loc = capture_user_location()
             for_op = scf.ForOp(start_val, stop_val, step_val, loc=loc)
             InsertEmptyYieldForSCFFor._apply_loop_unroll(for_op, unroll, unroll_full)
-            InsertEmptyYieldForSCFFor._apply_loop_prefetch(for_op, prefetch_depth, unroll, unroll_full)
+            InsertEmptyYieldForSCFFor._apply_loop_prefetch(
+                for_op, prefetch_depth, unroll, unroll_full, prefetch_assume_independent
+            )
             _locate_block_args(for_op.body, loc)
             with ir.InsertionPoint(for_op.body):
                 yield for_op.induction_variable
@@ -1079,6 +1103,7 @@ class InsertEmptyYieldForSCFFor(Transformer):
         unroll=-1,
         unroll_full=False,
         prefetch_depth=None,
+        prefetch_assume_independent=False,
     ):
         start_val = as_ir_value(start)
         stop_val = as_ir_value(stop)
@@ -1115,7 +1140,9 @@ class InsertEmptyYieldForSCFFor(Transformer):
             loc = capture_user_location()
             for_op = scf.ForOp(start_val, stop_val, step_val, loc=loc)
             InsertEmptyYieldForSCFFor._apply_loop_unroll(for_op, unroll, unroll_full)
-            InsertEmptyYieldForSCFFor._apply_loop_prefetch(for_op, prefetch_depth, unroll, unroll_full)
+            InsertEmptyYieldForSCFFor._apply_loop_prefetch(
+                for_op, prefetch_depth, unroll, unroll_full, prefetch_assume_independent
+            )
             _locate_block_args(for_op.body, loc)
             with ir.InsertionPoint(for_op.body):
                 iv = for_op.induction_variable
@@ -1131,7 +1158,9 @@ class InsertEmptyYieldForSCFFor(Transformer):
         loc = capture_user_location()
         for_op = scf.ForOp(start_val, stop_val, step_val, state_raw, loc=loc)
         InsertEmptyYieldForSCFFor._apply_loop_unroll(for_op, unroll, unroll_full)
-        InsertEmptyYieldForSCFFor._apply_loop_prefetch(for_op, prefetch_depth, unroll, unroll_full)
+        InsertEmptyYieldForSCFFor._apply_loop_prefetch(
+            for_op, prefetch_depth, unroll, unroll_full, prefetch_assume_independent
+        )
         _locate_block_args(for_op.body, loc)
 
         with ir.InsertionPoint(for_op.body):

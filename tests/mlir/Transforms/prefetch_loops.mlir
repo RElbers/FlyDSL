@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 FlyDSL Project Contributors
-// RUN: %fly-opt %s --pass-pipeline='builtin.module(gpu.module(fly-rocdl-prefetch-loops))' | FileCheck %s --implicit-check-not=fly.prefetch_depth
+// RUN: %fly-opt %s --pass-pipeline='builtin.module(gpu.module(fly-rocdl-prefetch-loops))' | FileCheck %s --implicit-check-not=fly.prefetch_depth --implicit-check-not=fly.prefetch_assume_independent
 // RUN: %fly-opt %s --pass-pipeline='builtin.module(gpu.module(fly-rocdl-prefetch-loops))' -verify-diagnostics -o /dev/null
 
 // Tests for fly-rocdl-prefetch-loops:
@@ -183,7 +183,7 @@ gpu.module @prefetch_loops {
       %v = llvm.load %pin : !llvm.ptr<1> -> f32
       %pout = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
       llvm.store %v, %pout : f32, !llvm.ptr<1>
-    } {fly.prefetch_depth = 4 : i64}
+    } {fly.prefetch_assume_independent, fly.prefetch_depth = 4 : i64}
     gpu.return
   }
 
@@ -198,7 +198,7 @@ gpu.module @prefetch_loops {
     scf.for %i = %c0 to %n step %c1 : i32 {
       %v = rocdl.raw.ptr.buffer.load %rin, %i, %c0, 0 : f32
       rocdl.raw.ptr.buffer.store %v, %rout, %i, %c0, 0 : f32
-    } {fly.prefetch_depth = 4 : i64}
+    } {fly.prefetch_assume_independent, fly.prefetch_depth = 4 : i64}
     gpu.return
   }
 
@@ -212,7 +212,7 @@ gpu.module @prefetch_loops {
       gpu.barrier
       %pout = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
       llvm.store %v, %pout : f32, !llvm.ptr<1>
-    } {fly.prefetch_depth = 4 : i64}
+    } {fly.prefetch_assume_independent, fly.prefetch_depth = 4 : i64}
     gpu.return
   }
 
@@ -230,7 +230,7 @@ gpu.module @prefetch_loops {
       %s, %valid = gpu.shuffle xor %v, %c1, %c64 : f32
       %pout = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
       llvm.store %s, %pout : f32, !llvm.ptr<1>
-    } {fly.prefetch_depth = 4 : i64}
+    } {fly.prefetch_assume_independent, fly.prefetch_depth = 4 : i64}
     gpu.return
   }
 
@@ -245,7 +245,7 @@ gpu.module @prefetch_loops {
       %s, %valid = gpu.shuffle xor %v, %c1, %c64 : f32
       %pout = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
       llvm.store %s, %pout : f32, !llvm.ptr<1>
-    } {fly.prefetch_depth = 4 : i64}
+    } {fly.prefetch_assume_independent, fly.prefetch_depth = 4 : i64}
     gpu.return
   }
 
@@ -261,7 +261,7 @@ gpu.module @prefetch_loops {
       %s, %valid = gpu.shuffle xor %v, %c1_i32, %c64 : f32
       %pout = llvm.getelementptr %out[%i64] : (!llvm.ptr<1>, i64) -> !llvm.ptr<1>, f32
       llvm.store %s, %pout : f32, !llvm.ptr<1>
-    } {fly.prefetch_depth = 4 : i64}
+    } {fly.prefetch_assume_independent, fly.prefetch_depth = 4 : i64}
     gpu.return
   }
 
@@ -275,7 +275,7 @@ gpu.module @prefetch_loops {
       %v = llvm.load %pin : !llvm.ptr<1> -> f32
       %pout = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
       llvm.store %v, %pout : f32, !llvm.ptr<1>
-    } {fly.prefetch_depth = 4 : i64}
+    } {fly.prefetch_assume_independent, fly.prefetch_depth = 4 : i64}
     gpu.return
   }
 
@@ -289,7 +289,7 @@ gpu.module @prefetch_loops {
       llvm.store %v, %tmp : f32, !llvm.ptr<1>
       %w = llvm.load %tmp : !llvm.ptr<1> -> f32
       llvm.store %w, %p : f32, !llvm.ptr<1>
-    } {fly.prefetch_depth = 4 : i64}
+    } {fly.prefetch_assume_independent, fly.prefetch_depth = 4 : i64}
     gpu.return
   }
 
@@ -304,7 +304,7 @@ gpu.module @prefetch_loops {
       %w = llvm.load %lds : !llvm.ptr<3> -> f32
       %pout = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
       llvm.store %w, %pout : f32, !llvm.ptr<1>
-    } {fly.prefetch_depth = 4 : i64}
+    } {fly.prefetch_assume_independent, fly.prefetch_depth = 4 : i64}
     gpu.return
   }
 
@@ -318,7 +318,7 @@ gpu.module @prefetch_loops {
       gpu.printf "%f", %v : f32
       %pout = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
       llvm.store %v, %pout : f32, !llvm.ptr<1>
-    } {fly.prefetch_depth = 4 : i64}
+    } {fly.prefetch_assume_independent, fly.prefetch_depth = 4 : i64}
     gpu.return
   }
 
@@ -335,7 +335,7 @@ gpu.module @prefetch_loops {
         %q = llvm.getelementptr %out[%k] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
         llvm.store %v, %q : f32, !llvm.ptr<1>
       }
-    } {fly.prefetch_depth = 4 : i64}
+    } {fly.prefetch_assume_independent, fly.prefetch_depth = 4 : i64}
     gpu.return
   }
 
@@ -365,7 +365,7 @@ gpu.module @prefetch_loops {
       %o = llvm.atomicrmw add %ctr, %c1 monotonic : !llvm.ptr<1>, i32
       %a = arith.addf %acc, %v : f32
       scf.yield %o, %a : i32, f32
-    } {fly.prefetch_depth = 2 : i64}
+    } {fly.prefetch_assume_independent, fly.prefetch_depth = 2 : i64}
     llvm.store %r#1, %out : f32, !llvm.ptr<1>
     gpu.return
   }
@@ -379,7 +379,7 @@ gpu.module @prefetch_loops {
       %v = llvm.load %p : !llvm.ptr<1> -> f32
       %pout = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
       llvm.store %v, %pout : f32, !llvm.ptr<1>
-    } {fly.prefetch_depth = 2 : i64}
+    } {fly.prefetch_assume_independent, fly.prefetch_depth = 2 : i64}
     gpu.return
   }
 
@@ -393,7 +393,7 @@ gpu.module @prefetch_loops {
       %w = llvm.load %lds : !llvm.ptr<3> -> f32
       %pout = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
       llvm.store %w, %pout : f32, !llvm.ptr<1>
-    } {fly.prefetch_depth = 2 : i64}
+    } {fly.prefetch_assume_independent, fly.prefetch_depth = 2 : i64}
     gpu.return
   }
 
@@ -410,7 +410,7 @@ gpu.module @prefetch_loops {
       %s, %valid = gpu.shuffle xor %v, %c1, %c64 : f32
       %pout = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
       llvm.store %s, %pout : f32, !llvm.ptr<1>
-    } {fly.prefetch_depth = 4 : i64}
+    } {fly.prefetch_assume_independent, fly.prefetch_depth = 4 : i64}
     gpu.return
   }
 
@@ -421,7 +421,7 @@ gpu.module @prefetch_loops {
       %v = llvm.load %pin : !llvm.ptr<1> -> f32
       %pout = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
       llvm.store %v, %pout : f32, !llvm.ptr<1>
-    } {fly.prefetch_depth = 4 : i64}
+    } {fly.prefetch_assume_independent, fly.prefetch_depth = 4 : i64}
     gpu.return
   }
 

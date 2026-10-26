@@ -223,7 +223,7 @@ def test_ast_rewrite_for_multi_var_generates_dispatch():
 # ---------------------------------------------------------------------------
 
 
-def _for_dispatch_ir(*, unroll=-1, unroll_full=False, prefetch_depth=None):
+def _for_dispatch_ir(*, unroll=-1, unroll_full=False, prefetch_depth=None, prefetch_assume_independent=False):
     """Build a single-iter-arg scf.for via dispatch and return its module text."""
     with Context(), Location.unknown():
         module = Module.create()
@@ -247,6 +247,7 @@ def _for_dispatch_ir(*, unroll=-1, unroll_full=False, prefetch_depth=None):
                     unroll=unroll,
                     unroll_full=unroll_full,
                     prefetch_depth=prefetch_depth,
+                    prefetch_assume_independent=prefetch_assume_independent,
                 )
                 func.ReturnOp([r.ir_value()])
         assert module.operation.verify()
@@ -446,6 +447,23 @@ def test_for_dispatch_prefetch_depth_non_int_rejected(depth):
         _for_dispatch_ir(prefetch_depth=depth)
 
 
+def test_for_dispatch_prefetch_assume_independent_attr():
+    ir_text = _for_dispatch_ir(prefetch_depth=4, prefetch_assume_independent=True)
+    assert "fly.prefetch_assume_independent" in ir_text
+    assert "fly.prefetch_assume_independent" not in _for_dispatch_ir(prefetch_depth=4)
+
+
+def test_for_dispatch_prefetch_assume_independent_requires_depth():
+    with pytest.raises(ValueError, match="requires `prefetch_depth`"):
+        _for_dispatch_ir(prefetch_assume_independent=True)
+
+
+@pytest.mark.parametrize("value", [1, "yes", None])
+def test_for_dispatch_prefetch_assume_independent_non_bool_rejected(value):
+    with pytest.raises(TypeError, match="prefetch_assume_independent"):
+        _for_dispatch_ir(prefetch_depth=4, prefetch_assume_independent=value)
+
+
 def test_scf_range_prefetch_depth_attr():
     """The init-carrying generator path also honors prefetch_depth."""
     from flydsl._mlir.dialects import scf
@@ -459,12 +477,13 @@ def test_scf_range_prefetch_depth_attr():
             with InsertionPoint(entry):
                 zero = Int32(arith.ConstantOp(i32, 0).result)
                 for _iv, _args in InsertEmptyYieldForSCFFor.scf_range(
-                    0, 8, 1, init=[zero.ir_value()], prefetch_depth=2
+                    0, 8, 1, init=[zero.ir_value()], prefetch_depth=2, prefetch_assume_independent=True
                 ):
                     scf.YieldOp(list(_args))
                 func.ReturnOp([])
         assert module.operation.verify()
         assert "fly.prefetch_depth = 2 : i64" in str(module)
+        assert "fly.prefetch_assume_independent" in str(module)
 
 
 def test_ast_rewrite_for_threads_prefetch_depth():
@@ -481,11 +500,12 @@ def test_ast_rewrite_for_threads_prefetch_depth():
 
     auto = rewrite("""
         def s(n):
-            for i in range(0, n, 1, prefetch_depth=8):
+            for i in range(0, n, 1, prefetch_depth=8, prefetch_assume_independent=True):
                 pass
         """)
     assert "scf_for_dispatch(" in auto
     assert "prefetch_depth=8" in auto
+    assert "prefetch_assume_independent=True" in auto
 
     init_path = rewrite("""
         def s(n):
@@ -510,7 +530,7 @@ module attributes {{gpu.container_module}} {{
         %v = llvm.load %p : !llvm.ptr<1> -> f32
         {extra}
         llvm.store %v, %p : f32, !llvm.ptr<1>
-      }} {{fly.prefetch_depth = 4 : i64}} loc("user_kernel.py":12:8)
+      }} {{fly.prefetch_depth = 4 : i64{attrs}}} loc("user_kernel.py":12:8)
       gpu.return
     }}
   }}
@@ -518,7 +538,7 @@ module attributes {{gpu.container_module}} {{
 """
 
 
-def _run_prefetch_pass(extra):
+def _run_prefetch_pass(extra, attrs=", fly.prefetch_assume_independent"):
     import warnings
 
     from flydsl._mlir.passmanager import PassManager
@@ -526,7 +546,7 @@ def _run_prefetch_pass(extra):
 
     with Context() as ctx, warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        module = Module.parse(_MARKED_LOOP.format(extra=extra))
+        module = Module.parse(_MARKED_LOOP.format(extra=extra, attrs=attrs))
         with dsl_ir_diagnostics(ctx):
             PassManager.parse("builtin.module(gpu.module(fly-rocdl-prefetch-loops))").run(module.operation)
     return caught
@@ -545,3 +565,12 @@ def test_prefetch_loop_left_unchanged_warns_at_user_line():
 @pytest.mark.rocm_lower
 def test_prefetch_loop_pipelined_without_warning():
     assert _run_prefetch_pass("") == []
+
+
+@pytest.mark.l1b_target_dialect
+@pytest.mark.rocm_lower
+def test_prefetch_loop_that_stores_needs_assume_independent():
+    caught = _run_prefetch_pass("", attrs="")
+    assert len(caught) == 1
+    assert "it may write memory (llvm.store)" in str(caught[0].message)
+    assert "prefetch_assume_independent=True" in str(caught[0].message)

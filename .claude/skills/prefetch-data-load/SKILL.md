@@ -30,7 +30,9 @@ b, c)`); the raw `rocdl.mfma_*` intrinsics take `(result_type, operands)`, not
 memory (no barrier or LDS round trip in the body), `range(..., prefetch_depth=N)`
 does this transformation automatically, including runtime trip counts; see
 "Compiler prefetch with `range(..., prefetch_depth=N)`" in
-`docs/kernel_tuning_guide.md` for its contract and when it pays off. Hand-write
+`docs/kernel_tuning_guide.md` for its contract and when it pays off. A loop that
+stores needs `prefetch_assume_independent=True`, which asserts that no iteration
+reads memory an earlier one wrote. Hand-write
 the prefetch below when the loop is left unchanged (the compiler warns why) or
 when the schedule needs control the directive does not give.
 

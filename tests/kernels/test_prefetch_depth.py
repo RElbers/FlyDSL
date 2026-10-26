@@ -8,8 +8,8 @@ edges of the pipelined loop's prologue, epilogue and remainder: no iterations, l
 iterations, fewer iterations than the depth, and lanes whose trip counts differ by one on either
 side of a multiple of the depth (where a lane-exchange op would see the wrong lanes unless the
 pass splits the loop at the wave's shortest trip count). Further tests cover runtime bounds with
-empty ranges, loads issued past the trip count, lane-dependent bounds from mbcnt, and an address
-carried from one iteration to the next.
+empty ranges, loads issued past the trip count, lane-dependent bounds from mbcnt, an address
+carried from one iteration to the next, and loops that store, which need prefetch_assume_independent.
 """
 
 import pytest
@@ -317,4 +317,67 @@ def test_prefetch_depth_loop_shapes(make_launcher, sizes, depth):
     for n in sizes:
         want = _launch_and_read(reference, inp, n)
         got = _launch_and_read(pipelined, inp, n)
+        assert torch.equal(got, want), f"n={n}"
+
+
+def _scatter_launcher(depth):
+    assume = depth is not None
+
+    @flyc.kernel(known_block_size=[BLK, 1, 1])
+    def k(inp: fx.Tensor, out: fx.Tensor, n: fx.Int32) -> None:
+        rin = buffer_ops.create_buffer_resource(inp, max_size=True)
+        rout = buffer_ops.create_buffer_resource(out, max_size=True)
+        tid = arith.index_cast(T.i32, gpu.thread_id("x"))
+        for i in range(fx.Int32(tid), n, fx.Int32(BLK), prefetch_depth=depth, prefetch_assume_independent=assume):
+            buffer_ops.buffer_store(ArithValue(_load(rin, i)) * 2.0, rout, i)
+
+    @flyc.jit
+    def launch(inp: fx.Tensor, out: fx.Tensor, n: fx.Int32, stream: fx.Stream):
+        k(inp, out, n).launch(grid=(1, 1, 1), block=(BLK, 1, 1), stream=stream)
+
+    return launch
+
+
+@pytest.mark.parametrize("depth", [1, 4, 16])
+def test_prefetch_depth_assume_independent_scatter(depth):
+    # A loop that stores is only pipelined with the flag; each iteration writes its own element.
+    reference, pipelined = _scatter_launcher(None), _scatter_launcher(depth)
+    inp = torch.rand(max(SIZES), device="cuda", generator=torch.Generator(device="cuda").manual_seed(0))
+    for n in SIZES:
+        outs = []
+        for launch in (reference, pipelined):
+            out = torch.zeros(max(SIZES), device="cuda")
+            launch(inp, out, n, torch.cuda.current_stream())
+            torch.cuda.synchronize()
+            outs.append(out.cpu())
+        assert torch.equal(*outs), f"n={n}"
+
+
+def _accumulate_in_memory_launcher(depth, assume):
+    @flyc.kernel(known_block_size=[BLK, 1, 1])
+    def k(inp: fx.Tensor, out: fx.Tensor, n: fx.Int32) -> None:
+        rin = buffer_ops.create_buffer_resource(inp, max_size=True)
+        rout = buffer_ops.create_buffer_resource(out, max_size=True)
+        tid = arith.index_cast(T.i32, gpu.thread_id("x"))
+        for i in range(fx.Int32(0), n, fx.Int32(1), prefetch_depth=depth, prefetch_assume_independent=assume):
+            total = ArithValue(_load(rout, tid)) + ArithValue(_load(rin, i))
+            buffer_ops.buffer_store(total, rout, tid)
+
+    @flyc.jit
+    def launch(inp: fx.Tensor, out: fx.Tensor, n: fx.Int32, stream: fx.Stream):
+        k(inp, out, n).launch(grid=(1, 1, 1), block=(BLK, 1, 1), stream=stream)
+
+    return launch
+
+
+@pytest.mark.parametrize("assume", [False, True])
+@pytest.mark.parametrize("depth", [1, 4])
+def test_prefetch_depth_accumulator_in_memory_left_unchanged(depth, assume):
+    # Every iteration reads what the previous one stored. Without the flag the loop stores, and with
+    # it the load reads the same address in every iteration, so the pass leaves it unchanged either way.
+    reference, candidate = _accumulate_in_memory_launcher(None, False), _accumulate_in_memory_launcher(depth, assume)
+    inp = torch.arange(1, 1025, device="cuda", dtype=torch.float32)
+    for n in (0, 1, 10, 37):
+        want = _launch_and_read(reference, inp, n)
+        got = _launch_and_read(candidate, inp, n)
         assert torch.equal(got, want), f"n={n}"
