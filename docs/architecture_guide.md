@@ -177,7 +177,7 @@ Python Function (@flyc.kernel / @flyc.jit)
    │   fly-promote-regmem-to-vectorssa                      │
    │   convert-fly-to-rocdl                                 │
    │   canonicalize                                         │
-   │   gpu.module(convert-scf-to-cf, cse,                   │
+   │   gpu.module(fly-convert-scf-to-cf, cse,               │
    │              convert-rocdl-fastmath-ops,              │
    │              convert-gpu-to-rocdl{chipset=gfxNNN ...}, │
    │              fly-rocdl-cluster-attr)                   │
@@ -235,7 +235,7 @@ definition for this checkout:
 | 7 | `fly-promote-regmem-to-vectorssa` | Promotes `fly.make_ptr(register)` memory semantics to vector SSA values (requires #6). |
 | 8 | `convert-fly-to-rocdl` | Lowers remaining Fly ops to MLIR upstream + ROCDL dialects (copy atoms → ROCDL buffer load/store operations, or gfx1250 TDM → `rocdl.tensor.load.to.lds` / `store.from.lds`; MMA atoms → `rocdl.mfma.*` on CDNA, `rocdl.wmma.*` on gfx11/gfx1250). |
 | 9 | `canonicalize` | Second canonicalization round after ROCDL lowering. |
-| 10 | `gpu.module(convert-scf-to-cf, cse, convert-rocdl-fastmath-ops, convert-gpu-to-rocdl{chipset=gfxNNN ...}, fly-rocdl-cluster-attr)` | Inside the GPU module: SCF→CF, CSE, ROCDL fast-math ops lowering, GPU intrinsics→ROCDL, then `fly-rocdl-cluster-attr` injects `amdgpu-cluster-dims` into the `llvm.func` `passthrough`. |
+| 10 | `gpu.module(fly-convert-scf-to-cf, cse, convert-rocdl-fastmath-ops, convert-gpu-to-rocdl{chipset=gfxNNN ...}, fly-rocdl-cluster-attr)` | Inside the GPU module: SCF→CF (`fly-convert-scf-to-cf` is upstream `convert-scf-to-cf` plus `nsw` / `nuw` on each loop increment, so LLVM can count the trips of loops whose step isn't 1), CSE, ROCDL fast-math ops lowering, GPU intrinsics→ROCDL, then `fly-rocdl-cluster-attr` injects `amdgpu-cluster-dims` into the `llvm.func` `passthrough`. |
 
 **Stage B — `binary_prep_fragments`** (LLVM lowering, host + kernel)
 
@@ -500,7 +500,7 @@ dumps/my_func_name/
 ├── 07_fly_promote_regmem_to_vectorssa.mlir
 ├── 08_convert_fly_to_rocdl.mlir
 ├── 09_canonicalize.mlir
-├── 10_convert_scf_to_cf_cse_convert_gpu_to_rocdl.mlir
+├── 10_fly_convert_scf_to_cf_cse_convert_gpu_to_rocdl.mlir
 │                                      # also runs fly-rocdl-cluster-attr
 ├── 11_rocdl_attach_target.mlir
 ├── 12_convert_scf_to_cf.mlir
