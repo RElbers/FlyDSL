@@ -566,7 +566,7 @@ def test_prefetch_loop_left_unchanged_warns_at_user_line():
 def test_prefetch_loop_warns_at_recorded_line_without_debug_info():
     # Without debug info the loop's location points into re-parsed IR text; the frontend records the
     # user's line in fly.prefetch_loc, and the remark uses it.
-    caught = _run_prefetch_pass("gpu.barrier", attrs=', fly.prefetch_loc = "user_kernel.py:21:4"', loc="")
+    caught = _run_prefetch_pass("gpu.barrier", attrs=', fly.prefetch_loc = loc("user_kernel.py":21:4)', loc="")
     assert len(caught) == 1
     assert (caught[0].filename, caught[0].lineno) == ("user_kernel.py", 21)
 

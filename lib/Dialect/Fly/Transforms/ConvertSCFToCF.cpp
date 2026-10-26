@@ -8,8 +8,8 @@
 // scf.for guarantees this: the value after the last increment, LB + n * step, must be representable
 // in the induction variable's type, or the loop is undefined. Without the flag LLVM can't compute
 // the trip count of a loop with bounds narrower than 64 bits, so it can't unroll it with a runtime
-// trip count (`range(..., unroll=N)` keeps one load in flight) or reason about its induction
-// variable.
+// trip count or reason about its induction variable. Each copy `range(..., unroll=N)` makes then
+// keeps its own exit test, and waits for its load before the next copy issues one.
 //
 // Upstream's lowering creates the increment without flags and has no option for them, but it copies
 // every LLVM-dialect attribute of the scf.for onto the loop's back-edge branch (that is how
@@ -38,6 +38,7 @@ namespace fly {
 
 namespace {
 
+// Its value must be an LLVM-dialect attribute: upstream only copies those onto the back edge.
 constexpr StringLiteral kNoWrapMarker = "fly.iv_no_wrap";
 
 class FlyConvertSCFToCFPass

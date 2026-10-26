@@ -39,25 +39,25 @@ def FlyROCDLPrefetchLoopsPass : Pass<"fly-rocdl-prefetch-loops"> {
     issues. The loop is unrolled by N and pipelined in two stages: each
     steady-state iteration issues the next N loads together, ahead of the
     previous N iterations' compute (it still waits for them before its
-    backedge). In the
-    prologue and epilogue of a runtime trip count, reads, side effects and
-    integer division or remainder only run for in-range iterations. Loads move
-    ahead of earlier iterations' writes, so a loop that may write memory is only
-    pipelined with `fly.prefetch_assume_independent` (set by
+    backedge). In the prologue and epilogue of a runtime trip count, reads,
+    side effects and integer division or remainder only run for in-range
+    iterations.
+
+    Loads move ahead of earlier iterations' writes, so a loop that may write
+    memory is only pipelined with `fly.prefetch_assume_independent` (set by
     `prefetch_assume_independent=True`), which asserts that no iteration reads
-    memory an earlier one wrote. A loop is left unchanged, with a remark naming
-    the reason, when it contains a barrier, a print or assert, a copy into or
-    out of LDS or an asynchronous copy, a fence, a volatile access or an atomic
-    with acquire or stronger ordering, a private-memory access, a load after a
-    possible store in the same iteration, a load from the same address in every
-    iteration of a buffer the loop writes, no top-level load, a load whose
-    address depends on a side-effecting op, or a guarded op of a type it can't
-    stand in for. Narrow integer bounds are widened to i64; a loop is left
-    unchanged if its step times the depth overflows a signed 64-bit integer (a
-    runtime 64-bit step is assumed not to). Loops with a lane-exchange op
-    (including calls, inline asm and AMDGPU intrinsic calls) and lane-dependent
-    bounds are first split at the wave's shortest trip count. Run inside `gpu.module(...)` after
-    `convert-fly-to-rocdl` and before `convert-scf-to-cf`.
+    memory an earlier one wrote. A loop whose order of loads, stores,
+    synchronization or address computation the move would change, such as one
+    with a barrier, or with a load whose address depends on a value the loop
+    computes after its loads, is left unchanged with a remark naming the
+    reason.
+
+    Narrow integer bounds are widened to i64; a loop is left unchanged if its
+    step times the depth overflows a signed 64-bit integer (a runtime 64-bit
+    step is assumed not to). Loops with a lane-exchange op (including calls,
+    inline asm and AMDGPU intrinsic calls) and lane-dependent bounds are first
+    split at the wave's shortest trip count. Run inside `gpu.module(...)` after
+    `convert-fly-to-rocdl` and before `fly-convert-scf-to-cf`.
   }];
   let dependentDialects = [
     "arith::ArithDialect",

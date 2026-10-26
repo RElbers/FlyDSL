@@ -41,22 +41,6 @@ class DiagRecord:
     chain: List[SourceFrame] = field(default_factory=list)
 
 
-_LOCATION_KINDS = (("callsite", "CallSiteLoc"), ("name", "NameLoc"), ("fused", "FusedLoc"), ("file", "FileLineColLoc"))
-
-
-def _location_kind(loc) -> Optional[str]:
-    """The kind of an MLIR ``Location``: typed subclasses (``CallSiteLoc``, ...) in current
-    bindings, ``Location.is_a_*()`` in older ones."""
-    for kind, cls_name in _LOCATION_KINDS:
-        cls = getattr(ir, cls_name, None)
-        if cls is not None and isinstance(loc, cls):
-            return kind
-        is_a = getattr(loc, f"is_a_{kind}", None)
-        if is_a is not None and is_a():
-            return kind
-    return None
-
-
 def location_chain(loc) -> List[SourceFrame]:
     """Flatten an MLIR ``Location`` into ``[innermost, ..., outermost]`` frames.
 
@@ -67,17 +51,16 @@ def location_chain(loc) -> List[SourceFrame]:
     if loc is None:
         return []
     try:
-        kind = _location_kind(loc)
-        if kind == "callsite":
+        if isinstance(loc, ir.CallSiteLoc):
             return location_chain(loc.callee) + location_chain(loc.caller)
-        if kind == "name":
+        if isinstance(loc, ir.NameLoc):
             return location_chain(loc.child_loc)
-        if kind == "fused":
+        if isinstance(loc, ir.FusedLoc):
             out: List[SourceFrame] = []
             for child in loc.locations:
                 out.extend(location_chain(child))
             return out
-        if kind == "file":
+        if isinstance(loc, ir.FileLineColLoc):
             filename, line = loc.filename, loc.start_line
             if not filename or filename.startswith("<") or filename == "-" or not line:
                 return []  # synthetic source (or IR re-parsed from text) we cannot point a user at
@@ -179,12 +162,11 @@ def install_excepthook() -> None:
 
 @contextmanager
 def dsl_ir_diagnostics(ctx):
-    """Collect MLIR error diagnostics emitted during a ``with`` block.
+    """Collect the MLIR errors emitted during a ``with`` block as a list of :class:`DiagRecord`.
 
-    Yields a list of :class:`DiagRecord`.
-    Only ``ERROR`` severity messages are captured. Warnings and remarks (for example a loop marked
-    with ``prefetch_depth`` that a pass leaves unchanged) become Python warnings at the user's
-    source line after the block succeeds; the Python bindings would otherwise drop them.
+    Warnings and remarks (for example a loop marked with ``prefetch_depth`` that a pass leaves
+    unchanged) become Python warnings at the user's source line once the block succeeds; the Python
+    bindings would otherwise drop them.
     """
     records: list = []
     pending_warnings: list = []
