@@ -85,8 +85,7 @@ bool isWaveUniform(Value v, DenseMap<Value, bool> &memo) {
       uniform = true;
     else if (auto forOp = dyn_cast<scf::ForOp>(parent); forOp && v == forOp.getInductionVar())
       uniform = isWaveUniform(forOp.getLowerBound(), memo) &&
-                isWaveUniform(forOp.getUpperBound(), memo) &&
-                isWaveUniform(forOp.getStep(), memo);
+                isWaveUniform(forOp.getUpperBound(), memo) && isWaveUniform(forOp.getStep(), memo);
   } else {
     Operation *op = v.getDefiningOp();
     StringRef n = op->getName().getStringRef();
@@ -140,20 +139,32 @@ bool hasReadAfterWrite(scf::ForOp forOp) {
   return result.wasInterrupted();
 }
 
-// Mechanical whole-loop rotation cannot safely pipeline a loop that contains an intra-loop barrier
-// or a single-buffered global->LDS DMA (`buffer.load.lds`) / LDS store: rotating the DMA across the
-// backedge would clobber the shared buffer (no double buffering), and a dynamic-trip epilogue would
-// have to predicate the barrier, which is illegal. Prints and asserts would run out of order, and a
-// read after a write could move ahead of it. Such loops are left as they are.
-bool isMechanicallyPipelineable(scf::ForOp forOp) {
-  WalkResult result = forOp.getBody()->walk([](Operation *op) {
+// Why `forOp` can't be pipelined, or an empty string when it can. Mechanical whole-loop rotation
+// cannot safely pipeline a loop that contains an intra-loop barrier or a single-buffered
+// global->LDS DMA (`buffer.load.lds`): rotating the DMA across the backedge would clobber the
+// shared buffer (no double buffering), and a dynamic-trip epilogue would have to predicate the
+// barrier, which is illegal. Prints and asserts would run out of order, and a read after a write
+// could move ahead of it.
+StringRef whyNotPipelineable(scf::ForOp forOp) {
+  StringRef reason;
+  forOp.getBody()->walk([&](Operation *op) {
     StringRef n = op->getName().getStringRef();
-    if (n.contains("barrier") || n.contains("buffer.load.lds") || n.contains("ds.write") ||
-        n.contains("print") || n.contains("assert"))
-      return WalkResult::interrupt();
-    return WalkResult::advance();
+    if (n.contains("barrier"))
+      reason = "it contains a barrier";
+    else if (n.contains("buffer.load.lds"))
+      reason = "it contains a global-to-LDS copy";
+    else if (n.contains("print") || n.contains("assert"))
+      reason = "it contains a print or an assert";
+    return reason.empty() ? WalkResult::advance() : WalkResult::interrupt();
   });
-  return !result.wasInterrupted() && !hasReadAfterWrite(forOp);
+  if (!reason.empty())
+    return reason;
+  if (llvm::none_of(forOp.getBody()->without_terminator(),
+                    [](Operation &op) { return isPipelineableRead(&op); }))
+    return "its body has no load at the top level to issue early";
+  if (hasReadAfterWrite(forOp))
+    return "a load follows a possible store in the same iteration and would move ahead of it";
+  return {};
 }
 
 Value toI64(RewriterBase &rewriter, Location loc, Value v) {
@@ -177,8 +188,7 @@ Value fromI64(RewriterBase &rewriter, Location loc, Value v, Type ty) {
 // runs the remaining iterations of each lane in a plain tail loop after it. Every lane then runs
 // `forOp` the same number of times, and the tail runs in lockstep, so each iteration index sees the
 // same active lanes as in the original loop. Costs one wave reduction before the loop.
-LogicalResult splitAtWaveUniformTripCount(RewriterBase &rewriter, scf::ForOp forOp,
-                                          int64_t depth) {
+LogicalResult splitAtWaveUniformTripCount(RewriterBase &rewriter, scf::ForOp forOp, int64_t depth) {
   if (forOp.getUnsignedCmp())
     return failure();
   Location loc = forOp.getLoc();
@@ -238,8 +248,8 @@ void buildLoadComputeSchedule(scf::ForOp forOp,
       return o->getBlock() == forOp.getBody() && isMemoryEffectFree(o);
     };
     // Root the slice at the read's operands, not the read itself: getBackwardSlice returns an empty
-    // slice when the root fails the filter (a read is not memory-effect-free), which would leave the
-    // address math in the last stage ("operation scheduled before its operands").
+    // slice when the root fails the filter (a read is not memory-effect-free), which would leave
+    // the address math in the last stage ("operation scheduled before its operands").
     for (Value operand : op.getOperands())
       (void)getBackwardSlice(operand, &slice, sliceOpts);
     stage0.insert(slice.begin(), slice.end());
@@ -289,9 +299,8 @@ Operation *predicateOp(RewriterBase &rewriter, Operation *op, Value pred) {
   if (isMemoryEffectFree(op))
     return op;
 
-  bool zeroable = llvm::all_of(op->getResultTypes(), [](Type t) {
-    return isa<IntegerType, FloatType, VectorType>(t);
-  });
+  bool zeroable = llvm::all_of(op->getResultTypes(),
+                               [](Type t) { return isa<IntegerType, FloatType, VectorType>(t); });
   if (!zeroable)
     return nullptr;
   OpBuilder::InsertionGuard g(rewriter);
@@ -310,7 +319,8 @@ Operation *predicateOp(RewriterBase &rewriter, Operation *op, Value pred) {
   rewriter.setInsertionPointToEnd(ifOp.elseBlock());
   SmallVector<Value> zeros;
   for (Type t : op->getResultTypes())
-    zeros.push_back(arith::ConstantOp::create(rewriter, loc, cast<TypedAttr>(rewriter.getZeroAttr(t))));
+    zeros.push_back(
+        arith::ConstantOp::create(rewriter, loc, cast<TypedAttr>(rewriter.getZeroAttr(t))));
   scf::YieldOp::create(rewriter, loc, zeros);
   return ifOp;
 }
@@ -331,13 +341,26 @@ public:
     IRRewriter rewriter(&getContext());
     for (auto [forOp, depth] : requested) {
       forOp->removeAttr(kPrefetchDepthAttr);
-      if (depth < 1 || !isMechanicallyPipelineable(forOp))
+      // The loop was marked explicitly, so say why it stays as it is.
+      auto notPipelined = [&, depth = depth](scf::ForOp loop, StringRef why) {
+        loop.emitRemark() << "loop not pipelined (prefetch_depth=" << depth << "): " << why;
+      };
+      if (depth < 1) {
+        notPipelined(forOp, "the depth must be at least 1");
         continue;
+      }
+      if (StringRef why = whyNotPipelineable(forOp); !why.empty()) {
+        notPipelined(forOp, why);
+        continue;
+      }
       // Unrolling and peeling split each lane's iterations at its own trip count; a lane-exchange
       // op needs that split to fall at the same iteration in every lane of the wave.
       if (hasLaneExchangeOp(forOp) && !hasWaveUniformTripCount(forOp) &&
-          failed(splitAtWaveUniformTripCount(rewriter, forOp, depth)))
+          failed(splitAtWaveUniformTripCount(rewriter, forOp, depth))) {
+        notPipelined(forOp, "it exchanges values across lanes and compares its bounds unsigned, so "
+                            "its trip count can't be split the same way in every lane");
         continue;
+      }
 
       scf::ForOp target = forOp;
       if (depth > 1) {
@@ -355,8 +378,11 @@ public:
       options.getScheduleFn = buildLoadComputeSchedule;
       rewriter.setInsertionPoint(target);
       bool modified = false;
-      if (failed(scf::pipelineForLoop(rewriter, target, options, &modified)) && modified)
-        return signalPassFailure(); // IR mutated, then failed
+      if (failed(scf::pipelineForLoop(rewriter, target, options, &modified))) {
+        if (modified)
+          return signalPassFailure(); // IR mutated, then failed
+        notPipelined(target, "the pipeliner rejected its schedule (the loop is only unrolled)");
+      }
     }
   }
 };

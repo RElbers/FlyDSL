@@ -182,13 +182,24 @@ def dsl_ir_diagnostics(ctx):
     """Collect MLIR error diagnostics emitted during a ``with`` block.
 
     Yields a list of :class:`DiagRecord`.
-    Only ``ERROR`` severity messages are captured.
+    Only ``ERROR`` severity messages are captured. Warnings and remarks (for example a loop marked
+    with ``prefetch_depth`` that a pass leaves unchanged) become Python warnings at the user's
+    source line; the Python bindings would otherwise drop them.
     """
     records: list = []
 
     def _handler(d):
         if d.severity == ir.DiagnosticSeverity.ERROR:
             records.append(diag_record_from_diagnostic(d))
+            return True
+        if d.severity in (ir.DiagnosticSeverity.WARNING, ir.DiagnosticSeverity.REMARK):
+            record = diag_record_from_diagnostic(d)
+            if record.chain:
+                frame = record.chain[0]
+                warnings.warn_explicit(record.message, UserWarning, frame.filename, frame.line)
+            else:
+                hint = "set FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1 to see the source line"
+                warnings.warn(f"{record.message} ({hint})", stacklevel=2)
             return True
         return False
 

@@ -495,3 +495,53 @@ def test_ast_rewrite_for_threads_prefetch_depth():
         """)
     assert "scf_range(" in init_path
     assert "prefetch_depth=8" in init_path
+
+
+# A marked loop the pass leaves unchanged gets a remark, which FlyDSL reports as a Python warning at
+# the user's source line.
+_MARKED_LOOP = """
+module attributes {{gpu.container_module}} {{
+  gpu.module @m {{
+    gpu.func @k(%in: !llvm.ptr<1>, %n: i32) kernel {{
+      %c0 = arith.constant 0 : i32
+      %c1 = arith.constant 1 : i32
+      scf.for %i = %c0 to %n step %c1 : i32 {{
+        %p = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+        %v = llvm.load %p : !llvm.ptr<1> -> f32
+        {extra}
+        llvm.store %v, %p : f32, !llvm.ptr<1>
+      }} {{fly.prefetch_depth = 4 : i64}} loc("user_kernel.py":12:8)
+      gpu.return
+    }}
+  }}
+}}
+"""
+
+
+def _run_prefetch_pass(extra):
+    import warnings
+
+    from flydsl._mlir.passmanager import PassManager
+    from flydsl.compiler.diagnostics import dsl_ir_diagnostics
+
+    with Context() as ctx, warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        module = Module.parse(_MARKED_LOOP.format(extra=extra))
+        with dsl_ir_diagnostics(ctx):
+            PassManager.parse("builtin.module(gpu.module(fly-rocdl-prefetch-loops))").run(module.operation)
+    return caught
+
+
+@pytest.mark.l1b_target_dialect
+@pytest.mark.rocm_lower
+def test_prefetch_loop_left_unchanged_warns_at_user_line():
+    caught = _run_prefetch_pass("gpu.barrier")
+    assert len(caught) == 1
+    assert str(caught[0].message) == "loop not pipelined (prefetch_depth=4): it contains a barrier"
+    assert (caught[0].filename, caught[0].lineno) == ("user_kernel.py", 12)
+
+
+@pytest.mark.l1b_target_dialect
+@pytest.mark.rocm_lower
+def test_prefetch_loop_pipelined_without_warning():
+    assert _run_prefetch_pass("") == []
