@@ -118,18 +118,42 @@ bool hasLaneExchangeOp(scf::ForOp forOp) {
   return result.wasInterrupted();
 }
 
+// A leaf op that may write memory: a write effect, or no effect information at all.
+bool mayWriteMemory(Operation *op) {
+  return !isPipelineableRead(op) && !isMemoryEffectFree(op) &&
+         !hasSingleEffect<MemoryEffects::Read>(op);
+}
+
+// Stage 0 runs a top-level read one iteration group ahead of everything else, so a read that
+// follows a write in the body would move ahead of that write, which may store to the same address
+// (an LDS round trip, or a global store and reload).
+bool hasReadAfterWrite(scf::ForOp forOp) {
+  bool sawWrite = false;
+  WalkResult result = forOp.getBody()->walk<WalkOrder::PreOrder>([&](Operation *op) {
+    if (op->getNumRegions() > 0)
+      return WalkResult::advance();
+    if (sawWrite && isPipelineableRead(op) && op->getBlock() == forOp.getBody())
+      return WalkResult::interrupt();
+    sawWrite |= mayWriteMemory(op);
+    return WalkResult::advance();
+  });
+  return result.wasInterrupted();
+}
+
 // Mechanical whole-loop rotation cannot safely pipeline a loop that contains an intra-loop barrier
 // or a single-buffered global->LDS DMA (`buffer.load.lds`) / LDS store: rotating the DMA across the
 // backedge would clobber the shared buffer (no double buffering), and a dynamic-trip epilogue would
-// have to predicate the barrier, which is illegal. Such loops are left as they are.
+// have to predicate the barrier, which is illegal. Prints and asserts would run out of order, and a
+// read after a write could move ahead of it. Such loops are left as they are.
 bool isMechanicallyPipelineable(scf::ForOp forOp) {
   WalkResult result = forOp.getBody()->walk([](Operation *op) {
     StringRef n = op->getName().getStringRef();
-    if (n.contains("barrier") || n.contains("buffer.load.lds") || n.contains("ds.write"))
+    if (n.contains("barrier") || n.contains("buffer.load.lds") || n.contains("ds.write") ||
+        n.contains("print") || n.contains("assert"))
       return WalkResult::interrupt();
     return WalkResult::advance();
   });
-  return !result.wasInterrupted();
+  return !result.wasInterrupted() && !hasReadAfterWrite(forOp);
 }
 
 Value toI64(RewriterBase &rewriter, Location loc, Value v) {

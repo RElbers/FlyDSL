@@ -8,7 +8,9 @@
 //     epilogue stores, and a serial remainder loop for the runtime trip count
 //   - a raw load in the prologue only issues under scf.if, since it can fault past the trip count;
 //     a buffer load issues unguarded and its result is masked to zero
-//   - a loop with a barrier is left unchanged
+//   - a loop with a barrier or a print is left unchanged, and so is a loop that reads after a write
+//     in the same iteration (global or LDS), since the read would move ahead of the write; a read
+//     whose address comes from another read is still pipelined
 //   - a loop with a lane-exchange op (gpu.shuffle) is pipelined as is when its bounds are
 //     wave-uniform; when they depend on the lane, its main loop first ends at the wave's shortest
 //     trip count (wave.reduce.umin, as i32 for 32-bit bounds and i64 for index) and a plain tail
@@ -71,6 +73,43 @@
 // CHECK-LABEL: gpu.func @with_shuffle_index
 // CHECK:      llvm.call_intrinsic "llvm.amdgcn.wave.reduce.umin"({{.*}}) : (i64, i32) -> i64
 // CHECK:      gpu.return
+
+// CHECK-LABEL: gpu.func @gather
+// CHECK-COUNT-4: scf.if {{.*}} -> (i32) {
+// CHECK-NEXT:      llvm.load
+// CHECK:      scf.for
+// CHECK:      gpu.return
+
+// CHECK-LABEL: gpu.func @store_then_reload
+// CHECK:      scf.for
+// CHECK-NEXT:   llvm.getelementptr
+// CHECK-NEXT:   llvm.load
+// CHECK-NEXT:   llvm.store
+// CHECK-NEXT:   llvm.load
+// CHECK-NEXT:   llvm.store
+// CHECK-NEXT: }
+// CHECK-NEXT: gpu.return
+
+// CHECK-LABEL: gpu.func @lds_round_trip
+// CHECK:      scf.for
+// CHECK-NEXT:   llvm.getelementptr
+// CHECK-NEXT:   llvm.load
+// CHECK-NEXT:   llvm.store
+// CHECK-NEXT:   llvm.load
+// CHECK-NEXT:   llvm.getelementptr
+// CHECK-NEXT:   llvm.store
+// CHECK-NEXT: }
+// CHECK-NEXT: gpu.return
+
+// CHECK-LABEL: gpu.func @with_printf
+// CHECK:      scf.for
+// CHECK-NEXT:   llvm.getelementptr
+// CHECK-NEXT:   llvm.load
+// CHECK-NEXT:   gpu.printf
+// CHECK-NEXT:   llvm.getelementptr
+// CHECK-NEXT:   llvm.store
+// CHECK-NEXT: }
+// CHECK-NEXT: gpu.return
 
 // CHECK-LABEL: gpu.func @unmarked
 // CHECK:      scf.for
@@ -166,6 +205,60 @@ gpu.module @prefetch_loops {
       %s, %valid = gpu.shuffle xor %v, %c1_i32, %c64 : f32
       %pout = llvm.getelementptr %out[%i64] : (!llvm.ptr<1>, i64) -> !llvm.ptr<1>, f32
       llvm.store %s, %pout : f32, !llvm.ptr<1>
+    } {fly.prefetch_depth = 4 : i64}
+    gpu.return
+  }
+
+  gpu.func @gather(%idx: !llvm.ptr<1>, %in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    scf.for %i = %c0 to %n step %c1 : i32 {
+      %pidx = llvm.getelementptr %idx[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, i32
+      %j = llvm.load %pidx : !llvm.ptr<1> -> i32
+      %pin = llvm.getelementptr %in[%j] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      %v = llvm.load %pin : !llvm.ptr<1> -> f32
+      %pout = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      llvm.store %v, %pout : f32, !llvm.ptr<1>
+    } {fly.prefetch_depth = 4 : i64}
+    gpu.return
+  }
+
+  gpu.func @store_then_reload(%in: !llvm.ptr<1>, %tmp: !llvm.ptr<1>, %n: i32) kernel {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    scf.for %i = %c0 to %n step %c1 : i32 {
+      %p = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      %v = llvm.load %p : !llvm.ptr<1> -> f32
+      llvm.store %v, %tmp : f32, !llvm.ptr<1>
+      %w = llvm.load %tmp : !llvm.ptr<1> -> f32
+      llvm.store %w, %p : f32, !llvm.ptr<1>
+    } {fly.prefetch_depth = 4 : i64}
+    gpu.return
+  }
+
+  gpu.func @lds_round_trip(%in: !llvm.ptr<1>, %lds: !llvm.ptr<3>, %out: !llvm.ptr<1>, %n: i32) kernel {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    scf.for %i = %c0 to %n step %c1 : i32 {
+      %pin = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      %v = llvm.load %pin : !llvm.ptr<1> -> f32
+      llvm.store %v, %lds : f32, !llvm.ptr<3>
+      %w = llvm.load %lds : !llvm.ptr<3> -> f32
+      %pout = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      llvm.store %w, %pout : f32, !llvm.ptr<1>
+    } {fly.prefetch_depth = 4 : i64}
+    gpu.return
+  }
+
+  gpu.func @with_printf(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    scf.for %i = %c0 to %n step %c1 : i32 {
+      %pin = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      %v = llvm.load %pin : !llvm.ptr<1> -> f32
+      gpu.printf "%f", %v : f32
+      %pout = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
+      llvm.store %v, %pout : f32, !llvm.ptr<1>
     } {fly.prefetch_depth = 4 : i64}
     gpu.return
   }
