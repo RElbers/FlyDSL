@@ -12,6 +12,7 @@ add_mlir_dialect_library(MLIRFlyROCDLDialect
   CDNA5/TdmAtomBuilder.cpp
   Transforms/ExpandOps.cpp
   Transforms/ClusterAttr.cpp
+  Transforms/PrefetchLoops.cpp
   GFX1250/MmaAtom.cpp
   GFX1250/MmaAtomScale.cpp
   GFX1250/CopyAtom.cpp

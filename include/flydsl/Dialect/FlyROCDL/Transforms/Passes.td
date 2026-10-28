@@ -30,4 +30,40 @@ def FlyROCDLClusterAttrPass : Pass<"fly-rocdl-cluster-attr"> {
   ];
 }
 
+def FlyROCDLPrefetchLoopsPass : Pass<"fly-rocdl-prefetch-loops"> {
+  let summary = "Software-pipeline scf.for loops marked with fly.prefetch_depth";
+  let description = [{
+    Rewrites each `scf.for` carrying `fly.prefetch_depth = N` (set by
+    `range(..., prefetch_depth=N)`) so up to N loads per lane are in flight at
+    once, instead of waiting for each iteration's load before the next one
+    issues. The loop is unrolled by N and pipelined in two stages: each
+    steady-state iteration issues the next N loads together, ahead of the
+    previous N iterations' compute (it still waits for them before its
+    backedge). In the prologue and epilogue of a runtime trip count, reads,
+    side effects and integer division or remainder only run for in-range
+    iterations.
+
+    Loads move ahead of earlier iterations' writes, so a loop that may write
+    memory is only pipelined with `fly.prefetch_assume_independent` (set by
+    `prefetch_assume_independent=True`), which asserts that no iteration reads
+    memory an earlier one wrote. A loop whose order of loads, stores,
+    synchronization or address computation the move would change, such as one
+    with a barrier, or with a load whose address depends on a value the loop
+    computes after its loads, is left unchanged with a remark naming the
+    reason.
+
+    Narrow integer bounds are widened to i64; a loop is left unchanged if its
+    step times the depth overflows a signed 64-bit integer (a runtime 64-bit
+    step is assumed not to). Loops with a lane-exchange op (including calls,
+    inline asm and AMDGPU intrinsic calls) and lane-dependent bounds are first
+    split at the wave's shortest trip count. Run inside `gpu.module(...)` after
+    `convert-fly-to-rocdl` and before `fly-convert-scf-to-cf`.
+  }];
+  let dependentDialects = [
+    "arith::ArithDialect",
+    "LLVM::LLVMDialect",
+    "scf::SCFDialect"
+  ];
+}
+
 #endif // FLYROCDL_PASSES
