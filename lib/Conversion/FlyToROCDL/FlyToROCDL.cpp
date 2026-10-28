@@ -80,6 +80,26 @@ static unsigned getLLVMAlignment(fly::PointerType ptrTy) {
   return 1u << llvm::countr_zero(static_cast<unsigned>(align));
 }
 
+// Tag every memory access that lowering `op` created with the copy's alias scopes. The atom
+// emitters insert before `op`, so those are the ops between `prev` (the op that preceded `op`
+// before lowering, or null when `op` was first in its block) and `op`, with their regions.
+static void applyCopyAliasScopes(ConversionPatternRewriter &rewriter, Operation *op,
+                                 Operation *prev, ArrayAttr aliasScopes, ArrayAttr noaliasScopes) {
+  if (!aliasScopes && !noaliasScopes)
+    return;
+  Block::iterator it = prev ? std::next(prev->getIterator()) : op->getBlock()->begin();
+  for (; &*it != op; ++it) {
+    it->walk([&](LLVM::AliasAnalysisOpInterface access) {
+      rewriter.modifyOpInPlace(access, [&] {
+        if (aliasScopes)
+          access.setAliasScopes(aliasScopes);
+        if (noaliasScopes)
+          access.setNoAliasScopes(noaliasScopes);
+      });
+    });
+  }
+}
+
 // Create a freshly named LDS global of `[nbytes x i8]` in `addrSpace`, inserted
 // at the start of `moduleOp`. The symbol name is `prefix` followed by a counter
 // chosen to avoid collisions with existing globals in the module. Shared by
@@ -652,6 +672,7 @@ public:
         return rewriter.notifyMatchFailure(op, "pred is not a MemRef type");
     }
 
+    Operation *prev = op->getPrevNode();
     if (pred) {
       if (failed(copyAtom.emitAtomCall(rewriter, loc, copyAtomType, srcTy, dstTy, predMemTy,
                                        copyAtomVal, src, dst, pred)))
@@ -661,6 +682,7 @@ public:
                                        dst)))
         return failure();
     }
+    applyCopyAliasScopes(rewriter, op, prev, op.getAliasScopesAttr(), op.getNoaliasScopesAttr());
     rewriter.eraseOp(op);
     return success();
   }
@@ -701,6 +723,7 @@ public:
         return op.emitOpError("expected a scalar i1 predicate after SSA lowering");
     }
 
+    Operation *prev = op->getPrevNode();
     FailureOr<Value> result;
     if (pred) {
       result = copyAtom.emitAtomCallSSA(rewriter, loc, resultTy, copyAtomType, srcTy, dstTy,
@@ -712,6 +735,7 @@ public:
     }
     if (failed(result))
       return failure();
+    applyCopyAliasScopes(rewriter, op, prev, op.getAliasScopesAttr(), op.getNoaliasScopesAttr());
 
     if (hasResult)
       rewriter.replaceOp(op, *result);

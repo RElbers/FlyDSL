@@ -408,6 +408,14 @@ Tiled copies support the same state update API: `tiled_copy.set_value("soffset",
 returns a new TiledCopy with its original tile and thread/value layout. Passing it to
 `fx.copy` uses the updated atom state. Both tiled types also accept a dictionary of fields.
 
+`fx.copy(..., alias_scopes=..., noalias_scopes=...)` takes `ArrayAttr`s of `#llvm.alias_scope`, as
+`llvm.LoadOp` does, and attaches them to every memory access the copy lowers to. Use them on an LDS
+DMA whose destination address is built through integers (`fx.inttoptr`): without a scope, LLVM can
+only treat such a DMA as writing any LDS and cannot tell it apart from scoped LDS reads. With the
+scope of the buffer it fills, plus a noalias list of the others, LLVM waits for the DMA before
+reads of that buffer only. A DMA destination built as a pointer offset from the LDS field
+(`fx.add_offset(field.ptr, ...)`) needs no scopes; LLVM derives them per field.
+
 Use `atom_callback` to select a different atom for each static tile, for example
 to choose a byte from packed CDNA4 scale words explicitly:
 

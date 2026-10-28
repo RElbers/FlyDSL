@@ -26,6 +26,24 @@ gpu.module @convert_atom_call_to_ssa_form {
     gpu.return
   }
 
+  // Test 1a: alias scopes on copy_atom_call carry over to copy_atom_call_ssa
+  // CHECK-LABEL: gpu.func @copy_dst_register_alias_scopes
+  // CHECK: fly.copy_atom_call_ssa(%{{.*}}, %{{.*}}) {alias_scopes = [#{{.*}}], noalias_scopes = [#{{.*}}], operandSegmentSizes = array<i32: 1, 1, 0, 0>}
+  gpu.func @copy_dst_register_alias_scopes(%src: !fly.ptr<f16, global>) kernel {
+    %shape4 = fly.make_int_tuple() : () -> !fly.int_tuple<4>
+    %stride1 = fly.make_int_tuple() : () -> !fly.int_tuple<1>
+    %vec4 = fly.make_layout(%shape4, %stride1) : (!fly.int_tuple<4>, !fly.int_tuple<1>) -> !fly.layout<4:1>
+
+    %src_view = fly.make_view(%src, %vec4) : (!fly.ptr<f16, global>, !fly.layout<4:1>) -> !fly.memref<f16, global, 4:1>
+    %copy = fly.make_copy_atom {valBits = 16 : i32} : !fly.copy_atom<!fly.universal_copy<64>, 16>
+
+    %reg_ptr = fly.make_ptr() {dictAttrs = {allocSize = 4 : i64}} : () -> !fly.ptr<f16, register>
+    %reg_view = fly.make_view(%reg_ptr, %vec4) : (!fly.ptr<f16, register>, !fly.layout<4:1>) -> !fly.memref<f16, register, 4:1>
+
+    fly.copy_atom_call(%copy, %src_view, %reg_view) {alias_scopes = [#llvm.alias_scope<id = "a", domain = #llvm.alias_scope_domain<id = "test">>], noalias_scopes = [#llvm.alias_scope<id = "b", domain = #llvm.alias_scope_domain<id = "test">>]} : (!fly.copy_atom<!fly.universal_copy<64>, 16>, !fly.memref<f16, global, 4:1>, !fly.memref<f16, register, 4:1>) -> ()
+    gpu.return
+  }
+
   // Test 1b: copy_atom_call with register src (rank=1, stride=1) should be promoted
   // src is pre-loaded via ptr.load, then passed to copy_atom_call_ssa as vector operand
   // CHECK-LABEL: gpu.func @copy_src_register
