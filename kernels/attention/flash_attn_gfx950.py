@@ -38,6 +38,8 @@ from kernels.attention.flash_attn_utils import (
     _bias_dma_src_elem,
     _bias_lds_lane_base,
     _buffer_load_lds_128,
+    _dualwave_dma_scope_names,
+    _dualwave_lds_scope,
     _dualwave_sync_barrier,
     _load_bias_frag_lds,
     _make_bias_lds_ptr,
@@ -340,6 +342,8 @@ def build_flash_attn_dualwave_swp_module(
                     0,
                     _dma_atom=ctx.dma_atom,
                     _lds_ptr_ty=ctx.lds_ptr_ty,
+                    scope=_dualwave_lds_scope("bias", 0),
+                    scope_names=_dualwave_dma_scope_names(traits),
                 )
 
         def _read_bias_frag(h, g, buf):

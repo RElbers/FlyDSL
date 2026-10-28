@@ -534,6 +534,11 @@ def _dualwave_lds_noalias_scopes(name, scope_names):
     return _lds_alias_scope_array([scope_name for scope_name in scope_names if scope_name != name])
 
 
+def _dualwave_dma_scope_names(traits):
+    """Every LDS scope a dual-wave DMA can write: the K/V buffers and the bias staging buffer."""
+    return traits.LDS_SCOPE_NAMES + (_dualwave_lds_scope("bias", 0),)
+
+
 def _cu_load(div, idx, cu_atom, cu_v1i32):
     """Load cu_seqlens[idx] into an SGPR. ``idx`` must be wave-uniform."""
     v = fly.copy_atom_call_ssa([cu_v1i32], cu_atom, fx.slice(div, (None, fx.Int32(idx))))
@@ -724,12 +729,24 @@ def _buffer_load_128(elem_index, _load_atom_128, q_div, q_load_i32x4_type):
     return fly.copy_atom_call_ssa([q_load_i32x4_type], _load_atom_128, fx.slice(q_div, (None, fx.Int32(elem_index))))
 
 
-def _buffer_load_lds_128(src_div, lds_byte_addr, src_elem, soffset_elems, _dma_atom, _lds_ptr_ty):
-    """128-bit global->LDS DMA; `src_elem` is voffset, `soffset_elems` is scaled by the atom."""
+def _buffer_load_lds_128(
+    src_div, lds_byte_addr, src_elem, soffset_elems, _dma_atom, _lds_ptr_ty, scope=None, scope_names=()
+):
+    """128-bit global->LDS DMA; `src_elem` is voffset, `soffset_elems` is scaled by the atom.
+
+    `scope` names the LDS alias scope the DMA writes (one of `scope_names`). Without it the
+    integer-addressed write may alias any LDS, and scoped LDS reads cannot be told apart from it.
+    """
     lds_ptr = fx.inttoptr(_lds_ptr_ty, fx.Int32(lds_byte_addr))
     dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
     src = fx.slice(src_div, (None, fx.Int32(src_elem)))
-    fx.copy(_dma_atom, src, dst, soffset=fx.Int32(soffset_elems))
+    scopes = {}
+    if const_expr(scope is not None):
+        scopes = {
+            "alias_scopes": _dualwave_lds_alias_scopes(scope),
+            "noalias_scopes": _dualwave_lds_noalias_scopes(scope, scope_names),
+        }
+    fx.copy(_dma_atom, src, dst, soffset=fx.Int32(soffset_elems), **scopes)
 
 
 def _buffer_store_128(pack_i32_vec, elem_index, _o_store_reg_128, _store_atom_128, o_div):
@@ -4145,7 +4162,7 @@ class DualwaveKvGmemToLdsLoader(DualwaveKernelContext):
         self.num_dma_k = self.NUM_DMA_K
         self.num_dma_v = self.NUM_DMA_V
 
-    def _issue_kv_dma(self, src_div, lds_addr, src_elem, soffset):
+    def _issue_kv_dma(self, src_div, lds_addr, src_elem, soffset, scope):
         _buffer_load_lds_128(
             src_div,
             lds_addr,
@@ -4153,6 +4170,8 @@ class DualwaveKvGmemToLdsLoader(DualwaveKernelContext):
             soffset,
             _dma_atom=self.dma_atom,
             _lds_ptr_ty=self.lds_ptr_ty,
+            scope=scope,
+            scope_names=_dualwave_dma_scope_names(self.traits),
         )
 
     def _kv_src_div(self, tensor, dense_div, page_id, name):
@@ -4173,7 +4192,7 @@ class DualwaveKvGmemToLdsLoader(DualwaveKernelContext):
             )
         return dense_div
 
-    def _async_load_kv_linear(self, dma_m0, buf_id, src_div, src_base, soffset, num_dma):
+    def _async_load_kv_linear(self, dma_m0, buf_id, src_div, src_base, soffset, num_dma, scope):
         for d in range_constexpr(num_dma):
             self._issue_kv_dma(
                 src_div,
@@ -4188,6 +4207,7 @@ class DualwaveKvGmemToLdsLoader(DualwaveKernelContext):
                     stride_kv_n_v=self.stride_kv_n_v,
                 ),
                 soffset,
+                scope,
             )
 
     def load_k(self, tile_start, buf_id, page_id=None):
@@ -4213,9 +4233,12 @@ class DualwaveKvGmemToLdsLoader(DualwaveKernelContext):
                         kv_head_idx=self.kv_head_idx,
                     ),
                     soffset,
+                    _dualwave_lds_scope("k", buf_id),
                 )
         else:
-            self._async_load_kv_linear(ctx.k_dma_m0, buf_id, src_div, src_base, soffset, self.num_dma_k)
+            self._async_load_kv_linear(
+                ctx.k_dma_m0, buf_id, src_div, src_base, soffset, self.num_dma_k, _dualwave_lds_scope("k", buf_id)
+            )
 
     def load_k_tile(self, tile_idx, buf_id, page_id=None):
         self.load_k(self.tile_start(tile_idx), buf_id, page_id=page_id)
@@ -4246,9 +4269,12 @@ class DualwaveKvGmemToLdsLoader(DualwaveKernelContext):
                         kv_head_idx=self.kv_head_idx,
                     ),
                     soffset,
+                    _dualwave_lds_scope("v", buf_id),
                 )
         else:
-            self._async_load_kv_linear(ctx.v_dma_m0, buf_id, src_div, src_base, soffset, self.num_dma_v)
+            self._async_load_kv_linear(
+                ctx.v_dma_m0, buf_id, src_div, src_base, soffset, self.num_dma_v, _dualwave_lds_scope("v", buf_id)
+            )
 
     def load_v_tile(self, tile_idx, buf_id, page_id=None):
         self.load_v(self.tile_start(tile_idx), buf_id, page_id=page_id)
