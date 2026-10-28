@@ -111,13 +111,14 @@ public:
         auto ssaTy = RegMem2SSAType(dstTy, true);
         Value dstIter = copyOp.getDst().getDefiningOp<MakeViewOp>().getIter();
         Value oldDst = pred ? PtrLoadOp::create(builder, loc, ssaTy, dstIter) : Value{};
-        auto ssaOp =
-            CopyAtomCallSSA::create(builder, loc, TypeRange{ssaTy}, copyOp.getCopyAtom(), srcVal,
-                                    /*dst=*/oldDst, pred);
+        auto ssaOp = CopyAtomCallSSA::create(
+            builder, loc, TypeRange{ssaTy}, copyOp.getCopyAtom(), srcVal,
+            /*dst=*/oldDst, pred, copyOp.getAliasScopesAttr(), copyOp.getNoaliasScopesAttr());
         PtrStoreOp::create(builder, loc, ssaOp.getResult(0), dstIter);
       } else {
         CopyAtomCallSSA::create(builder, loc, TypeRange{}, copyOp.getCopyAtom(), srcVal,
-                                /*dst=*/copyOp.getDst(), pred);
+                                /*dst=*/copyOp.getDst(), pred, copyOp.getAliasScopesAttr(),
+                                copyOp.getNoaliasScopesAttr());
       }
       copyOp->erase();
     }

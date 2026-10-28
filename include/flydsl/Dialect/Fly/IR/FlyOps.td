@@ -367,7 +367,9 @@ def Fly_AtomSetValueOp : Fly_Op<"atom.set_value", [Pure, DeclareOpInterfaceMetho
 
 def Fly_CopyAtomCall : Fly_Op<"copy_atom_call"> {
   let arguments = (ins Fly_CopyAtom:$copyAtom, Fly_TensorLikeType:$src,
-                       Fly_TensorLikeType:$dst, Optional<Fly_MemRef>:$pred);
+                       Fly_TensorLikeType:$dst, Optional<Fly_MemRef>:$pred,
+                       OptionalAttr<ArrayAttr>:$alias_scopes,
+                       OptionalAttr<ArrayAttr>:$noalias_scopes);
 }
 def Fly_MmaAtomCall : Fly_Op<"mma_atom_call", [AttrSizedOperandSegments]> {
   let hasVerifier = 1;
@@ -380,7 +382,9 @@ def Fly_MmaAtomCall : Fly_Op<"mma_atom_call", [AttrSizedOperandSegments]> {
 
 def Fly_CopyAtomCallSSA : Fly_Op<"copy_atom_call_ssa", [AttrSizedOperandSegments]> {
   let arguments = (ins Fly_CopyAtom:$copyAtom, AnyType:$src,
-                       Optional<AnyType>:$dst, Optional<AnyType>:$pred);
+                       Optional<AnyType>:$dst, Optional<AnyType>:$pred,
+                       OptionalAttr<ArrayAttr>:$alias_scopes,
+                       OptionalAttr<ArrayAttr>:$noalias_scopes);
   let results = (outs Variadic<AnyType>:$results);
 }
 def Fly_MmaAtomCallSSA : Fly_Op<"mma_atom_call_ssa", [AttrSizedOperandSegments]> {
@@ -447,8 +451,14 @@ def Fly_MmaMakeFragmentOp : Fly_Op<"mma.make_fragment", [Pure, DeclareOpInterfac
 }
 
 def Fly_CopyOp : Fly_Op<"copy"> {
+  let description = [{
+    `alias_scopes` and `noalias_scopes` (arrays of `#llvm.alias_scope`) are attached to every
+    memory access the copy lowers to, as on `llvm.load` / `llvm.store`.
+  }];
   let arguments = (ins AnyType:$copyAtom, Fly_TensorLikeType:$src, Fly_TensorLikeType:$dst,
-                       Optional<Fly_MemRef>:$pred);
+                       Optional<Fly_MemRef>:$pred,
+                       OptionalAttr<ArrayAttr>:$alias_scopes,
+                       OptionalAttr<ArrayAttr>:$noalias_scopes);
   let assemblyFormat = "`(` $copyAtom `,` $src `,` $dst (`,` $pred^)? `)` attr-dict `:` functional-type(operands, results)";
 }
 def Fly_GemmOp : Fly_Op<"gemm", [AttrSizedOperandSegments]> {

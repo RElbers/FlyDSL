@@ -138,3 +138,18 @@ func.func @test_buffer_copy_lds_const_both(
   fly.copy_atom_call(%a2, %src, %dst) : (!fly.copy_atom<!fly_rocdl.cdna3.buffer_copy_lds<32>, 32>, !fly.memref<f32, #fly_rocdl.buffer_desc, 1:1>, !fly.memref<f32, shared, 1:1>) -> ()
   return
 }
+
+// -----
+
+// alias_scopes / noalias_scopes on fly.copy reach the DMA it lowers to, so LLVM can tell an
+// integer-addressed LDS DMA apart from LDS accesses in other scopes.
+
+// CHECK-LABEL: @test_buffer_copy_lds_alias_scopes
+func.func @test_buffer_copy_lds_alias_scopes(
+    %src: !fly.memref<f32, #fly_rocdl.buffer_desc, 1:1>,
+    %dst: !fly.memref<f32, shared, 1:1>) {
+  %atom = fly.make_copy_atom {valBits = 32 : i32} : !fly.copy_atom<!fly_rocdl.cdna3.buffer_copy_lds<32>, 32>
+  // CHECK: rocdl.raw.ptr.buffer.load.lds {{.*}} {alias_scopes = [#[[SCOPE_A:alias_scope[0-9]*]]], noalias_scopes = [#[[SCOPE_B:alias_scope[0-9]*]]]}
+  fly.copy(%atom, %src, %dst) {alias_scopes = [#llvm.alias_scope<id = "lds_a", domain = #llvm.alias_scope_domain<id = "test.lds">>], noalias_scopes = [#llvm.alias_scope<id = "lds_b", domain = #llvm.alias_scope_domain<id = "test.lds">>]} : (!fly.copy_atom<!fly_rocdl.cdna3.buffer_copy_lds<32>, 32>, !fly.memref<f32, #fly_rocdl.buffer_desc, 1:1>, !fly.memref<f32, shared, 1:1>) -> ()
+  return
+}

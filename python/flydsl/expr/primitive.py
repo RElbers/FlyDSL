@@ -1112,8 +1112,21 @@ def mma_make_fragment(operand_id, tiled_mma, input, *, stages=None):
 
 
 @dsl_loc_tracing
-def copy(copy_atom, src, dst, *, pred=None, **kwargs):
-    return fly.copy(copy_atom.set_value(kwargs) if kwargs else copy_atom, src, dst, pred=pred)
+def copy(copy_atom, src, dst, *, pred=None, alias_scopes=None, noalias_scopes=None, **kwargs):
+    """Copy ``src`` to ``dst`` with ``copy_atom``; extra keywords set atom state (e.g. ``soffset``).
+
+    ``alias_scopes`` / ``noalias_scopes`` are ``ArrayAttr``s of ``#llvm.alias_scope``, attached to
+    every memory access the copy lowers to, as on ``llvm.LoadOp``. They let LLVM tell an
+    integer-addressed LDS DMA apart from LDS accesses in other scopes.
+    """
+    return fly.copy(
+        copy_atom.set_value(kwargs) if kwargs else copy_atom,
+        src,
+        dst,
+        pred=pred,
+        alias_scopes=alias_scopes,
+        noalias_scopes=noalias_scopes,
+    )
 
 
 @dsl_loc_tracing
