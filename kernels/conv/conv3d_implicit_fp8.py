@@ -577,6 +577,9 @@ def compile_conv3d_implicit_fp8(n, c, d, h, width, k, kt, kh, kw, st, sh, sw, pt
 
         a1_frag = a_s2r.load(a_cur1)
         conv_a_g2s(a_next1, 1, K_ITERS - 1)
+        # b_next0 was filled in the last main-loop step and may still be in flight; as for a_cur0
+        # below, the second barrier covers wave group 1, which runs one barrier behind.
+        wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
         fx.rocdl.s_barrier()
 
         c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
@@ -592,6 +595,11 @@ def compile_conv3d_implicit_fp8(n, c, d, h, width, k, kt, kh, kw, st, sh, sw, pt
         b_cur1, b_next1 = b_next1, b_cur1
 
         # ---- step k = K_ITERS - 1 ----
+        # a_cur0 was filled in the last main-loop step and may still be in flight. Wave group 1
+        # runs one barrier behind group 0, so group 0 needs a second barrier to know group 1 has
+        # also waited for its share.
+        wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
+        fx.rocdl.s_barrier()
         a0_frag = a_s2r.load(a_cur0)
         wait_barrier(0)
 
