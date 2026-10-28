@@ -2,7 +2,6 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
@@ -90,10 +89,13 @@ def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled):
     return offsets
 
 
+# sched_barrier mask: ALU, VALU, SALU, MFMA, VMEM reads and transcendentals may cross.
+DMA_FENCE_MASK = 0x42F
+
+
 class G2SLoader:
     def __init__(self, gl_src, gl_offsets, n_load_steps, lds_dtype, wave_id):
         self.g2lds_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
-        self.LdsPtr_t = fx.PointerType.get(lds_dtype, 2, 512)
         self.gl_src = gl_src
         self.gl_offsets = gl_offsets
         self.n_load_steps = n_load_steps
@@ -102,21 +104,20 @@ class G2SLoader:
 
     def _lds_dst_at(self, lds_dst, step):
         step_off = self.wave_id * 1024 + step * (self.n_waves * 1024)
-        base_i32 = fx.Int32(fx.ptrtoint(lds_dst.ptr))
-        sum_i32 = base_i32 + fx.Int32(step_off)
-        lds_ptr = fx.inttoptr(self.LdsPtr_t, sum_i32)
-        return fx.make_view(lds_ptr, fx.make_layout(1, 1))
+        return fx.make_view(fx.add_offset(lds_dst.ptr, step_off), fx.make_layout(1, 1))
 
     def load(self, lds_dst, k_offset):
         for step in range_constexpr(self.n_load_steps):
-            src = fx.slice(self.gl_src, (None, fx.Int32(self.gl_offsets[step])))
-            dst = self._lds_dst_at(lds_dst, step)
-            fx.copy(self.g2lds_atom, src, dst, soffset=fx.Int32(k_offset))
+            self.load_one(lds_dst, k_offset, step)
 
     def load_one(self, lds_dst, k_offset, step):
         src = fx.slice(self.gl_src, (None, fx.Int32(self.gl_offsets[step])))
         dst = self._lds_dst_at(lds_dst, step)
+        # The destination's alias scope lets the scheduler move the DMA past LDS reads and writes;
+        # keep it where it is issued. Everything but DS ops and VMEM writes may still cross.
+        rocdl.sched_barrier(DMA_FENCE_MASK)
         fx.copy(self.g2lds_atom, src, dst, soffset=fx.Int32(k_offset))
+        rocdl.sched_barrier(DMA_FENCE_MASK)
 
 
 def pack_i32x4_i32x8(lo, hi):
@@ -227,13 +228,8 @@ class StoreC:
 
 
 def wait_barrier(count):
-    _llvm.inline_asm(
-        res=None,
-        operands_=[],
-        asm_string=f"s_waitcnt vmcnt({count})\ns_barrier",
-        constraints="",
-        has_side_effects=True,
-    )
+    rocdl.s_waitcnt(vmcnt=count)
+    rocdl.s_barrier()
 
 
 class Mfma16x16x128:
