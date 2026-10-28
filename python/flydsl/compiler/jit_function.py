@@ -798,6 +798,9 @@ def _run_pipeline(module: ir.Module, fragments: list, *, verifier: bool, print_a
     with dsl_ir_diagnostics(module.context) as diags:
         try:
             pm.run(module.operation)
+        except ir.MLIRError as exc:
+            # PassManager.run captures the errors into the MLIRError before any other handler sees them.
+            raise DSLCompileError(str(exc), diagnostics=diag_records_from_mlir_error(exc)) from exc
         except Exception as exc:
             raise DSLCompileError(str(exc), diagnostics=diags) from exc
 
@@ -815,7 +818,9 @@ class MlirCompiler:
         backend = get_backend(arch=arch)
 
         compile_hints = CompilationContext.get_compile_hints()
-        module = ir.Module.parse(module.operation.get_asm(enable_debug_info=env.debug.enable_debug_info))
+        # Keep source locations so pass diagnostics point at user code. They only become DWARF when
+        # the debug-info pass runs.
+        module = ir.Module.parse(module.operation.get_asm(enable_debug_info=True))
         backend.lower_compile_hints(module, compile_hints=compile_hints)
         cfg = _pipeline_fragments_for_mode(backend, compile_hints=compile_hints)
         fragments = cfg.fragments
@@ -872,6 +877,8 @@ class MlirCompiler:
                     with dsl_ir_diagnostics(module.context) as diags:
                         try:
                             pm.run(module.operation)
+                        except ir.MLIRError as exc:
+                            raise DSLCompileError(str(exc), diagnostics=diag_records_from_mlir_error(exc)) from exc
                         except Exception as exc:
                             raise DSLCompileError(str(exc), diagnostics=diags) from exc
 
