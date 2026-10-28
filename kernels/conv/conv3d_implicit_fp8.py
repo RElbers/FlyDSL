@@ -452,7 +452,8 @@ def compile_conv3d_implicit_fp8(n, c, d, h, width, k, kt, kh, kw, st, sh, sw, pt
         # The physical LDS byte this lane owns equals the plain flatten of its logical
         # (row_g, col_g), so the element stored must be A[swizzle_128(row_g, col_g)] for
         # S2RLoader to round-trip. Mirrors G2SLoader._lds_dst_at exactly.
-        g2s_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
+        # Async DMA: LLVM inserts no waits for it; the kernel's own vmcnt waits order it.
+        g2s_atom = fx.make_copy_atom(fx.rocdl.cdna4.BufferLoadAsyncLDS128b(), 128)
         LdsPtr_t = fx.PointerType.get(f8_ir_t, 2, 512)
 
         # Diagnostic only: swap the im2col address for a plain linear GEMM read to isolate

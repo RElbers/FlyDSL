@@ -3690,7 +3690,8 @@ class DualwaveKernelContext:
     def init_atoms_and_lds_ptrs(self):
         self.load_atom_128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
         self.store_atom_128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
-        self.dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
+        # Async DMA: LLVM inserts no waits for it; the kernel's own vmcnt waits order it.
+        self.dma_atom = fx.make_copy_atom(fx.rocdl.cdna4.BufferLoadAsyncLDS128b(), 128)
         self.mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(32, 32, 16, self.elem_dtype))
         self.o_store_reg_128 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
         self.lds_ptr_ty = fx.PointerType.get(self.elem_dtype.ir_type, 2, self.traits.DMA_BYTES)
@@ -4744,7 +4745,8 @@ class DualwaveFp8KernelContext:
         self.load_atom_64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Int32)
         self.store_atom_64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Int32)
         self.store_atom_128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
-        self.dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
+        # Async DMA: LLVM inserts no waits for it; the kernel's own vmcnt waits order it.
+        self.dma_atom = fx.make_copy_atom(fx.rocdl.cdna4.BufferLoadAsyncLDS128b(), 128)
         self.o_store_reg = fx.make_rmem_tensor(fx.make_layout(2, 1), fx.Int32)
         self.o_store_reg_128 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
         # fp8 global->LDS DMA uses i8 destination typing; K/V LDS reads are byte-addressed.
