@@ -315,6 +315,9 @@ def compile_fp8_gemm_8w(*, K: int, BLOCK_M: int = 256, BLOCK_N: int = 256, b_pre
         # Main loop prefetches a_next1 one step behind; issue the final
         # K_ITERS - 1 tile here, otherwise c10 / c11 read stale A1 data.
         a_g2s.load(a_next1, A1_gl_offset + (K_ITERS - 1) * BLOCK_K)
+        # b_next0 was filled in the last main-loop step and may still be in flight; as for a_cur0
+        # below, the second barrier covers wave group 1, which runs one barrier behind.
+        wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
         rocdl.s_barrier()
 
         c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
@@ -331,6 +334,11 @@ def compile_fp8_gemm_8w(*, K: int, BLOCK_M: int = 256, BLOCK_N: int = 256, b_pre
 
         # Step k = K_ITERS - 1
         k = K_ITERS - 1
+        # a_cur0 was filled in the last main-loop step and may still be in flight. Wave group 1
+        # runs one barrier behind group 0, so group 0 needs a second barrier to know group 1 has
+        # also waited for its share.
+        wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
+        rocdl.s_barrier()
         a0_frag = a_s2r.load(a_cur0)
         wait_barrier(0)
 
