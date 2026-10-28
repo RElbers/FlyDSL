@@ -190,14 +190,12 @@ def build_gqa_attn(
         # ---------------- group_load: global -> LDS ----------------
         # High-level DMA: a BufferCopyLDS128b copy atom + fx.copy
         _dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
-        _lds_dma_ptr_ty = fx.PointerType.get(bf16.ir_type, 2, BYTES_PER_THREAD)
 
         def group_load(lds_base, tile, offsets, src_div, base_elems, row_stride):
             soff_elems = base_elems + tile * (KV_BLOCK_SIZE * row_stride)
             soff_elems = sgpr(soff_elems)
             for i in range_constexpr(2):
-                lds_ptr = fx.inttoptr(_lds_dma_ptr_ty, i32(lds_base + i32(i * BYTES_PER_MEMCPY)))
-                dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
+                dst = fx.make_view(fx.add_offset(lds_base, i * (BYTES_PER_MEMCPY // 2)), fx.make_layout(1, 1))
                 src = fx.slice(src_div, (None, i32(offsets[i])))
                 fx.copy(_dma_atom, src, dst, soffset=i32(soff_elems))
 
@@ -432,10 +430,10 @@ def build_gqa_attn(
         stagger = wid_uni // 4
 
         # Per-warp LDS destination bases, hoisted into SGPRs (wave-uniform), matching
-        lds_warp_off = i32(wid * BYTES_PER_WARP)
+        lds_warp_off = sgpr(wid * (BYTES_PER_WARP // 2))
 
         def _lds_base(smem_ptr):
-            return sgpr(i32(fx.ptrtoint(smem_ptr)) + lds_warp_off)
+            return fx.add_offset(smem_ptr, fx.make_int_tuple(lds_warp_off))
 
         k_lds_base = [_lds_base(k_smem_0), _lds_base(k_smem_1)]
         v_lds_base = [_lds_base(v_smem_0), _lds_base(v_smem_1)]
