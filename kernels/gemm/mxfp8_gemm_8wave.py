@@ -83,7 +83,8 @@ class ScaleRawLds:
         lane = fx.thread_idx.x % 64
         self.wave_id = wave_id
         self.lds = lds
-        self.atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS32b(), 32)
+        # Async DMA: LLVM inserts no waits for it; the kernel's own vmcnt waits order it.
+        self.atom = fx.make_copy_atom(fx.rocdl.cdna4.BufferLoadAsyncLDS32b(), 32)
         self.LdsPtr_t = fx.PointerType.get(fp8_ir_t, 2, 512)
         self.srcs = []
         for arg, block in ((A_scale, block_m), (B_scale, block_n)):

@@ -188,8 +188,9 @@ def build_gqa_attn(
             return offs
 
         # ---------------- group_load: global -> LDS ----------------
-        # High-level DMA: a BufferCopyLDS128b copy atom + fx.copy
-        _dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
+        # High-level DMA: a BufferLoadAsyncLDS128b copy atom + fx.copy.
+        # Async DMA: LLVM inserts no waits for it; the kernel's own vmcnt waits order it.
+        _dma_atom = fx.make_copy_atom(fx.rocdl.cdna4.BufferLoadAsyncLDS128b(), 128)
         _lds_dma_ptr_ty = fx.PointerType.get(bf16.ir_type, 2, BYTES_PER_THREAD)
 
         def group_load(lds_base, tile, offsets, src_div, base_elems, row_stride):

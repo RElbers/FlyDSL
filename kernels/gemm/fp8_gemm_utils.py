@@ -92,7 +92,8 @@ def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled):
 
 class G2SLoader:
     def __init__(self, gl_src, gl_offsets, n_load_steps, lds_dtype, wave_id):
-        self.g2lds_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
+        # Async DMA: LLVM inserts no waits for it; the kernel's own vmcnt waits order it.
+        self.g2lds_atom = fx.make_copy_atom(fx.rocdl.cdna4.BufferLoadAsyncLDS128b(), 128)
         self.LdsPtr_t = fx.PointerType.get(lds_dtype, 2, 512)
         self.gl_src = gl_src
         self.gl_offsets = gl_offsets
