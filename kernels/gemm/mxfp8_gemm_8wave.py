@@ -10,6 +10,7 @@ from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 from kernels.common.kernels_common import get_warp_size
 from kernels.gemm.fp8_gemm_utils import (
+    DMA_FENCE_MASK,
     G2SLoader,
     S2RLoader,
     StoreC,
@@ -78,13 +79,12 @@ class ScaleRawLds:
     BYTES = 2 * 256 * 16
 
     def __init__(self, A_scale, B_scale, K, block_m, block_n, wave_id, a_row, b_row, lds, fp8_ir_t):
-        """``a_row`` / ``b_row``: block-local first row of this wave's tiles; ``lds``: two chunk slots."""
+        """``a_row`` / ``b_row``: block-local first row of this wave's tiles; ``lds``: the two chunk slots."""
         self.row_bytes = K // 32
         lane = fx.thread_idx.x % 64
         self.wave_id = wave_id
         self.lds = lds
         self.atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS32b(), 32)
-        self.LdsPtr_t = fx.PointerType.get(fp8_ir_t, 2, 512)
         self.srcs = []
         for arg, block in ((A_scale, block_m), (B_scale, block_n)):
             src = fx.logical_divide(make_fp8_buffer_tensor(arg, fp8_ir_t), fx.make_layout(1, 1))
@@ -93,31 +93,37 @@ class ScaleRawLds:
                 word = step * 512 + wave_id * 64 + lane  # 4 words per row
                 offs.append((block * 256 + word // 4) * self.row_bytes + (word % 4) * 4)
             self.srcs.append((src, offs))
-        # One per-lane base per operand; every read adds only a constant, which
-        # folds into the ds_read offset as long as the buffer sits below 64 KB.
+        # One per-lane base per slot and operand; every read adds only a constant,
+        # which folds into the ds_read offset as long as the buffer sits below 64 KB.
         lane_off = (lane % 16) * 16 + lane // 16
         self.bases = [
-            fx.add_offset(lds.ptr, fx.make_int_tuple(op * 4096 + row * 16 + lane_off))
-            for op, row in ((0, a_row), (1, b_row))
+            [
+                fx.add_offset(slot.ptr, fx.make_int_tuple(op * 4096 + row * 16 + lane_off))
+                for op, row in ((0, a_row), (1, b_row))
+            ]
+            for slot in lds
         ]
 
     def dma(self, chunk):
         """Stage chunk ``chunk``; the last chunk may run past K (those bytes are never read)."""
-        base_i32 = fx.Int32(fx.ptrtoint(self.lds.ptr))
+        slot = self.lds[chunk % 2]
         for op in range_constexpr(2):
             src, offs = self.srcs[op]
             for step in range_constexpr(2):
-                dst_off = chunk % 2 * self.BYTES + op * 4096 + step * 2048 + self.wave_id * 256
-                dst = fx.make_view(fx.inttoptr(self.LdsPtr_t, base_i32 + fx.Int32(dst_off)), fx.make_layout(1, 1))
+                dst_off = op * 4096 + step * 2048 + self.wave_id * 256
+                dst = fx.make_view(fx.add_offset(slot.ptr, dst_off), fx.make_layout(1, 1))
+                rocdl.sched_barrier(DMA_FENCE_MASK)
                 fx.copy(self.atom, fx.slice(src, (None, fx.Int32(offs[step]))), dst, soffset=fx.Int32(chunk * 16))
+                rocdl.sched_barrier(DMA_FENCE_MASK)
 
     def read(self, op, half_row, n_tiles, k):
         """MFMA scale operands of ``n_tiles`` tiles, ``half_row`` rows past this wave's first row."""
         words = []
         for t in range_constexpr(n_tiles):
-            off = k // self.CHUNK % 2 * self.BYTES + (half_row + t * 16) * 16 + (k % self.CHUNK) * 4
+            off = (half_row + t * 16) * 16 + (k % self.CHUNK) * 4
+            base = self.bases[k // self.CHUNK % 2][op]
             v = fx.make_view(
-                fx.recast_iter(fx.Uint8, fx.add_offset(self.bases[op], fx.make_int_tuple(off))), fx.make_layout(1, 1)
+                fx.recast_iter(fx.Uint8, fx.add_offset(base, fx.make_int_tuple(off))), fx.make_layout(1, 1)
             )
             words.append(fx.Int32(v.load()[0]))
         return words
@@ -245,7 +251,10 @@ def compile_mxfp8_gemm_8w(
     @fx.struct
     class SharedStorage:
         if not scale_preshuffled:
-            S_lds: fx.Array[fx.Float8E4M3FN, 2 * ScaleRawLds.BYTES, 16]
+            # The higher alignment places the slots first in LDS (LLVM orders LDS variables by
+            # alignment, then size), below 64 KB, where read offsets fold into ds_read.
+            S_lds_0: fx.Array[fx.Float8E4M3FN, ScaleRawLds.BYTES, 32]
+            S_lds_1: fx.Array[fx.Float8E4M3FN, ScaleRawLds.BYTES, 32]
         A_lds_cur_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
         A_lds_cur_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
         A_lds_next_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
@@ -323,7 +332,7 @@ def compile_mxfp8_gemm_8w(
                 wave_id,
                 wave_m * A_GRP_ROWS,
                 wave_n * B_GRP_ROWS,
-                lds.S_lds,
+                (lds.S_lds_0, lds.S_lds_1),
                 F8_IR_t,
             )
             n_chunks = (K_ITERS + ScaleRawLds.CHUNK - 1) // ScaleRawLds.CHUNK
