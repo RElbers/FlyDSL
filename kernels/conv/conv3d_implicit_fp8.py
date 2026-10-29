@@ -31,7 +31,7 @@ from kernels.gemm.fp8_gemm_utils import (
     compute_global_swizzle,
     make_fp8_buffer_tensor,
     swizzle_128,
-    wait_barrier,
+    wait_groups_barrier,
 )
 
 
@@ -452,7 +452,7 @@ def compile_conv3d_implicit_fp8(n, c, d, h, width, k, kt, kh, kw, st, sh, sw, pt
         # The physical LDS byte this lane owns equals the plain flatten of its logical
         # (row_g, col_g), so the element stored must be A[swizzle_128(row_g, col_g)] for
         # S2RLoader to round-trip. Mirrors G2SLoader._lds_dst_at exactly.
-        # Async DMA: LLVM inserts no waits for it; the kernel's own vmcnt waits order it.
+        # Async DMA: LLVM inserts no waits for it; callers wait for its asyncmark groups.
         g2s_atom = fx.make_copy_atom(fx.rocdl.cdna4.BufferLoadAsyncLDS128b(), 128)
         LdsPtr_t = fx.PointerType.get(f8_ir_t, 2, 512)
 
@@ -493,6 +493,7 @@ def compile_conv3d_implicit_fp8(n, c, d, h, width, k, kt, kh, kw, st, sh, sw, pt
                 dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
                 src = fx.slice(x_div, (None, fx.Int32(safe)))
                 fx.copy(g2s_atom, src, dst)
+            fx.rocdl.asyncmark()
 
         # ---- B G2S: plain KTRSC (k, crs_pad) matrix -> reuse the GEMM loader verbatim ----
         # Row stride is crs_pad, so the tail tile reads the host's zero-pad.
@@ -525,13 +526,13 @@ def compile_conv3d_implicit_fp8(n, c, d, h, width, k, kt, kh, kw, st, sh, sw, pt
         if wave_m == 1:
             fx.rocdl.s_barrier()
 
-        wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
+        wait_groups_barrier(2)
 
         b_g2s.load(b_next0, B0_gl_offset + 1 * BLOCK_K)
         conv_a_g2s(a_next0, 0, 1)
         b_g2s.load(b_next1, B1_gl_offset + 1 * BLOCK_K)
 
-        wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
+        wait_groups_barrier(3)
 
         # ---- main loop (mirror kernel_gemm, A loads swapped for conv_a_g2s) ----
         for ki in range_constexpr(K_ITERS - 2):
@@ -555,7 +556,7 @@ def compile_conv3d_implicit_fp8(n, c, d, h, width, k, kt, kh, kw, st, sh, sw, pt
             c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
 
             b_g2s.load(b_cur1, B1_gl_offset + (ki + 2) * BLOCK_K)
-            wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
+            wait_groups_barrier(3)
 
             c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
 
@@ -580,7 +581,7 @@ def compile_conv3d_implicit_fp8(n, c, d, h, width, k, kt, kh, kw, st, sh, sw, pt
         conv_a_g2s(a_next1, 1, K_ITERS - 1)
         # b_next0 was filled in the last main-loop step and may still be in flight; as for a_cur0
         # below, the second barrier covers wave group 1, which runs one barrier behind.
-        wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
+        wait_groups_barrier(3)
         fx.rocdl.s_barrier()
 
         c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
@@ -599,10 +600,10 @@ def compile_conv3d_implicit_fp8(n, c, d, h, width, k, kt, kh, kw, st, sh, sw, pt
         # a_cur0 was filled in the last main-loop step and may still be in flight. Wave group 1
         # runs one barrier behind group 0, so group 0 needs a second barrier to know group 1 has
         # also waited for its share.
-        wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
+        wait_groups_barrier(2)
         fx.rocdl.s_barrier()
         a0_frag = a_s2r.load(a_cur0)
-        wait_barrier(0)
+        wait_groups_barrier(0)
 
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
 

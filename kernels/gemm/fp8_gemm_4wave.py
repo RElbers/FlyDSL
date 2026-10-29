@@ -7,7 +7,7 @@ Algorithm derived from HipKittens FP8_4wave
 (https://github.com/HazyResearch/HipKittens/blob/7782744ba1fd259a377a99e2ea8f71384cc80e55/kernels/gemm/fp8fp32/FP8_4wave/4_wave.cu#L1).
 
 Global IO, scale loads, and bf16 stores go through the layout API
-(``fx.rocdl.make_buffer_tensor`` + ``fx.copy`` with ``BufferCopyLDS128b``
+(``fx.rocdl.make_buffer_tensor`` + ``fx.copy`` with ``BufferLoadAsyncLDS128b``
 / ``BufferCopy{16,32,128}b``). MFMAs use ``fly.mma_atom_call_ssa`` so
 the chained Vec(4, f32) accumulator stays on AGPR. The XOR swizzle and
 the 8-buffer LDS pipeline ping-pong are kept as direct arithmetic to
@@ -33,7 +33,7 @@ from kernels.gemm.fp8_gemm_utils import (
     make_fp8_buffer_tensor,
     pack_i32x4_i32x8,
     swizzle_128,
-    wait_barrier,
+    wait_groups_barrier,
     xcd_remap_pid,
 )
 
@@ -289,6 +289,8 @@ def compile_fp8_gemm_4w(
 
             c[mfma.idx(3, 2)] = mfma.call_one(a, b, c, 3, 2)
             c[mfma.idx(3, 3)] = mfma.call_one(a, b, c, 3, 3)
+            # The four steps above are one tile, so one async group, as G2SLoader.load would make.
+            fx.rocdl.asyncmark()
 
             return c, rt_dst
 
@@ -379,16 +381,16 @@ def compile_fp8_gemm_4w(
         b_g2s.load(b_next1, B1_gl_offset + 1 * B_K_STEP)
         a_g2s.load(a_next1, A1_gl_offset + 1 * A_K_STEP)
 
-        wait_barrier((3 * N_TILES_A) + (4 * N_TILES_B))
+        wait_groups_barrier(7)
 
         a0_frag = a_s2r.load(a_cur0)
 
-        wait_barrier((3 * N_TILES_A) + (3 * N_TILES_B))
+        wait_groups_barrier(6)
 
         b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
 
         for k in range_constexpr(K_ITERS - 2):
-            wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B))
+            wait_groups_barrier(4)
 
             c00_frag, b1_frag = _compute_block(
                 a_cur0,
@@ -413,7 +415,7 @@ def compile_fp8_gemm_4w(
                 c01_frag,
             )
 
-            wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B))
+            wait_groups_barrier(4)
 
             c10_frag, a0_frag = _compute_block(
                 b_cur1,
@@ -444,12 +446,12 @@ def compile_fp8_gemm_4w(
             b_cur1, b_next1 = b_next1, b_cur1
 
         # Tail step k_iters - 2.
-        wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B))
+        wait_groups_barrier(4)
         b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
         a1_frag = a_s2r.load(a_cur1)
         c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
-        wait_barrier((1 * N_TILES_A) + (1 * N_TILES_B))
+        wait_groups_barrier(2)
         a0_frag = a_s2r.load(a_next0)
         c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
         b0_frag = b_s2r.load(b_next0, preshuffled=b_preshuffled)
@@ -463,7 +465,7 @@ def compile_fp8_gemm_4w(
         # Tail step k_iters - 1.
         base_row = tile_i * BLOCK_M + wave_i * (N_TILES_A * 16)
         base_col = tile_j * BLOCK_N + wave_j * (N_TILES_B * 16)
-        wait_barrier(0)
+        wait_groups_barrier(0)
         b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
         a1_frag = a_s2r.load(a_cur1)
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
