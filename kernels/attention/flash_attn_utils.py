@@ -44,6 +44,31 @@ def _s_waitcnt(val):
     rocdl.s_waitcnt(val)
 
 
+class _AsyncDmaGroups:
+    """The async LDS DMA groups a kernel has closed so far, recorded in issue order while tracing.
+
+    `wait(n)` waits until every group that ends before the newest `n` DMA instructions is complete,
+    which is what `s_waitcnt vmcnt(n)` guaranteed when only DMAs were in flight, so a wait keeps its
+    instruction count while LLVM counts any other loads itself.
+    """
+
+    def __init__(self):
+        self.sizes = []
+
+    def close(self, dma_count):
+        rocdl.asyncmark()
+        self.sizes.append(dma_count)
+
+    def wait(self, dma_count):
+        groups = covered = 0
+        for size in reversed(self.sizes):
+            if covered >= dma_count:
+                break
+            covered += size
+            groups += 1
+        rocdl.wait_asyncmark(groups)
+
+
 def _sched_barrier(val):
     rocdl.sched_barrier(val)
 
@@ -3455,6 +3480,7 @@ class DualwaveKernelContext:
 
         self.ctx_ref = self
         self.traits = traits_or_ctx
+        self.dma_groups = _AsyncDmaGroups()
         self.Q = Q
         self.K = K
         self.V = V
@@ -3690,7 +3716,7 @@ class DualwaveKernelContext:
     def init_atoms_and_lds_ptrs(self):
         self.load_atom_128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
         self.store_atom_128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
-        # Async DMA: LLVM inserts no waits for it; the kernel's own vmcnt waits order it.
+        # Async DMA: LLVM inserts no waits for it; the kernel closes and waits on self.dma_groups.
         self.dma_atom = fx.make_copy_atom(fx.rocdl.cdna4.BufferLoadAsyncLDS128b(), 128)
         self.mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(32, 32, 16, self.elem_dtype))
         self.o_store_reg_128 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
@@ -4217,6 +4243,7 @@ class DualwaveKvGmemToLdsLoader(DualwaveKernelContext):
                 )
         else:
             self._async_load_kv_linear(ctx.k_dma_m0, buf_id, src_div, src_base, soffset, self.num_dma_k)
+        self.dma_groups.close(self.num_dma_k)
 
     def load_k_tile(self, tile_idx, buf_id, page_id=None):
         self.load_k(self.tile_start(tile_idx), buf_id, page_id=page_id)
@@ -4250,6 +4277,7 @@ class DualwaveKvGmemToLdsLoader(DualwaveKernelContext):
                 )
         else:
             self._async_load_kv_linear(ctx.v_dma_m0, buf_id, src_div, src_base, soffset, self.num_dma_v)
+        self.dma_groups.close(self.num_dma_v)
 
     def load_v_tile(self, tile_idx, buf_id, page_id=None):
         self.load_v(self.tile_start(tile_idx), buf_id, page_id=page_id)

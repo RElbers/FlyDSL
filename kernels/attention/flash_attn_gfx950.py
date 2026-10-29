@@ -56,7 +56,6 @@ from kernels.attention.flash_attn_utils import (
     _stagger_extra_barrier_if_zero,
     _v_pair_to_vec32,
     _v_vec32_to_pair,
-    _waitcnt_vm_n,
     bias_addressing_error,
     daz_denormal_attr,
 )
@@ -341,6 +340,7 @@ def build_flash_attn_dualwave_swp_module(
                     _dma_atom=ctx.dma_atom,
                     _lds_ptr_ty=ctx.lds_ptr_ty,
                 )
+            ctx.dma_groups.close(_NUM_DMA_BIAS)
 
         def _read_bias_frag(h, g, buf):
             gran = _seq_pad_score_threshold(traits, g * _BIAS_VEC) // _bias_gran_elems + _bias_half_grans * h
@@ -376,7 +376,7 @@ def build_flash_attn_dualwave_swp_module(
                 return gemm_helper.qk(v_k, q_all_scaled_bf16)
             v_s_lo, v_s_hi = gemm_helper.qk(v_k, q_all_scaled_bf16)
             if const_expr(HAS_BIAS):
-                _waitcnt_vm_n(bias_vmcnt)
+                ctx.dma_groups.wait(bias_vmcnt)
             scored = (
                 _score_bias_half(v_s_lo, tile_idx, 0, buf),
                 _score_bias_half(v_s_hi, tile_idx, 1, buf),
@@ -425,7 +425,7 @@ def build_flash_attn_dualwave_swp_module(
             v_k = kv_lds_to_regs.load_k(0)
             _sched_barrier(0)
             _s_waitcnt(traits.LGKMCNT_0_ONLY)
-            _waitcnt_vm_n(ctx.NUM_DMA_V)
+            ctx.dma_groups.wait(ctx.NUM_DMA_V)
 
             # OPEN the wave-group phase shift: one extra s_barrier on group B
             if const_expr(traits.DUALWAVE_SWP_ENABLE_STAGGER):
@@ -509,7 +509,7 @@ def build_flash_attn_dualwave_swp_module(
                     kv_gmem_to_lds.load_v_tile(j_idx - 2, 1)
                 v_k = kv_lds_to_regs.load_k(1)
                 _s_waitcnt(traits.LGKMCNT_0_ONLY)
-                _waitcnt_vm_n(ctx.NUM_DMA_K + ctx.NUM_DMA_V)
+                ctx.dma_groups.wait(ctx.NUM_DMA_K + ctx.NUM_DMA_V)
                 _dualwave_sync_barrier()
 
                 # Cluster 1 computes MMA0, finishes v_p_0 softmax, updates l_row, and casts P.
@@ -535,7 +535,7 @@ def build_flash_attn_dualwave_swp_module(
                     kv_gmem_to_lds.load_k_tile(j_idx, 1)
                 v_v = kv_lds_to_regs.load_v(0)
                 _s_waitcnt(traits.LGKMCNT_0_ONLY)
-                _waitcnt_vm_n(ctx.NUM_DMA_K + ctx.NUM_DMA_V)
+                ctx.dma_groups.wait(ctx.NUM_DMA_K + ctx.NUM_DMA_V)
                 _dualwave_sync_barrier()
 
                 # Cluster 3 computes P*V, row max, rescale, sub row, and first-half exp2.
@@ -584,7 +584,7 @@ def build_flash_attn_dualwave_swp_module(
                     kv_gmem_to_lds.load_v_tile(j_idx - 1, 0)
                 v_k = kv_lds_to_regs.load_k(0)
                 _s_waitcnt(traits.LGKMCNT_0_ONLY)
-                _waitcnt_vm_n(ctx.NUM_DMA_K + ctx.NUM_DMA_V)
+                ctx.dma_groups.wait(ctx.NUM_DMA_K + ctx.NUM_DMA_V)
                 _dualwave_sync_barrier()
 
                 # Cluster 5 mirrors C1: MMA0, finish v_p_1 softmax, update l_row, and cast P.
@@ -618,7 +618,7 @@ def build_flash_attn_dualwave_swp_module(
                 else:
                     v_s_0 = softmax_helper.v_s_vec_to_lists(v_s_0)
                 _s_waitcnt(traits.LGKMCNT_0_ONLY)
-                _waitcnt_vm_n(ctx.NUM_DMA_K + ctx.NUM_DMA_V)
+                ctx.dma_groups.wait(ctx.NUM_DMA_K + ctx.NUM_DMA_V)
                 _dualwave_sync_barrier()
 
                 # Cluster 7 mirrors C3 and carries m_row, l_row, v_o, and packed v_p_0.
@@ -675,7 +675,7 @@ def build_flash_attn_dualwave_swp_module(
                 kv_gmem_to_lds.load_v_tile(max_m3, 1)
             v_k = kv_lds_to_regs.load_k(1)
             _s_waitcnt(traits.LGKMCNT_0_ONLY)
-            _waitcnt_vm_n(ctx.NUM_DMA_K + ctx.NUM_DMA_V)
+            ctx.dma_groups.wait(ctx.NUM_DMA_K + ctx.NUM_DMA_V)
             _dualwave_sync_barrier()
 
             # Epilogue C1 (compute): MMA0 -> v_s_1; finish v_p_0 softmax (like C1).
@@ -709,7 +709,7 @@ def build_flash_attn_dualwave_swp_module(
             else:
                 v_s_1 = softmax_helper.seq_pad_mask_if_needed(v_s_1, max_m3)
             _s_waitcnt(traits.LGKMCNT_0_ONLY)
-            _waitcnt_vm_n(ctx.NUM_DMA_K + ctx.NUM_DMA_V)
+            ctx.dma_groups.wait(ctx.NUM_DMA_K + ctx.NUM_DMA_V)
             _dualwave_sync_barrier()
 
             # Epilogue C3 (compute): full P*V + unconditional rescale
@@ -744,7 +744,7 @@ def build_flash_attn_dualwave_swp_module(
                 kv_gmem_to_lds.load_v_tile(max_m2, 0)
             v_k = kv_lds_to_regs.load_k(0)
             _s_waitcnt(traits.LGKMCNT_0_ONLY)
-            _waitcnt_vm_n(ctx.NUM_DMA_K + ctx.NUM_DMA_V)
+            ctx.dma_groups.wait(ctx.NUM_DMA_K + ctx.NUM_DMA_V)
             _dualwave_sync_barrier()
 
             # Epilogue C5 computes MMA0, folds rescale_e3 into l_row, and finishes v_p_1 softmax.
@@ -769,7 +769,7 @@ def build_flash_attn_dualwave_swp_module(
             else:
                 v_s_0 = softmax_helper.seq_pad_mask_if_needed(v_s_0, max_m2)
             _s_waitcnt(traits.LGKMCNT_0_ONLY)
-            _waitcnt_vm_n(ctx.NUM_DMA_V)
+            ctx.dma_groups.wait(ctx.NUM_DMA_V)
             _dualwave_sync_barrier()
 
             # Epilogue C7 (compute, mirror of C3): full P*V + unconditional rescale.
@@ -803,7 +803,7 @@ def build_flash_attn_dualwave_swp_module(
                 kv_gmem_to_lds.load_v_tile(max_m1, 1)
             v_k = kv_lds_to_regs.load_k(1)
             _s_waitcnt(traits.LGKMCNT_0_ONLY)
-            _waitcnt_vm_n(ctx.NUM_DMA_V)
+            ctx.dma_groups.wait(ctx.NUM_DMA_V)
             _dualwave_sync_barrier()
 
             # Epilogue C9 computes the last-tile MMA0, folds rescale_e7 into l_row, and finishes v_p_0.
@@ -828,7 +828,7 @@ def build_flash_attn_dualwave_swp_module(
             else:
                 v_s_1 = softmax_helper.seq_pad_mask_if_needed(v_s_1, max_m1)
             _s_waitcnt(traits.LGKMCNT_0_ONLY)
-            _waitcnt_vm_n(0)
+            ctx.dma_groups.wait(0)
             _dualwave_sync_barrier()
 
             # Epilogue C11: final rescale and complete the last tile's softmax in-place.
