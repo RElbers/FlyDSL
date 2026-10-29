@@ -878,6 +878,8 @@ def gemm_a16w16_hti_gfx950_kernel(
             load_iters=half_ldg_a_iters,
             is_k_major=param.a_is_transposed,
         )
+        # Each half-tile load is one async group; the waits below count groups.
+        rocdl.asyncmark()
 
     def async_load_b_to_lds(n_part, k_tile, stage):
         async_load_to_lds(
@@ -895,6 +897,7 @@ def gemm_a16w16_hti_gfx950_kernel(
             load_iters=half_ldg_b_iters,
             is_k_major=not param.b_is_transposed,
         )
+        rocdl.asyncmark()
 
     def make_gC(m_part, n_part):
         return fx.flat_divide(out_buf, (half_block_m, half_block_n))[None, None, bid_m * 2 + m_part, bid_n * 2 + n_part]
@@ -1036,7 +1039,8 @@ def gemm_a16w16_hti_gfx950_kernel(
     async_load_a_to_lds(0, 1, 1)
     async_load_b_to_lds(1, 1, 1)
     rocdl.sched_barrier(0)
-    wait_vmcnt_and_barrier(half_ldg_b_iters + half_ldg_a_iters)
+    rocdl.wait_asyncmark(2)
+    rocdl.s_barrier()
 
     main_loop_end = k_tiles - 2
     for k_tile in range(0, main_loop_end, 2):
@@ -1060,7 +1064,8 @@ def gemm_a16w16_hti_gfx950_kernel(
         rocdl.s_barrier()
         b0 = load_b_fragment(0, 1)
         async_load_b_to_lds(1, next_k_tile, 0)
-        wait_vmcnt_and_barrier(2 * half_ldg_b_iters + half_ldg_a_iters)
+        rocdl.wait_asyncmark(3)
+        rocdl.s_barrier()
         consume(c11, a1, b1, True)
         rocdl.s_barrier()
         # 1
@@ -1080,7 +1085,8 @@ def gemm_a16w16_hti_gfx950_kernel(
         consume(c10, a1, b0, True)
         rocdl.s_barrier()
         async_load_b_to_lds(1, next_k_tile + 1, 1)
-        wait_vmcnt_and_barrier(half_ldg_b_iters + half_ldg_a_iters)
+        rocdl.wait_asyncmark(2)
+        rocdl.s_barrier()
         consume(c11, a1, b1, True)
         rocdl.s_barrier()
 
@@ -1106,7 +1112,7 @@ def gemm_a16w16_hti_gfx950_kernel(
     if wid // n_waves == 1:
         # As in the prologue: the next barrier releases the first group to read the stage 1 A half 0. The newer
         # B half 1 and A half 1 copies may stay in flight.
-        rocdl.s_waitcnt(vmcnt=half_ldg_b_iters + half_ldg_a_iters)
+        rocdl.wait_asyncmark(2)
     rocdl.s_barrier()
     consume(c11, a1, b1, True)
     wait_vmcnt_and_barrier(0)
