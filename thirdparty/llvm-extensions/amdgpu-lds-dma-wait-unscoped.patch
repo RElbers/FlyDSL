@@ -1,0 +1,164 @@
+diff --git a/llvm/lib/Target/AMDGPU/SIInsertWaitcnts.cpp b/llvm/lib/Target/AMDGPU/SIInsertWaitcnts.cpp
+index d735654..273f556 100644
+--- a/llvm/lib/Target/AMDGPU/SIInsertWaitcnts.cpp
++++ b/llvm/lib/Target/AMDGPU/SIInsertWaitcnts.cpp
+@@ -137,6 +137,17 @@ static bool isNonWaitcntMetaInst(const MachineInstr &MI) {
+   }
+ }
+ 
++// The alias info of \p MI's LDS store if it has an alias scope, which
++// identifies the LDS variable written (the module LDS lowering gives each
++// variable its own scope), or empty AAMDNodes otherwise.
++static AAMDNodes getLDSStoreScopeInfo(const MachineInstr &MI) {
++  for (const MachineMemOperand *MemOp : MI.memoperands()) {
++    if (MemOp->isStore() && MemOp->getAddrSpace() == AMDGPUAS::LOCAL_ADDRESS)
++      return MemOp->getAAInfo().Scope ? MemOp->getAAInfo() : AAMDNodes();
++  }
++  return AAMDNodes();
++}
++
+ static bool updateVMCntOnly(const MachineInstr &Inst) {
+   return (SIInstrInfo::isVMEM(Inst) && !SIInstrInfo::isFLAT(Inst)) ||
+          SIInstrInfo::isFLATGlobal(Inst) || SIInstrInfo::isFLATScratch(Inst);
+@@ -1040,36 +1051,27 @@ void WaitcntBrackets::updateByEvent(HWEvents E, MachineInstr &Inst) {
+       // there is a MachineInstr in LDSDMAStores used to track this LDSDMA
+       // store. The "Slot" is the index into LDSDMAStores + 1.
+       unsigned Slot = 0;
+-      for (const auto *MemOp : Inst.memoperands()) {
+-        if (!MemOp->isStore() ||
+-            MemOp->getAddrSpace() != AMDGPUAS::LOCAL_ADDRESS)
+-          continue;
+-        // Comparing just AA info does not guarantee memoperands are equal
+-        // in general, but this is so for LDS DMA in practice.
+-        auto AAI = MemOp->getAAInfo();
+-        // Alias scope information gives a way to definitely identify an
+-        // original memory object and practically produced in the module LDS
+-        // lowering pass. If there is no scope available we will not be able
+-        // to disambiguate LDS aliasing as after the module lowering all LDS
+-        // is squashed into a single big object.
+-        if (!AAI || !AAI.Scope)
+-          break;
++      // Alias scope information gives a way to definitely identify an
++      // original memory object and practically produced in the module LDS
++      // lowering pass. If there is no scope available we will not be able
++      // to disambiguate LDS aliasing as after the module lowering all LDS
++      // is squashed into a single big object. An LDS DMA without a scope may
++      // write any LDS variable: all such DMAs share a slot keyed by empty
++      // alias info, so that an access with scope information still waits for
++      // them.
++      AAMDNodes AAI = getLDSStoreScopeInfo(Inst);
++      if (AAI || Context->isNonAsyncLdsDmaWrite(Inst)) {
+         for (unsigned I = 0, E = LDSDMAStores.size(); I != E && !Slot; ++I) {
+-          for (const auto *MemOp : LDSDMAStores[I]->memoperands()) {
+-            if (MemOp->isStore() && AAI == MemOp->getAAInfo()) {
+-              Slot = I + 1;
+-              break;
+-            }
+-          }
++          if (getLDSStoreScopeInfo(*LDSDMAStores[I]) == AAI)
++            Slot = I + 1;
+         }
+-        if (Slot)
+-          break;
+         // The slot may not be valid because it can be >= NUM_LDSDMA which
+         // means the scoreboard cannot track it. We still want to preserve the
+         // MI in order to check alias information, though.
+-        LDSDMAStores.push_back(&Inst);
+-        Slot = LDSDMAStores.size();
+-        break;
++        if (!Slot) {
++          LDSDMAStores.push_back(&Inst);
++          Slot = LDSDMAStores.size();
++        }
+       }
+       setVMemScore(LDSDMA_BEGIN, T, CurrScore);
+       if (Slot && Slot < NUM_LDSDMA)
+@@ -2439,7 +2441,9 @@ bool SIInsertWaitcnts::generateWaitcntInstBefore(
+         if (Ptr && Memop->getAAInfo()) {
+           const auto &LDSDMAStores = ScoreBrackets.getLDSDMAStores();
+           for (unsigned I = 0, E = LDSDMAStores.size(); I != E; ++I) {
+-            if (MI.mayAlias(AA, *LDSDMAStores[I], true)) {
++            // An LDS DMA without a scope may write any LDS variable.
++            if (!getLDSStoreScopeInfo(*LDSDMAStores[I]) ||
++                MI.mayAlias(AA, *LDSDMAStores[I], true)) {
+               if ((I + 1) >= NUM_LDSDMA) {
+                 // We didn't have enough slot to track this LDS DMA store, it
+                 // has been tracked using the common RegNo (FIRST_LDS_VGPR).
+diff --git a/llvm/test/CodeGen/AMDGPU/lds-dma-waits-scopes.ll b/llvm/test/CodeGen/AMDGPU/lds-dma-waits-scopes.ll
+new file mode 100644
+index 0000000..12b7c24
+--- /dev/null
++++ b/llvm/test/CodeGen/AMDGPU/lds-dma-waits-scopes.ll
+@@ -0,0 +1,72 @@
++; RUN: llc -mtriple=amdgcn -mcpu=gfx900 < %s | FileCheck %s
++; RUN: llc -mtriple=amdgcn -mcpu=gfx950 < %s | FileCheck %s
++
++; Waits between LDS DMA writes and later LDS accesses when the DMA's LDS
++; destination does not carry an alias scope. The module LDS lowering gives the
++; LDS accesses of a kernel that uses more than one LDS variable alias scopes,
++; but only where the pointer is derived from the variable. A destination built
++; through an integer has none, so the DMA may write any LDS variable.
++
++@lds.0 = internal addrspace(3) global [256 x i32] poison, align 16
++@lds.1 = internal addrspace(3) global [256 x i32] poison, align 16
++
++declare void @llvm.amdgcn.raw.ptr.buffer.load.lds(ptr addrspace(8), ptr addrspace(3) nocapture, i32, i32, i32, i32, i32)
++declare void @llvm.amdgcn.wave.barrier()
++
++; The read has a scope, the DMA writing what it reads does not.
++define amdgpu_kernel void @unscoped_dma_scoped_read(ptr addrspace(8) %rsrc, i32 %off, ptr addrspace(1) %out) {
++; CHECK-LABEL: {{^}}unscoped_dma_scoped_read:
++; CHECK:       buffer_load_dword {{.*}} lds
++; CHECK-NOT:   ds_read
++; CHECK:       s_waitcnt vmcnt(0)
++; CHECK-NEXT:  ds_read_b32
++  %base = ptrtoint ptr addrspace(3) @lds.0 to i32
++  %addr = add i32 %base, %off
++  %dst = inttoptr i32 %addr to ptr addrspace(3)
++  call void @llvm.amdgcn.raw.ptr.buffer.load.lds(ptr addrspace(8) %rsrc, ptr addrspace(3) %dst, i32 4, i32 0, i32 0, i32 0, i32 0)
++  call void @llvm.amdgcn.wave.barrier()
++  %val = load i32, ptr addrspace(3) @lds.0
++  store i32 0, ptr addrspace(3) @lds.1
++  store i32 %val, ptr addrspace(1) %out
++  ret void
++}
++
++; The read must wait for the unscoped DMA too, not only for the older DMA
++; with its scope.
++define amdgpu_kernel void @scoped_dma_then_unscoped_dma(ptr addrspace(8) %rsrc, i32 %off, ptr addrspace(1) %out) {
++; CHECK-LABEL: {{^}}scoped_dma_then_unscoped_dma:
++; CHECK:       buffer_load_dword {{.*}} lds
++; CHECK:       buffer_load_dword {{.*}} lds
++; CHECK-NOT:   ds_read
++; CHECK:       s_waitcnt vmcnt(0)
++; CHECK-NEXT:  ds_read_b32
++  call void @llvm.amdgcn.raw.ptr.buffer.load.lds(ptr addrspace(8) %rsrc, ptr addrspace(3) @lds.1, i32 4, i32 0, i32 0, i32 0, i32 0)
++  %base = ptrtoint ptr addrspace(3) @lds.0 to i32
++  %addr = add i32 %base, %off
++  %dst = inttoptr i32 %addr to ptr addrspace(3)
++  call void @llvm.amdgcn.raw.ptr.buffer.load.lds(ptr addrspace(8) %rsrc, ptr addrspace(3) %dst, i32 4, i32 0, i32 0, i32 0, i32 0)
++  call void @llvm.amdgcn.wave.barrier()
++  %val = load i32, ptr addrspace(3) @lds.1
++  store i32 %val, ptr addrspace(1) %out
++  ret void
++}
++
++; The read waits for the unscoped DMA but not for the younger DMA into the
++; other variable.
++define amdgpu_kernel void @unscoped_dma_then_scoped_dma(ptr addrspace(8) %rsrc, i32 %off, ptr addrspace(1) %out) {
++; CHECK-LABEL: {{^}}unscoped_dma_then_scoped_dma:
++; CHECK:       buffer_load_dword {{.*}} lds
++; CHECK:       buffer_load_dword {{.*}} lds
++; CHECK-NOT:   ds_read
++; CHECK:       s_waitcnt vmcnt(1)
++; CHECK-NEXT:  ds_read_b32
++  %base = ptrtoint ptr addrspace(3) @lds.0 to i32
++  %addr = add i32 %base, %off
++  %dst = inttoptr i32 %addr to ptr addrspace(3)
++  call void @llvm.amdgcn.raw.ptr.buffer.load.lds(ptr addrspace(8) %rsrc, ptr addrspace(3) %dst, i32 4, i32 0, i32 0, i32 0, i32 0)
++  call void @llvm.amdgcn.raw.ptr.buffer.load.lds(ptr addrspace(8) %rsrc, ptr addrspace(3) @lds.1, i32 4, i32 0, i32 0, i32 0, i32 0)
++  call void @llvm.amdgcn.wave.barrier()
++  %val = load i32, ptr addrspace(3) @lds.0
++  store i32 %val, ptr addrspace(1) %out
++  ret void
++}
