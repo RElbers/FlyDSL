@@ -37,6 +37,16 @@
         "file": "amdgpu-inline-asm-agpr-hazards.patch",
         "description": "Treat inline asm that defines or reads an AGPR as a possible MFMA in the hazard recognizer: a later read of its AGPR result waits the longest MFMA latency, and a VALU write of an AGPR it reads is followed by the MFMA source wait states. Without it, a compiler-inserted copy of an inline-asm MFMA's accumulator can read the old value.",
         "upstream_status": "not yet submitted"
+      },
+      {
+        "file": "amdgpu-lds-dma-wait-unscoped.patch",
+        "description": "Track LDS DMA writes without an alias scope in their own waitcnt slot, so a scoped LDS access waits for them instead of never waiting.",
+        "upstream_status": "not yet submitted"
+      },
+      {
+        "file": "amdgpu-lds-dma-wait-compare-scopes.patch",
+        "description": "Decide whether an LDS access waits for an LDS DMA slot by comparing alias scopes only, not the pointer of the slot's first DMA, which missed accesses that overlap a later DMA in the same slot.",
+        "upstream_status": "not yet submitted"
       }
     ],
     "extensions": []
