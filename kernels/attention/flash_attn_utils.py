@@ -2068,16 +2068,6 @@ def _make_dualwave_swp_fp8_traits(
     )
 
 
-def dualwave_fp8_dma_per_iter(traits):
-    rows_per_wave = -(-traits.BLOCK_N // traits.NUM_WAVES)
-    k_instr = sum(-(-(rows_per_wave * (chunk // traits.VEC_KV)) // traits.WARP_SIZE) for chunk in traits.K_BAND_CHUNK)
-    num_dma_v = (traits.BLOCK_N * (traits.HEAD_DIM_V // 16) * 16) // (
-        traits.WARP_SIZE * traits.VEC_KV * traits.ELEM_BYTES
-    )
-    v_instr_min = num_dma_v // traits.NUM_WAVES
-    return 2 * k_instr + 2 * v_instr_min
-
-
 @dataclass(frozen=True)
 class PagedDualwaveSwpFp8Traits:
     """Layouts for native paged FP8 QK/PV with register-resident Q."""
@@ -4773,7 +4763,8 @@ class DualwaveFp8KernelContext:
         self.load_atom_64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Int32)
         self.store_atom_64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Int32)
         self.store_atom_128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Int32)
-        # Async DMA: LLVM inserts no waits for it; the kernel's own vmcnt waits order it.
+        # Async DMA: LLVM inserts no waits for it. The dense kernel waits on one group per K/V tile;
+        # the paged kernel drains vmcnt fully.
         self.dma_atom = fx.make_copy_atom(fx.rocdl.cdna4.BufferLoadAsyncLDS128b(), 128)
         self.o_store_reg = fx.make_rmem_tensor(fx.make_layout(2, 1), fx.Int32)
         self.o_store_reg_128 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
