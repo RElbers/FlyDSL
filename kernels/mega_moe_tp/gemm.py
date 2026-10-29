@@ -78,7 +78,7 @@ def build_gemm(kc: KernelCtx) -> dict:
     DLL, G2, GPC, H, I, KS1, L_A, L_AS = kc.get("DLL G2 GPC H I KS1 L_A L_AS")  # noqa: E741
     L_B1, L_B1S, L_CTL, L_DCH, L_INTER = kc.get("L_B1 L_B1S L_CTL L_DCH L_INTER")
     L_INTERS, L_RING, L_RIX, L_WT, MT = kc.get("L_INTERS L_RING L_RIX L_WT MT")
-    MTSKIP, NA_L, NA_ROWOPS, NAB, NCG = kc.get("MTSKIP NA_L NA_ROWOPS NAB NCG")
+    MTSKIP, NA_ROWOPS, NAB, NCG = kc.get("MTSKIP NA_ROWOPS NAB NCG")
     NCH, NCK, NSC_BLK, RG, SI_STRIDE = kc.get("NCH NCK NSC_BLK RG SI_STRIDE")
     TOPK, XB, a8, a_frag = kc.get("TOPK XB a8 a_frag")
     act_quant_store, ag_stage_free = kc.get("act_quant_store ag_stage_free")
@@ -213,6 +213,7 @@ def build_gemm(kc: KernelCtx) -> dict:
             sso = _g1_sso(pas, kk)
             dma4(slot + i32(4096), rws, vsl, sg0 + sso)
             dma4(slot + i32(4096 + 256), rws, vsl, su0 + sso)
+            rocdl.asyncmark()  # one async group per ring slot
 
         for kk in range_constexpr(nsk):
             issue_b(i32(kk), kk)
@@ -229,7 +230,7 @@ def build_gemm(kc: KernelCtx) -> dict:
                     for pp in range_constexpr(P):
                         s_ = ks * P + pp
                         g = g0 + i32(s_)
-                        wait_vm((nsk - 1) * OPS)
+                        rocdl.wait_asyncmark(nsk - 1)
                         slot = ring + i32((s_ % nsk) * SLOT)
                         b = [lds_ld(slot, i32(t * 1024) + lane * i32(16), V4I, 16) for t in range(4)]
                         sgw = lds_ld_i32(slot, i32(4096) + lane * i32(4))
@@ -324,6 +325,7 @@ def build_gemm(kc: KernelCtx) -> dict:
                     for j in range_constexpr(NSC_BLK):
                         dst = L + i32(L_AS) + b * i32(KCS * NSC_BLK * 64 * 4) + i32((k * NSC_BLK + j) * 64 * 4)
                         dma4(dst, rxs, ascl[j], cc * 8 + i32(k * 4), sys=True)
+                rocdl.asyncmark()  # one async group per A chunk
                 _loader_advance(L, lane, q)
             wait_vm(0)
             _loader_flush(L, lane)
@@ -332,7 +334,7 @@ def build_gemm(kc: KernelCtx) -> dict:
     def _loader_advance(L, lane, q):
         pub = lds_ld_i32(L, L_CTL + C_LPUB * 4)
         if q + i32(1) - pub >= i32(ADEPTH):
-            wait_vm(NA_L * (ADEPTH - 1))
+            rocdl.wait_asyncmark(ADEPTH - 1)
             if lane == i32(0):
                 lds_st_rel(L, L_CTL + C_ASEQ * 4 + (pub % i32(NAB)) * i32(4), pub + i32(1))
                 lds_st(L, L_CTL + C_LPUB * 4, pub + i32(1))
@@ -473,7 +475,6 @@ def build_gemm(kc: KernelCtx) -> dict:
         NSK2 = _nsk2_for(NKS, G2)
         GPI = (NSK2 * NKS // math.gcd(NSK2, NKS)) // NKS
         assert G2 % GPI == 0
-        WAIT_B2 = (NSK2 - 1) * OPS
         LAG = max(1, ceildiv(NSK2, GPC * NKS))
         RLAG = GPC * NKS * OPS
         lane = tid % i32(64)
@@ -532,6 +533,7 @@ def build_gemm(kc: KernelCtx) -> dict:
                     issue_n(q, slot_idx)
             else:
                 issue_n(q, slot_idx)
+            rocdl.asyncmark()  # one async group per ring slot
 
         def issue_n(q, slot_idx):
             qc = fx.min(q, g_hi * i32(NKS) - i32(1))
@@ -582,15 +584,8 @@ def build_gemm(kc: KernelCtx) -> dict:
                 acc = [zero] * (4 * MTE)
                 for k in range_constexpr(NKS):
                     sidx = (j * NKS + k) % NSK2
-                    if const_expr(k < NSK2 and NKS >= NSK2):
-                        if const_expr(j > 0):  # noqa: SIM114
-                            wait_vm(WAIT_B2 + 2 * MTE)
-                        elif gi > g_lo:
-                            wait_vm(WAIT_B2 + 2 * MTE)
-                        else:
-                            wait_vm(WAIT_B2)
-                    else:
-                        wait_vm(WAIT_B2)
+                    # the slot of this step is older than the newest NSK2 - 1 ring slots
+                    rocdl.wait_asyncmark(NSK2 - 1)
                     slot = ring + i32(sidx * SLOT)
                     b = [lds_ld(slot, i32(t * 1024) + lane * i32(16), V4I, 16) for t in range(4)]
                     s0 = lds_ld_i32(slot, i32(4096) + lane * i32(4))
@@ -765,12 +760,11 @@ def build_bigm_unit(H, I, TOPK, RG, NAB, BST, BS2, act, swiglu_limit, R8):  # no
     SCM = 0x38F
     NB2 = 6  # GEMM2 B ops per k-step: 4 tiles + 2 scale words per 64 columns
     NST2 = 2 * MTE  # route stores per wave per group
-    # steady-state GEMM1 issue order per chunk c: B(c + BST), then A(c + NAB - 1). By the
-    # count alone A(c) has landed once (NA + NB) * (NAB - 2) newer ops remain, but its LDS
-    # writes (direct-to-LDS loads) can still be in flight then: one chunk's ops more are
-    # awaited (else a unit now and then reads stale A rows of a chunk, small units mostly)
-    WAIT1 = max(min(NA + (NA + NB) * (BST - 1), (NA + NB) * (NAB - 3)), 0)
-    assert WAIT1 <= 63
+    # steady-state GEMM1 issue order per chunk c: B(c + BST), then A(c + NAB - 1), one async
+    # group per A chunk. A(c) has landed once NAB - 2 newer A chunks remain in flight, but one
+    # chunk more is awaited (else a unit now and then read stale A rows of a chunk, small units
+    # mostly), and no more than BST
+    WAIT1 = max(min(BST, NAB - 3), 0)
 
     def _wait2(kk):
         # GEMM2: B2 of step s was issued BS2 steps earlier; every step issues NB2 B2 ops and
@@ -839,6 +833,7 @@ def build_bigm_unit(H, I, TOPK, RG, NAB, BST, BS2, act, swiglu_limit, R8):  # no
                 soff,
                 c * i32(4 * KCK),
             )
+            rocdl.asyncmark()
 
         # one per-lane base + compile-time offsets (row tile m, k-step, ring buffer) for the A
         # fragment / scale reads (one wave's rows are every row: the swizzle depends on the lane
@@ -944,7 +939,7 @@ def build_bigm_unit(H, I, TOPK, RG, NAB, BST, BS2, act, swiglu_limit, R8):  # no
             ring = [list(stt[4 * MTE + s * NB : 4 * MTE + (s + 1) * NB]) for s in range(BST)]
             for c in range_constexpr(KCH):
                 rocdl.sched_barrier(0)
-                wait_vm(WAIT1)
+                rocdl.wait_asyncmark(WAIT1)
                 gpu.barrier()
                 # nothing crosses the chunk barrier: the A ring reads after every wave's DMA landed
                 # (else the scheduler may hoist them above s_barrier: a race)
