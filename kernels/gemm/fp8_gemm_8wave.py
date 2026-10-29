@@ -19,7 +19,7 @@ from kernels.gemm.fp8_gemm_utils import (
     compute_global_swizzle,
     divmod,
     make_fp8_buffer_tensor,
-    wait_barrier,
+    wait_groups_barrier,
 )
 
 
@@ -259,13 +259,13 @@ def compile_fp8_gemm_8w(*, K: int, BLOCK_M: int = 256, BLOCK_N: int = 256, b_pre
         if wave_m == 1:
             rocdl.s_barrier()
 
-        wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
+        wait_groups_barrier(2)
 
         b_g2s.load(b_next0, B0_gl_offset + 1 * B_K_STEP)
         a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K)
         b_g2s.load(b_next1, B1_gl_offset + 1 * B_K_STEP)
 
-        wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
+        wait_groups_barrier(3)
 
         for k in range_constexpr(K_ITERS - 2):
             b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
@@ -288,7 +288,7 @@ def compile_fp8_gemm_8w(*, K: int, BLOCK_M: int = 256, BLOCK_N: int = 256, b_pre
             c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
 
             b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * B_K_STEP)
-            wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
+            wait_groups_barrier(3)
 
             c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
 
@@ -317,7 +317,7 @@ def compile_fp8_gemm_8w(*, K: int, BLOCK_M: int = 256, BLOCK_N: int = 256, b_pre
         a_g2s.load(a_next1, A1_gl_offset + (K_ITERS - 1) * BLOCK_K)
         # b_next0 was filled in the last main-loop step and may still be in flight; as for a_cur0
         # below, the second barrier covers wave group 1, which runs one barrier behind.
-        wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
+        wait_groups_barrier(3)
         rocdl.s_barrier()
 
         c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
@@ -337,10 +337,10 @@ def compile_fp8_gemm_8w(*, K: int, BLOCK_M: int = 256, BLOCK_N: int = 256, b_pre
         # a_cur0 was filled in the last main-loop step and may still be in flight. Wave group 1
         # runs one barrier behind group 0, so group 0 needs a second barrier to know group 1 has
         # also waited for its share.
-        wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
+        wait_groups_barrier(2)
         rocdl.s_barrier()
         a0_frag = a_s2r.load(a_cur0)
-        wait_barrier(0)
+        wait_groups_barrier(0)
 
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
 

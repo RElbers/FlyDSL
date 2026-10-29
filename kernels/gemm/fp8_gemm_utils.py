@@ -2,7 +2,6 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
@@ -92,7 +91,7 @@ def compute_global_swizzle(lane_id, wave_id, K, n_rounds, preshuffled):
 
 class G2SLoader:
     def __init__(self, gl_src, gl_offsets, n_load_steps, lds_dtype, wave_id):
-        # Async DMA: LLVM inserts no waits for it; the kernel's own vmcnt waits order it.
+        # Async DMA: LLVM inserts no waits for it; callers wait for its asyncmark groups.
         self.g2lds_atom = fx.make_copy_atom(fx.rocdl.cdna4.BufferLoadAsyncLDS128b(), 128)
         self.LdsPtr_t = fx.PointerType.get(lds_dtype, 2, 512)
         self.gl_src = gl_src
@@ -109,10 +108,12 @@ class G2SLoader:
         return fx.make_view(lds_ptr, fx.make_layout(1, 1))
 
     def load(self, lds_dst, k_offset):
+        """DMA one LDS tile as one async group; wait for it with wait_groups_barrier."""
         for step in range_constexpr(self.n_load_steps):
             src = fx.slice(self.gl_src, (None, fx.Int32(self.gl_offsets[step])))
             dst = self._lds_dst_at(lds_dst, step)
             fx.copy(self.g2lds_atom, src, dst, soffset=fx.Int32(k_offset))
+        rocdl.asyncmark()
 
     def load_one(self, lds_dst, k_offset, step):
         src = fx.slice(self.gl_src, (None, fx.Int32(self.gl_offsets[step])))
@@ -227,14 +228,10 @@ class StoreC:
                     self._store_bf16(out, col_valid.select(c_index, oob))
 
 
-def wait_barrier(count):
-    _llvm.inline_asm(
-        res=None,
-        operands_=[],
-        asm_string=f"s_waitcnt vmcnt({count})\ns_barrier",
-        constraints="",
-        has_side_effects=True,
-    )
+def wait_groups_barrier(groups):
+    """Wait until at most `groups` async DMA groups are in flight, then barrier."""
+    rocdl.wait_asyncmark(groups)
+    rocdl.s_barrier()
 
 
 class Mfma16x16x128:

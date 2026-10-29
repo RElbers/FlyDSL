@@ -17,7 +17,7 @@ from kernels.gemm.fp8_gemm_utils import (
     compute_global_swizzle,
     divmod,
     make_fp8_buffer_tensor,
-    wait_barrier,
+    wait_groups_barrier,
     xcd_remap_pid,
 )
 
@@ -83,7 +83,7 @@ class ScaleRawLds:
         lane = fx.thread_idx.x % 64
         self.wave_id = wave_id
         self.lds = lds
-        # Async DMA: LLVM inserts no waits for it; the kernel's own vmcnt waits order it.
+        # Async DMA: LLVM inserts no waits for it; callers wait for its asyncmark groups.
         self.atom = fx.make_copy_atom(fx.rocdl.cdna4.BufferLoadAsyncLDS32b(), 32)
         self.LdsPtr_t = fx.PointerType.get(fp8_ir_t, 2, 512)
         self.srcs = []
@@ -111,6 +111,7 @@ class ScaleRawLds:
                 dst_off = chunk % 2 * self.BYTES + op * 4096 + step * 2048 + self.wave_id * 256
                 dst = fx.make_view(fx.inttoptr(self.LdsPtr_t, base_i32 + fx.Int32(dst_off)), fx.make_layout(1, 1))
                 fx.copy(self.atom, fx.slice(src, (None, fx.Int32(offs[step]))), dst, soffset=fx.Int32(chunk * 16))
+        rocdl.asyncmark()
 
     def read(self, op, half_row, n_tiles, k):
         """MFMA scale operands of ``n_tiles`` tiles, ``half_row`` rows past this wave's first row."""
@@ -331,11 +332,6 @@ def compile_mxfp8_gemm_8w(
         # 16-row tile index of each wave's first row, per LDS half.
         a_base16 = [(block_m * BLOCK_M + h * LDS_BLOCK_M + wave_m * A_GRP_ROWS) // 16 for h in range_constexpr(2)]
         b_base16 = [(block_n * BLOCK_N + h * LDS_BLOCK_N + wave_n * B_GRP_ROWS) // 16 for h in range_constexpr(2)]
-        SCALE_LOADS_PER_PAIR = 2 * (N_TILES_A // 2) + 2 * (N_TILES_B // 2)
-        assert SCALE_LOADS_PER_PAIR == 6, (
-            f"scale prefetch issues {SCALE_LOADS_PER_PAIR} VMEM loads per K-pair, not the 6 the "
-            "wait_barrier counts below were validated against; re-check them against the ISA"
-        )
 
         def scale_prefetch(sc, k0):
             if const_expr(not scale_preshuffled or k0 >= K_ITERS or k0 // 2 in sc):
@@ -359,7 +355,7 @@ def compile_mxfp8_gemm_8w(
         def scale_chunk_dma(k):
             # Issued after step k's first barrier: chunk k // CHUNK - 1 (same slot)
             # is then finished by both wave_m groups, and the step's closing
-            # wait_barrier drains this DMA long before chunk k // CHUNK + 1 is read.
+            # wait_groups_barrier drains this DMA long before chunk k // CHUNK + 1 is read.
             chunk = k // ScaleRawLds.CHUNK + 1
             if const_expr(not scale_preshuffled and k % ScaleRawLds.CHUNK == 0 and k > 0 and chunk < n_chunks):
                 raw_sc.dma(chunk)
@@ -382,13 +378,13 @@ def compile_mxfp8_gemm_8w(
         if wave_m == 1:
             rocdl.s_barrier()
 
-        wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
+        wait_groups_barrier(2)
 
         b_g2s.load(b_next0, B0_gl_offset + 1 * B_K_STEP)
         a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K)
         b_g2s.load(b_next1, B1_gl_offset + 1 * B_K_STEP)
 
-        wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
+        wait_groups_barrier(3)
 
         for k in range_constexpr(K_ITERS - 2):
             if const_expr(k % 2 == 1):
@@ -420,7 +416,7 @@ def compile_mxfp8_gemm_8w(
             c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, sa1, sb0, k_pack=k % 2)
 
             b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * B_K_STEP)
-            wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
+            wait_groups_barrier(3)
 
             c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, sa1, sb1, k_pack=k % 2)
 
@@ -437,7 +433,7 @@ def compile_mxfp8_gemm_8w(
         b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
         a0_frag = a_s2r.load(a_cur0)
         # Drain the last tile's loads: its B0/A0 are read before the final wait.
-        wait_barrier(0)
+        wait_groups_barrier(0)
 
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, sa0, sb0, k_pack=k % 2)
 
@@ -471,7 +467,7 @@ def compile_mxfp8_gemm_8w(
         sa0 = scale_read(sc_pf, k, "a0")
         sb0 = scale_read(sc_pf, k, "b0")
         a0_frag = a_s2r.load(a_cur0)
-        wait_barrier(0)
+        wait_groups_barrier(0)
 
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, sa0, sb0, k_pack=k % 2)
 
