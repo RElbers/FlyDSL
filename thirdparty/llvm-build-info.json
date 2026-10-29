@@ -32,6 +32,11 @@
         "file": "amdgpu-asyncmark-nocallback.patch",
         "description": "Mark llvm.amdgcn.asyncmark and llvm.amdgcn.wait.asyncmark nocallback. Without it a kernel that uses either gets no amdgpu-agpr-alloc attribute and only half the vector register file as arch VGPRs.",
         "upstream_status": "merged into upstream: e282c27d4c4d1c4fd8cea8d0dcb4674ad2dff02d"
+      },
+      {
+        "file": "amdgpu-inline-asm-agpr-hazards.patch",
+        "description": "Treat inline asm that defines or reads an AGPR as a possible MFMA in the hazard recognizer: a later read of its AGPR result waits the longest MFMA latency, and a VALU write of an AGPR it reads is followed by the MFMA source wait states. Without it, a compiler-inserted copy of an inline-asm MFMA's accumulator can read the old value.",
+        "upstream_status": "not yet submitted"
       }
     ],
     "extensions": []
