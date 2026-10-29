@@ -189,7 +189,6 @@ def build_gqa_attn(
 
         # ---------------- group_load: global -> LDS ----------------
         # High-level DMA: a BufferLoadAsyncLDS128b copy atom + fx.copy.
-        # Async DMA: LLVM inserts no waits for it; the kernel's own vmcnt waits order it.
         _dma_atom = fx.make_copy_atom(fx.rocdl.cdna4.BufferLoadAsyncLDS128b(), 128)
         _lds_dma_ptr_ty = fx.PointerType.get(bf16.ir_type, 2, BYTES_PER_THREAD)
 
@@ -201,6 +200,8 @@ def build_gqa_attn(
                 dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
                 src = fx.slice(src_div, (None, i32(offsets[i])))
                 fx.copy(_dma_atom, src, dst, soffset=i32(soff_elems))
+            # One async group per K/V tile; wait_asyncmark(n) leaves the newest n tiles in flight.
+            rocdl.asyncmark()
 
         def load_k(tile, buf):
             group_load(k_lds_base[buf], tile, off_K, k_src_div[buf], k_base_elems, K_stride1)
@@ -553,7 +554,7 @@ def build_gqa_attn(
 
         # ---------------- Load K[0] into shared ----------------
         load_k(0, 0)
-        rocdl.s_waitcnt(0)
+        rocdl.wait_asyncmark(0)
         rocdl.sched_barrier(0)
         rocdl.s_barrier()
 
@@ -602,7 +603,7 @@ def build_gqa_attn(
         k_reg = load_k_regs(0)
         rocdl.sched_barrier(0)
         wait_lgkmcnt0()
-        wait_vmcnt(2)
+        rocdl.wait_asyncmark(1)
         rocdl.sched_barrier(0)
         rocdl.s_barrier()
 
@@ -637,7 +638,7 @@ def build_gqa_attn(
         load_k(2, 0)
         load_v(1, 1)
         wait_lgkmcnt0()
-        wait_vmcnt(4)
+        rocdl.wait_asyncmark(2)
         rocdl.sched_barrier(0)
         rocdl.s_barrier()
 
@@ -748,7 +749,7 @@ def build_gqa_attn(
 
             att1[0] = mask_band(att1, jm1 - 1, half=0)
             wait_lgkmcnt0()
-            wait_vmcnt(4)
+            rocdl.wait_asyncmark(2)
             rocdl.sched_barrier(0)
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
@@ -782,7 +783,7 @@ def build_gqa_attn(
             load_v(jm1, 0)
             k_reg = load_k_regs(0)
             wait_lgkmcnt0()
-            wait_vmcnt(4)
+            rocdl.wait_asyncmark(2)
             rocdl.sched_barrier(0)
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
@@ -813,7 +814,7 @@ def build_gqa_attn(
 
             att0[0] = mask_band(att0, jm1, half=0)
             wait_lgkmcnt0()
-            wait_vmcnt(4)
+            rocdl.wait_asyncmark(2)
             rocdl.sched_barrier(0)
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
@@ -846,7 +847,7 @@ def build_gqa_attn(
             load_v(j, 1)
             k_reg = load_k_regs(1)
             wait_lgkmcnt0()
-            wait_vmcnt(4)
+            rocdl.wait_asyncmark(2)
             rocdl.sched_barrier(0)
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
@@ -902,7 +903,7 @@ def build_gqa_attn(
         v_reg = load_v_regs(0)
         att_block[1] = mask_band(att_block[1], nt - i32(3))
         wait_lgkmcnt0()
-        wait_vmcnt(4)
+        rocdl.wait_asyncmark(2)
         rocdl.sched_barrier(0)
         rocdl.s_barrier()
         rocdl.sched_barrier(0)
@@ -929,7 +930,7 @@ def build_gqa_attn(
         load_v(nt - 2, 0)
         k_reg = load_k_regs(0)
         wait_lgkmcnt0()
-        wait_vmcnt(4)
+        rocdl.wait_asyncmark(2)
         rocdl.sched_barrier(0)
         rocdl.s_barrier()
         rocdl.sched_barrier(0)
@@ -955,7 +956,7 @@ def build_gqa_attn(
         v_reg = load_v_regs(1)
         att_block[0] = mask_band(att_block[0], nt - i32(2))
         wait_lgkmcnt0()
-        wait_vmcnt(2)
+        rocdl.wait_asyncmark(1)
         rocdl.sched_barrier(0)
         rocdl.s_barrier()
         rocdl.sched_barrier(0)
@@ -981,7 +982,7 @@ def build_gqa_attn(
         load_v(nt - 1, 1)
         k_reg = load_k_regs(1)
         wait_lgkmcnt0()
-        wait_vmcnt(2)
+        rocdl.wait_asyncmark(1)
         rocdl.sched_barrier(0)
         rocdl.s_barrier()
         rocdl.sched_barrier(0)
@@ -1007,7 +1008,7 @@ def build_gqa_attn(
         v_reg = load_v_regs(0)
         att_block[1] = mask_band(att_block[1], nt - i32(1))
         wait_lgkmcnt0()
-        wait_vmcnt(0)
+        rocdl.wait_asyncmark(0)
         rocdl.sched_barrier(0)
         rocdl.s_barrier()
         rocdl.sched_barrier(0)
