@@ -50,6 +50,11 @@ def BufferLoadAsyncLDS(bit_size):
 
     ``bit_size`` must be 32, 96 or 128.
 
+    The destination is the wave's LDS base and must be the same on every lane: lane ``t`` writes
+    to ``dst + t * bit_size / 8``. LLVM loads the base from the first active lane, so a per-lane
+    destination lands somewhere else whenever lane 0 is off or the compiler splits the copy
+    across an exec mask.
+
     Current atom state:
     - `soffset` (`i32`), default zero
     - `imm_offset` (const `i32`), default zero
@@ -65,7 +70,8 @@ BufferLoadAsyncLDS128b = lambda: CopyOpCDNA4BufferLoadAsyncLDSType.get(128)
 def GlobalLoadAsyncLDS(bit_size):
     """Create a CDNA4 async global-to-LDS copy atom.
 
-    Completion tracking is the same: ``fx.rocdl.asyncmark()`` / ``fx.rocdl.wait_asyncmark(n)``.
+    Completion tracking and the wave-base destination are the same as :func:`BufferLoadAsyncLDS`:
+    ``fx.rocdl.asyncmark()`` / ``fx.rocdl.wait_asyncmark(n)``.
 
     ``bit_size`` must be 32, 96 or 128, same as :func:`BufferLoadAsyncLDS`.
     """
