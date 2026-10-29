@@ -105,6 +105,11 @@ def BufferCopyLDS(bit_size):
     :func:`flydsl.expr.rocdl.cdna4.GlobalLoadAsyncLDS` (Global -> Shared). Those require explicit
     ``fx.rocdl.asyncmark()`` / ``fx.rocdl.wait_asyncmark(n)`` tracking.
 
+    The destination is the wave's LDS base and must be the same on every lane: lane ``t`` writes
+    to ``dst + t * bit_size / 8``. LLVM loads the base from the first active lane, so a per-lane
+    destination lands somewhere else whenever lane 0 is off or the compiler splits the copy
+    across an exec mask.
+
     Current atom state:
     - `soffset` (`i32`), default zero
     - `imm_offset` (`i32`), default zero
