@@ -250,6 +250,9 @@ def _state_value_expr(name):
 class ASTRewriter:
     transformers: List = []
     rewrite_globals: dict = {}
+    # (id(code), debug info) -> (code, rewritten code or None). A rewrite depends only on these, and
+    # building a kernel factory again creates its nested functions again from the same code objects.
+    _rewritten_code: dict = {}
 
     @classmethod
     def register(cls, transformer):
@@ -263,6 +266,52 @@ class ASTRewriter:
         if not cls.transformers:
             return f
 
+        key = (id(f.__code__), env.debug.enable_debug_info)
+        cached = cls._rewritten_code.get(key)
+        if cached is None or cached[0] is not f.__code__:
+            if len(cls._rewritten_code) >= 1024:
+                cls._rewritten_code.clear()
+            # The entry keeps the code object alive, so its id is not reused.
+            cached = cls._rewritten_code[key] = (f.__code__, cls._rewrite_code(f))
+        new_f_code_o = cached[1]
+        if new_f_code_o is None:
+            return f
+
+        for name, val in cls.rewrite_globals.items():
+            f.__globals__[name] = val
+
+        # AST transforms may remove free-variable references, e.g.
+        # const_expr(True) is unpacked to True, dropping const_expr
+        # from co_freevars.  This makes co_freevars shorter than
+        # __closure__, so direct f.__code__ assignment raises ValueError.
+        # Rebuild the function with a matching (smaller) closure.
+        if f.__closure__ and new_f_code_o.co_freevars != f.__code__.co_freevars:
+            old_cells = {name: cell for name, cell in zip(f.__code__.co_freevars, f.__closure__)}
+            new_closure = []
+            for var in new_f_code_o.co_freevars:
+                if var in old_cells:
+                    new_closure.append(old_cells[var])
+                else:
+                    raise RuntimeError(
+                        f"AST rewriter produced free variable {var!r} that " f"is not in the original closure"
+                    )
+            new_f = types.FunctionType(
+                new_f_code_o,
+                f.__globals__,
+                f.__name__,
+                f.__defaults__,
+                tuple(new_closure),
+            )
+            new_f.__kwdefaults__ = f.__kwdefaults__
+            functools.update_wrapper(new_f, f)
+            return new_f
+
+        f.__code__ = new_f_code_o
+        return f
+
+    @classmethod
+    def _rewrite_code(cls, f):
+        """Run the transformers over *f*'s source; return the rewritten code object, or None."""
         f_src = dedent(inspect.getsource(f))
         module = ast.parse(f_src)
         assert isinstance(module.body[0], ast.FunctionDef), f"unexpected ast node {module.body[0]}"
@@ -314,39 +363,7 @@ class ASTRewriter:
         new_f_code_o = _find_func_in_code_object(module_code_o, f.__name__)
         if new_f_code_o is None:
             log().warning("could not find rewritten function %s in code object", f.__name__)
-            return f
-
-        for name, val in cls.rewrite_globals.items():
-            f.__globals__[name] = val
-
-        # AST transforms may remove free-variable references, e.g.
-        # const_expr(True) is unpacked to True, dropping const_expr
-        # from co_freevars.  This makes co_freevars shorter than
-        # __closure__, so direct f.__code__ assignment raises ValueError.
-        # Rebuild the function with a matching (smaller) closure.
-        if f.__closure__ and new_f_code_o.co_freevars != f.__code__.co_freevars:
-            old_cells = {name: cell for name, cell in zip(f.__code__.co_freevars, f.__closure__)}
-            new_closure = []
-            for var in new_f_code_o.co_freevars:
-                if var in old_cells:
-                    new_closure.append(old_cells[var])
-                else:
-                    raise RuntimeError(
-                        f"AST rewriter produced free variable {var!r} that " f"is not in the original closure"
-                    )
-            new_f = types.FunctionType(
-                new_f_code_o,
-                f.__globals__,
-                f.__name__,
-                f.__defaults__,
-                tuple(new_closure),
-            )
-            new_f.__kwdefaults__ = f.__kwdefaults__
-            functools.update_wrapper(new_f, f)
-            return new_f
-
-        f.__code__ = new_f_code_o
-        return f
+        return new_f_code_o
 
 
 _ASTREWRITE_MARKER = "_flydsl_ast_rewriter_generated_"
