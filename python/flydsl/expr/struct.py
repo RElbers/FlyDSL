@@ -679,8 +679,11 @@ class CompositeMeta(type):
     def __getitem__(cls, params):
         fields = _normalize_inline_fields(params, cls._display)
         display_name = _inline_display_name(cls._display, params, fields)
+        # A digest of the identity's repr, not hash(): string and class hashes change from process to process,
+        # and the name reaches the JIT disk-cache key through the closures that capture the type.
+        digest = hashlib.sha256(repr(_make_type_identity(cls._policy, fields)).encode()).hexdigest()[:16]
         return _make_composite_class(
-            name=f"_Dsl{cls._display}_{abs(hash(_make_type_identity(cls._policy, fields)))}",
+            name=f"_Dsl{cls._display}_{digest}",
             module=__name__,
             fields=fields,
             policy=cls._policy,
