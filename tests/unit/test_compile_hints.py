@@ -12,6 +12,7 @@ Validates:
 
 import gc
 import math
+import threading
 import weakref
 
 import pytest
@@ -306,6 +307,47 @@ class TestCompileHintsPropagation:
             }
         ](_noop_launch)
         exe()  # should compile and run without error
+
+    def test_compile_does_not_see_another_threads_llvm_options(self, monkeypatch):
+        import flydsl.compiler.jit_function as jit_function
+
+        @flyc.jit
+        def _with_options(stream: fx.Stream = fx.Stream(None)):
+            _noop_kernel().launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+
+        @flyc.jit
+        def _without_options(stream: fx.Stream = fx.Stream(None)):
+            _noop_kernel().launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+
+        monkeypatch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
+        _fly = TestLLVMOptionBindings._get_fly()
+        first_running = threading.Event()
+        release_first = threading.Event()
+        second_running = threading.Event()
+        seen = []
+        orig = jit_function._run_pipeline
+
+        def run_pipeline(*args, **kwargs):
+            if first_running.is_set():
+                seen.append(_fly.llvm_option_occurrences("unroll-threshold"))
+                second_running.set()
+            else:
+                first_running.set()
+                release_first.wait(timeout=30)
+            orig(*args, **kwargs)
+
+        monkeypatch.setattr(jit_function, "_run_pipeline", run_pipeline)
+        first = threading.Thread(target=flyc.compile[{"llvm_options": {"unroll-threshold": 50}}](_with_options))
+        first.start()
+        assert first_running.wait(timeout=30)
+        second = threading.Thread(target=flyc.compile(_without_options))
+        second.start()
+        # Without the lock, the second compile runs its pipeline while the first holds its options set.
+        second_running.wait(timeout=2)
+        release_first.set()
+        first.join()
+        second.join()
+        assert seen == [0]
 
 
 class TestCacheKeyIncludesTarget:

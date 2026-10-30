@@ -811,6 +811,11 @@ def _run_pass_manager(pm: PassManager, module: ir.Module) -> None:
             raise DSLCompileError(str(exc), diagnostics=diags) from exc
 
 
+# LLVM options are process-global, so a compile must not run while another thread's llvm_options scope
+# has them set. In-process compiles hold the GIL in PassManager.run, so they never overlapped anyway.
+_compile_lock = threading.Lock()
+
+
 class MlirCompiler:
     @classmethod
     def compile(
@@ -867,7 +872,7 @@ class MlirCompiler:
                 "to inspect pre-binary/final MLIR, or run external LLVM tools directly for ISA dumps."
             )
 
-        with _llvm_ctx:
+        with _compile_lock, _llvm_ctx:
             if dump_enabled:
                 asm = module.operation.get_asm(enable_debug_info=True)
                 kernel_names = _infer_kernel_names_from_asm(asm)
