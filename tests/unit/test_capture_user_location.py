@@ -65,3 +65,26 @@ def test_identical_code_in_two_files_keeps_each_file(tmp_path):
     with ir.Context(), ir.Location.unknown():
         for helper, path in helpers:
             assert str(helper(capture_user_location)).startswith(f'loc(callsite("{path}":2:')
+
+
+def _capture_in_a_loop_and_once_more():
+    looped = []
+    for _ in range(3):
+        looped.append(capture_user_location())  # looped
+    once = capture_user_location()  # once more
+    return looped, once
+
+
+def test_cached_captures_in_a_trace_keep_each_call_site():
+    import flydsl.expr.meta as meta
+
+    with ir.Context(), ir.Location.unknown():
+        with meta.tracing_context(_capture_in_a_loop_and_once_more):
+            looped, once = _capture_in_a_loop_and_once_more()
+            assert meta._tls.loc_cache is not None
+
+        assert meta._tls.loc_cache is None
+        assert len({str(loc) for loc in looped}) == 1
+        for loc, marker in ((looped[0], "looped"), (once, "once more")):
+            line, col = _source_position(marker)
+            assert str(loc).startswith(f'loc("{_SOURCE}":{line}:{col})')

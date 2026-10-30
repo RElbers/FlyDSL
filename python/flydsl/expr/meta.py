@@ -98,6 +98,9 @@ def tracing_context(func=None, **options):
         stack = _stack()
         if stack:
             stack.pop()
+        if not stack:
+            # Release the cached locations, and with them the trace's MLIR context.
+            _tls.loc_cache = None
 
 
 def tracing_option(key, default=None):
@@ -128,8 +131,7 @@ def capture_user_location() -> ir.Location:
     boundary = stack[-1][0] if stack else None
     max_depth = env.debug.max_loc_depth
     ctx = ir.Context.current
-    locs = []
-    boundary_loc = None
+    kept = []  # the recorded user frames, innermost first
     dropped = 0
 
     frame = inspect.currentframe().f_back
@@ -138,31 +140,53 @@ def capture_user_location() -> ir.Location:
             code = frame.f_code
             is_boundary = boundary is not None and code is boundary
             if not _is_framework_file(code.co_filename):
-                keep = len(locs) < max_depth
-                if keep or is_boundary:
-                    path, positions = _code_source_info(code)
-                    # One position per 2-byte code unit; without one, fall back to f_lineno / col 0.
-                    pos = positions[frame.f_lasti // 2] if positions and frame.f_lasti >= 0 else None
-                    line = pos[0] if pos is not None and pos[0] is not None else frame.f_lineno
-                    col = pos[2] if pos is not None and pos[2] is not None else 0
-                    floc = ir.Location.file(path, line, col, context=ctx)
-                    if keep:
-                        locs.append(floc)
-                    else:
-                        # Always keep the kernel frame: it is the top of the stack.
-                        boundary_loc = floc
-                else:
-                    dropped += 1
+                if len(kept) < max_depth or is_boundary:
+                    kept.append(frame)
+            else:
+                dropped += 1
             if is_boundary:
                 break
+            if len(kept) == max_depth:
+                # The depth is full, so only the kernel frame can still be recorded: it is the top of the stack.
+                frame = frame.f_back
+                while frame is not None and frame.f_code is not boundary:
+                    frame = frame.f_back
+                if frame is not None and not _is_framework_file(boundary.co_filename):
+                    kept.append(frame)
+                break
             frame = frame.f_back
+
+        if not stack:
+            return _location_from_frames(kept, ctx)
+
+        # Unrolled loops and shared helpers build ops at the same call sites again and again.
+        cache = getattr(_tls, "loc_cache", None)
+        if cache is None or cache[0] is not ctx:
+            cache = _tls.loc_cache = (ctx, {}, [])
+        key = []
+        for kept_frame in kept:
+            key.append(id(kept_frame.f_code))
+            key.append(kept_frame.f_lasti)
+        key = tuple(key)
+        loc = cache[1].get(key)
+        if loc is None:
+            loc = cache[1][key] = _location_from_frames(kept, ctx)
+            # Keep the keyed code objects alive, so their ids are not reused while the entry exists.
+            cache[2].extend(kept_frame.f_code for kept_frame in kept)
+        return loc
     finally:
-        del frame
+        del frame, kept
 
-    # The kernel boundary frame is always kept as the outermost call-site
-    if boundary_loc is not None:
-        locs.append(boundary_loc)
 
+def _location_from_frames(frames, ctx) -> ir.Location:
+    locs = []
+    for frame in frames:
+        path, positions = _code_source_info(frame.f_code)
+        # One position per 2-byte code unit; without one, fall back to f_lineno / col 0.
+        pos = positions[frame.f_lasti // 2] if positions and frame.f_lasti >= 0 else None
+        line = pos[0] if pos is not None and pos[0] is not None else frame.f_lineno
+        col = pos[2] if pos is not None and pos[2] is not None else 0
+        locs.append(ir.Location.file(path, line, col, context=ctx))
     if not locs:
         return ir.Location.unknown()
     callee, callers = locs[0], locs[1:]
