@@ -90,6 +90,10 @@ class TestLLVMOptionBindings:
         _fly = self._get_fly()
         with pytest.raises(RuntimeError, match="Unknown LLVM option"):
             _fly.set_llvm_option_bool("this-option-does-not-exist-xyz", True)
+        with pytest.raises(RuntimeError, match="Unknown LLVM option"):
+            _fly.llvm_option_occurrences("this-option-does-not-exist-xyz")
+        with pytest.raises(RuntimeError, match="Unknown LLVM option"):
+            _fly.reset_llvm_option("this-option-does-not-exist-xyz")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -116,6 +120,78 @@ class TestLLVMOptionsContextManager:
         # After context: should be restored
         val = _fly.set_llvm_option_bool("enable-post-misched", baseline)
         assert val == baseline
+
+    def test_unset_option_is_unset_again_after_scope(self):
+        # Restoring the old value would mark the option as set: unroll-threshold then overrides the
+        # target's threshold, and lsr-drop-solution, which defaults to unset, stays false.
+        from flydsl.compiler.llvm_options import llvm_options
+
+        _fly = TestLLVMOptionBindings._get_fly()
+        for name, value in (("unroll-threshold", 150), ("lsr-drop-solution", True)):
+            assert _fly.llvm_option_occurrences(name) == 0
+            with llvm_options({name: value}):
+                assert _fly.llvm_option_occurrences(name) == 1
+            assert _fly.llvm_option_occurrences(name) == 0
+
+    def test_nested_scope_restores_outer_value(self):
+        from flydsl.compiler.llvm_options import llvm_options
+
+        _fly = TestLLVMOptionBindings._get_fly()
+        with llvm_options({"unroll-threshold": 50}):
+            with llvm_options({"unroll-threshold": 60}):
+                pass
+            assert _fly.set_llvm_option_int("unroll-threshold", 50) == 50
+        assert _fly.llvm_option_occurrences("unroll-threshold") == 0
+
+    def test_nested_scope_restores_outer_string_value(self):
+        from flydsl.compiler.llvm_options import llvm_options
+
+        _fly = TestLLVMOptionBindings._get_fly()
+        with llvm_options({"amdgpu-sched-strategy": "max-ilp"}):
+            with llvm_options({"amdgpu-sched-strategy": "max-occupancy"}):
+                pass
+            assert _fly.set_llvm_option_str("amdgpu-sched-strategy", "max-ilp") == "max-ilp"
+        assert _fly.llvm_option_occurrences("amdgpu-sched-strategy") == 0
+
+    def test_nested_scope_sets_outer_value_without_reading_llvm(self, monkeypatch):
+        # LLVM can only read a value back as bool, int or string, which misreads tri-state options
+        # such as lsr-drop-solution; the outer scope's value must come from the scope itself.
+        import flydsl.compiler.llvm_options as llvm_options_module
+
+        class RecordingFly:
+            def __init__(self):
+                self.calls = []
+
+            def llvm_option_occurrences(self, name):
+                return 0
+
+            def set_llvm_option_bool(self, name, value, return_old=True):
+                self.calls.append(("set", name, value, return_old))
+
+            def reset_llvm_option(self, name):
+                self.calls.append(("reset", name))
+
+        fly = RecordingFly()
+        monkeypatch.setattr(llvm_options_module, "_fly_module", fly)
+        with llvm_options_module.llvm_options({"lsr-drop-solution": False}):
+            with llvm_options_module.llvm_options({"lsr-drop-solution": True}):
+                pass
+        assert fly.calls == [
+            ("set", "lsr-drop-solution", False, False),
+            ("set", "lsr-drop-solution", True, False),
+            ("set", "lsr-drop-solution", False, False),
+            ("reset", "lsr-drop-solution"),
+        ]
+
+    def test_enum_and_pass_registry_options_can_be_scoped(self):
+        # Reading the old value of these as a string crashed before values were tracked here.
+        from flydsl.compiler.llvm_options import llvm_options
+
+        _fly = TestLLVMOptionBindings._get_fly()
+        for name, value in (("amdgpu-atomic-optimizer-strategy", "DPP"), ("misched", "ilpmax")):
+            with llvm_options({name: value}):
+                assert _fly.llvm_option_occurrences(name) == 1
+            assert _fly.llvm_option_occurrences(name) == 0
 
     @pytest.mark.skip(reason="Temporarily disabled: opt-bisect-limit leaks LLVM BISECT logs across pytest.")
     def test_mixed_types(self):

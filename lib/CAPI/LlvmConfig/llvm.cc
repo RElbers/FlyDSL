@@ -85,4 +85,21 @@ flydslSetLLVMOptionStr(const char *name, const char *value, char **oldValue) {
 
 __attribute__((visibility("default"))) void flydslFreeLLVMOptionStr(char *str) { std::free(str); }
 
+__attribute__((visibility("default"))) int flydslGetLLVMOptionOccurrences(const char *name,
+                                                                          int *occurrences) {
+  cl::Option *opt = findOption(name);
+  if (!opt)
+    return 1;
+  *occurrences = opt->getNumOccurrences();
+  return 0;
+}
+
+__attribute__((visibility("default"))) int flydslResetLLVMOption(const char *name) {
+  cl::Option *opt = findOption(name);
+  if (!opt)
+    return 1;
+  opt->reset();
+  return 0;
+}
+
 } // extern "C"
