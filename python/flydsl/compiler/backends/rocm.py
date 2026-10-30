@@ -29,7 +29,7 @@ class RocmBackend(BaseBackend):
 
     @staticmethod
     def detect_target() -> GPUTarget:
-        arch = env.compile.arch or get_rocm_arch()
+        arch = get_rocm_arch()
         return GPUTarget(backend="rocm", arch=arch, warp_size=get_warp_size(arch))
 
     @classmethod

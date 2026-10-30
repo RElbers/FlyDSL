@@ -18,6 +18,7 @@ from ..._mlir.dialects.fly_rocdl import (
     TargetAddressSpace,
 )
 from ..._mlir.extras import types as T
+from ...runtime.device import get_rocm_arch
 from ..meta import dsl_loc_tracing
 from ..primitive import cosize, get_iter, get_layout, get_scalar, make_ptr, make_view
 from ..typing import (
@@ -32,7 +33,7 @@ from ..typing import (
     is_target_address_space,
 )
 from . import cdna3, rdna3, rdna4
-from .utils import normalize_s_waitcnt_field, require_lds_dma_support, target_arch
+from .utils import normalize_s_waitcnt_field, require_lds_dma_support
 
 
 @dsl_loc_tracing
@@ -43,7 +44,7 @@ def s_waitcnt(bitfield=None, *, vmcnt=None, lgkmcnt=None, expcnt=None):
             raise TypeError("legacy raw s_waitcnt bitfield cannot be combined with non-None keyword arguments")
         return mlir_rocdl.s_waitcnt(normalize_s_waitcnt_field("bitfield", bitfield, 0xFFFF))
 
-    arch = target_arch()
+    arch = get_rocm_arch()
     if arch.startswith(("gfx942", "gfx950")):
         return cdna3.s_waitcnt(vmcnt=vmcnt, lgkmcnt=lgkmcnt, expcnt=expcnt)
     if arch.startswith("gfx11"):
@@ -198,7 +199,7 @@ def WMMA(m, n, k, elem_ty_ab, elem_ty_acc=None, **kwargs):
     #     get separate atoms, matched on the disjoint gfx120x / gfx1250 prefixes
     #     rather than on a shared gfx12 one.
 
-    arch = target_arch() or ""
+    arch = get_rocm_arch() or ""
     if arch.startswith("gfx11"):
         return MmaOpGFX11_WMMAType.get(m, n, k, ty_a, ty_b, ty_acc, **kwargs)
     if arch.startswith("gfx1250"):
@@ -255,7 +256,7 @@ def make_buffer_ptr(ptr: Pointer, num_records_bytes=None):
 
     from ...runtime.device import is_rdna_arch
 
-    arch = target_arch()
+    arch = get_rocm_arch()
     flags = (7 << 12) | (4 << 15)
     if is_rdna_arch(arch):
         flags |= 1 << 24  # reserved bit, must be 1 on RDNA

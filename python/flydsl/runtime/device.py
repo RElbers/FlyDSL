@@ -6,6 +6,8 @@ import os
 import subprocess
 from typing import Optional
 
+from ..utils import env
+
 _ROCM_AGENT_TIMEOUT_S = int(os.environ.get("FLYDSL_ROCM_AGENT_TIMEOUT", "300"))
 
 
@@ -37,19 +39,23 @@ def _arch_from_hardware() -> str:
 
 
 def get_rocm_arch() -> str:
-    """Best-effort ROCm GPU arch string, always lower-cased (e.g. 'gfx942').
+    """Best-effort ROCm GPU arch string of the compile target, always lower-cased (e.g. 'gfx942').
+
+    ``ARCH`` sets the compile target, so it comes first; then the ``FLYDSL_GPU_ARCH`` and
+    ``HSA_OVERRIDE_GFX_VERSION`` device hints, then the installed device. Code that picks a wave size,
+    a data type or a code path while tracing must follow the target, not the device it runs on.
 
     Lower-casing happens here so every caller can compare against lower-case
     literals without normalising first; ROCm itself only ever emits lower-case
     names, so this only affects hand-set environment overrides.
     """
-    env = os.environ.get("FLYDSL_GPU_ARCH") or os.environ.get("HSA_OVERRIDE_GFX_VERSION")
-    if env:
-        env = env.lower()
-        if env.startswith("gfx"):
-            return env
-        if env.count(".") == 2:
-            parts = env.split(".")
+    override = env.compile.arch or os.environ.get("FLYDSL_GPU_ARCH") or os.environ.get("HSA_OVERRIDE_GFX_VERSION")
+    if override:
+        override = override.lower()
+        if override.startswith("gfx"):
+            return override
+        if override.count(".") == 2:
+            parts = override.split(".")
             return f"gfx{parts[0]}{parts[1]}{parts[2]}"
 
     return _arch_from_hardware().lower()

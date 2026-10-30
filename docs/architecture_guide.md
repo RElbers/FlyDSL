@@ -460,10 +460,11 @@ Transforms Python control flow to MLIR ops at the AST level:
 ### 5.4 Architecture detection priority
 
 `get_rocm_arch()` in `runtime/device.py` checks in the following order:
-1. `FLYDSL_GPU_ARCH` env var
-2. `HSA_OVERRIDE_GFX_VERSION` env var (supports `9.4.2` → `gfx942` format)
-3. `rocm_agent_enumerator` system tool
-4. Default: `gfx942`
+1. `ARCH` env var (the compile target, so cross-compiling traces kernels for it, not for the installed device)
+2. `FLYDSL_GPU_ARCH` env var
+3. `HSA_OVERRIDE_GFX_VERSION` env var (supports `9.4.2` → `gfx942` format)
+4. `rocm_agent_enumerator` system tool
+5. Default: `gfx942`
 
 ---
 

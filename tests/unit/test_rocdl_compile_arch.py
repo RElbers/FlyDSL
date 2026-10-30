@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""Arch-dependent ``fx.rocdl`` ops follow the compile target (``ARCH``), not the installed device.
+"""Arch lookups and arch-dependent ``fx.rocdl`` ops follow the compile target (``ARCH``), not the installed device.
 
 ``FLYDSL_GPU_ARCH`` stands in for the installed device, so these run the same on any host.
 """
@@ -11,6 +11,7 @@ import pytest
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl.compiler.jit_function import _create_mlir_context
+from flydsl.runtime.device import get_rocm_arch, get_warp_size, is_rdna_arch
 
 pytestmark = [pytest.mark.l1b_target_dialect, pytest.mark.rocm_lower]
 
@@ -26,6 +27,14 @@ def cdna_device_compiling_for(monkeypatch):
         monkeypatch.setenv("ARCH", arch)
 
     return target
+
+
+def test_arch_lookups_default_to_the_target(cdna_device_compiling_for):
+    # Kernels pick their wave size, fp8 type and code path from these while tracing.
+    cdna_device_compiling_for("gfx1201")
+    assert get_rocm_arch() == "gfx1201"
+    assert get_warp_size() == 32
+    assert is_rdna_arch()
 
 
 def _s_waitcnt_vmcnt0():
