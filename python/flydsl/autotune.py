@@ -8,6 +8,7 @@ import inspect
 import json
 import os
 import statistics
+import time
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Callable, Dict, List
@@ -476,6 +477,34 @@ class Autotuner:
                 if snapshot:
                     self._restore_tensors(snapshot)
 
+    def _compile_in_workers(self, configs, args, kwargs):
+        """Compile ``configs`` in ``FLYDSL_AUTOTUNE_COMPILE_WORKERS`` processes before they are benchmarked.
+
+        The benchmark loop then loads each config from the disk cache instead of compiling it. Without the
+        disk cache configs compile as they are benchmarked; so do those a worker could not compile, and
+        their errors are reported there.
+        """
+        workers = min(env.autotune.compile_workers, len(configs))
+        if workers < 2:
+            return
+        if not env.runtime.enable_cache:
+            log().info("[autotune] compile workers need the disk cache; compiling each config as it is benchmarked")
+            return
+        from .compiler.precompile import CompileJob, precompile
+
+        jobs = [
+            CompileJob(self.fn, args, {**kwargs, **config.all_kwargs()}, config.compiler_opts()) for config in configs
+        ]
+        start = time.perf_counter()
+        errors = precompile(jobs, workers)
+        print(
+            f"[autotune] compiled {errors.count(None)}/{len(configs)} configs in {workers} worker processes "
+            f"in {time.perf_counter() - start:.1f}s"
+        )
+        failures = [error for error in errors if error is not None]
+        if failures:
+            log().info(f"[autotune] configs not compiled in workers compile as they are benchmarked; {failures[0]}")
+
     def _run_with_hints(self, compiler_opts, args, kwargs):
         """Run the kernel with optional compiler hints. Import is deferred so
         the core stays importable without the compiled bindings when unused."""
@@ -675,6 +704,7 @@ class Autotuner:
         configs = self.configs(*args, **kwargs) if callable(self.configs) else self.configs
         configs = self._prune(configs, args, kwargs)
         print(f"[autotune] tuning {len(configs)} configs...")
+        self._compile_in_workers(configs, args, kwargs)
         results = []
         last_error = None
         for i, config in enumerate(configs):

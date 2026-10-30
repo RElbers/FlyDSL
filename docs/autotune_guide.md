@@ -53,6 +53,38 @@ declare an integer schema parameter on its entry point and list it in `key`, the
 bump it with any change that can move the winner. Softmax does this with
 `tuning_schema`.
 
+## Compiling configs in parallel
+
+`FLYDSL_AUTOTUNE_COMPILE_WORKERS=N` compiles a search's configs in `N` worker
+processes before any is benchmarked; the benchmark loop then loads each one from
+the JIT disk cache. Workers rebuild the call with CPU tensors of the same shape,
+strides and dtype, which specialize the kernel exactly as the device tensors do,
+and send other arguments pickled.
+
+The search compiles serially, as without workers, when the disk cache is off.
+Configs that cannot be sent to a worker (the entry point is defined inside a
+function or in the script being run, or an argument does not pickle) or that
+fail there are compiled, and their errors reported, by the benchmark loop.
+
+Workers are fresh interpreters that import FlyDSL and the kernel module once,
+about two seconds, and stay up for later searches in the same process. A search
+finishes no sooner than its slowest config compiles.
+
+The same pool serves sweeps outside the autotuner through
+`flydsl.compiler.precompile.precompile(jobs, workers)`. A `CompileJob` names a
+`@flyc.jit` function and its call, or a kernel factory with `factory_kwargs` and
+the call of the launcher it returns, which covers kernels built per
+configuration:
+
+```python
+from flydsl.compiler.precompile import CompileJob, precompile
+
+errors = precompile([CompileJob(build_kernel, args, factory_kwargs=cfg) for cfg in configs], workers=16)
+```
+
+Each entry of the result is None when the job compiled, else why not. A later
+call to the same specialization loads it from the disk cache.
+
 ## Candidate correctness gate
 
 `validate_hook(sig_args)` returns a context manager around one untimed candidate

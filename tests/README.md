@@ -64,6 +64,7 @@ Use the same names as [`python/flydsl/utils/env.py`](../python/flydsl/utils/env.
 | Enable/disable JIT disk cache | `FLYDSL_RUNTIME_ENABLE_CACHE` (`0` / `false` to disable; in-memory cache remains active) |
 | Force autotuning search | `FLYDSL_AUTOTUNE` (`1` / `true` to ignore the heuristic/cached best) |
 | Autotune result cache directory | `FLYDSL_AUTOTUNE_CACHE_DIR` |
+| Compile autotune configs in worker processes | `FLYDSL_AUTOTUNE_COMPILE_WORKERS` (default `0`: compile each config as it is benchmarked) |
 | IR dump | `FLYDSL_DUMP_IR`, `FLYDSL_DUMP_DIR` |
 | Device runtime kind | `FLYDSL_RUNTIME_KIND` |
 | ROCm arch hints (detection helpers) | `FLYDSL_GPU_ARCH`, `HSA_OVERRIDE_GFX_VERSION` |
