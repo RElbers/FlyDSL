@@ -30,6 +30,17 @@ cl::Option *findOption(const std::string &name) {
 /// ValueExpected flag as a proxy for the underlying C++ type.
 bool isBoolOption(cl::Option *opt) { return opt->getValueExpectedFlag() != cl::ValueRequired; }
 
+/// Set \p opt to \p value as if it were given on the command line. Returns 0, or 3 if LLVM rejects
+/// the value; the option then keeps its value, and one that was unset is unset again.
+int addOccurrence(cl::Option *opt, const char *name, StringRef value) {
+  unsigned occurrences = opt->getNumOccurrences();
+  if (!opt->addOccurrence(1, name, value))
+    return 0;
+  if (occurrences == 0)
+    opt->reset();
+  return 3;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -48,8 +59,7 @@ __attribute__((visibility("default"))) int flydslSetLLVMOptionBool(const char *n
   auto *typed = static_cast<cl::opt<bool> *>(opt);
   if (oldValue)
     *oldValue = typed->getValue();
-  opt->addOccurrence(1, name, value ? "true" : "false");
-  return 0;
+  return addOccurrence(opt, name, value ? "true" : "false");
 }
 
 __attribute__((visibility("default"))) int flydslSetLLVMOptionInt(const char *name, int value,
@@ -62,8 +72,7 @@ __attribute__((visibility("default"))) int flydslSetLLVMOptionInt(const char *na
   auto *typed = static_cast<cl::opt<int> *>(opt);
   if (oldValue)
     *oldValue = typed->getValue();
-  opt->addOccurrence(1, name, std::to_string(value));
-  return 0;
+  return addOccurrence(opt, name, std::to_string(value));
 }
 
 __attribute__((visibility("default"))) int
@@ -79,8 +88,7 @@ flydslSetLLVMOptionStr(const char *name, const char *value, char **oldValue) {
     *oldValue = static_cast<char *>(std::malloc(prev.size() + 1));
     std::memcpy(*oldValue, prev.c_str(), prev.size() + 1);
   }
-  opt->addOccurrence(1, name, value);
-  return 0;
+  return addOccurrence(opt, name, value);
 }
 
 __attribute__((visibility("default"))) void flydslFreeLLVMOptionStr(char *str) { std::free(str); }

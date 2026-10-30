@@ -95,6 +95,16 @@ class TestLLVMOptionBindings:
         with pytest.raises(RuntimeError, match="Unknown LLVM option"):
             _fly.reset_llvm_option("this-option-does-not-exist-xyz")
 
+    def test_invalid_value_raises_and_leaves_option_unset(self):
+        # LLVM rejects these values; before, it printed an error and the scope carried on as if set.
+        _fly = self._get_fly()
+        with pytest.raises(ValueError, match="Invalid value '-1' for LLVM option 'unroll-threshold'"):
+            _fly.set_llvm_option_int("unroll-threshold", -1)
+        with pytest.raises(ValueError, match="Invalid value 'Bogus'"):
+            _fly.set_llvm_option_str("amdgpu-atomic-optimizer-strategy", "Bogus", return_old=False)
+        assert _fly.llvm_option_occurrences("unroll-threshold") == 0
+        assert _fly.llvm_option_occurrences("amdgpu-atomic-optimizer-strategy") == 0
+
 
 # ──────────────────────────────────────────────────────────────
 # Tests: llvm_options context manager
@@ -192,6 +202,16 @@ class TestLLVMOptionsContextManager:
             with llvm_options({name: value}):
                 assert _fly.llvm_option_occurrences(name) == 1
             assert _fly.llvm_option_occurrences(name) == 0
+
+    def test_invalid_value_restores_options_set_before_it(self):
+        from flydsl.compiler.llvm_options import llvm_options
+
+        _fly = TestLLVMOptionBindings._get_fly()
+        with pytest.raises(ValueError, match="Invalid value"):
+            with llvm_options({"unroll-threshold": 50, "amdgpu-atomic-optimizer-strategy": "Bogus"}):
+                pass
+        assert _fly.llvm_option_occurrences("unroll-threshold") == 0
+        assert _fly.llvm_option_occurrences("amdgpu-atomic-optimizer-strategy") == 0
 
     @pytest.mark.skip(reason="Temporarily disabled: opt-bisect-limit leaks LLVM BISECT logs across pytest.")
     def test_mixed_types(self):

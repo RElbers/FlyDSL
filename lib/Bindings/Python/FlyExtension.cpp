@@ -1089,6 +1089,9 @@ NB_MODULE(_mlirDialectsFly, m) {
           throw std::runtime_error("Unknown LLVM option: " + name);
         if (rc == 2)
           throw std::runtime_error("LLVM option '" + name + "' is not a bool option");
+        if (rc == 3)
+          throw std::invalid_argument("Invalid value '" + std::string(value ? "true" : "false") +
+                                      "' for LLVM option '" + name + "'");
         return returnOld ? nb::cast(oldValue) : nb::none();
       },
       "name"_a, "value"_a, "return_old"_a = true,
@@ -1104,6 +1107,9 @@ NB_MODULE(_mlirDialectsFly, m) {
           throw std::runtime_error("Unknown LLVM option: " + name);
         if (rc == 2)
           throw std::runtime_error("LLVM option '" + name + "' is not an int option");
+        if (rc == 3)
+          throw std::invalid_argument("Invalid value '" + std::to_string(value) +
+                                      "' for LLVM option '" + name + "'");
         return returnOld ? nb::cast(oldValue) : nb::none();
       },
       "name"_a, "value"_a, "return_old"_a = true,
@@ -1120,6 +1126,9 @@ NB_MODULE(_mlirDialectsFly, m) {
           throw std::runtime_error("Unknown LLVM option: " + name);
         if (rc == 2)
           throw std::runtime_error("LLVM option '" + name + "' is not a string option");
+        if (rc == 3)
+          throw std::invalid_argument("Invalid value '" + value + "' for LLVM option '" + name +
+                                      "'");
         if (!returnOld)
           return nb::none();
         std::string result(oldValue ? oldValue : "");
