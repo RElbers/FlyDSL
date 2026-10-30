@@ -37,6 +37,7 @@ from torch.profiler import ProfilerActivity, profile  # noqa: E402
 
 from kernels.gemm.gemm_a16w16_gfx950 import gemm_a16w16  # noqa: E402
 from kernels.gemm.gemm_a16w16_gfx950_utils import GFX950_DMA_BYTES  # noqa: E402
+from kernels.monokernel.gemm_a16w16 import gemm_a16w16 as monokernel_gemm_a16w16  # noqa: E402
 
 DEFAULT_BENCH_ITERS = 50
 DEFAULT_BENCH_WARMUP = 3
@@ -1020,7 +1021,8 @@ def test_gemm_a16w16_split_k_uses_stream_local_sync_buffers():
     torch.testing.assert_close(out1, ref, atol=2e-1, rtol=2e-1)
 
 
-def test_gemm_a16w16_hti_two_k_tiles_with_concurrent_copy():
+@pytest.mark.parametrize("gemm", [gemm_a16w16, monokernel_gemm_a16w16], ids=["gemm", "monokernel"])
+def test_gemm_a16w16_hti_two_k_tiles_with_concurrent_copy(gemm):
     # The HTI tail LDS race shows only with exactly two K tiles (no main loop) and memory traffic from another stream.
     # Without split-K the output is deterministic, so every launch must match the idle-GPU output bitwise.
     kwargs = {
@@ -1040,7 +1042,7 @@ def test_gemm_a16w16_hti_two_k_tiles_with_concurrent_copy():
     b = empty_layout_matrix(k, n, dtype, is_t=True)
     b.normal_()
 
-    golden = gemm_a16w16(a, b, user_kwargs=kwargs, layout="nt")
+    golden = gemm(a, b, user_kwargs=kwargs, layout="nt")
     torch.testing.assert_close(golden, torch.mm(a, b), atol=3e-2, rtol=2e-1)
 
     side_stream = torch.cuda.Stream()
@@ -1053,7 +1055,7 @@ def test_gemm_a16w16_hti_two_k_tiles_with_concurrent_copy():
         with torch.cuda.stream(side_stream):
             dst.copy_(src)
         out.fill_(float("nan"))
-        gemm_a16w16(a, b, out, user_kwargs=kwargs, layout="nt")
+        gemm(a, b, out, user_kwargs=kwargs, layout="nt")
         bad_launches += (out != golden).any()
     torch.cuda.synchronize()
     assert bad_launches.item() == 0, f"{bad_launches.item()} of {launches} launches differ from the idle-GPU output"
