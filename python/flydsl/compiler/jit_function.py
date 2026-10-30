@@ -814,8 +814,15 @@ def _run_pass_manager(pm: PassManager, module: ir.Module) -> None:
 class MlirCompiler:
     @classmethod
     def compile(
-        cls, module: ir.Module, *, arch: str = "", func_name: str = "", link_libs: Optional[list] = None
+        cls,
+        module: ir.Module,
+        *,
+        arch: str = "",
+        func_name: str = "",
+        link_libs: Optional[list] = None,
+        asm: Optional[str] = None,
     ) -> ir.Module:
+        """Lower *module* to a GPU binary. *asm* is the module already printed with debug info, if the caller has it."""
         try:
             module.operation.verify()
         except ir.MLIRError as exc:
@@ -827,7 +834,7 @@ class MlirCompiler:
         compile_hints = CompilationContext.get_compile_hints()
         # Keep source locations so pass diagnostics point at user code. They only become DWARF when
         # the debug-info pass runs.
-        module = ir.Module.parse(module.operation.get_asm(enable_debug_info=True))
+        module = ir.Module.parse(asm if asm is not None else module.operation.get_asm(enable_debug_info=True))
         backend.lower_compile_hints(module, compile_hints=compile_hints)
         cfg = _pipeline_fragments_for_mode(backend, compile_hints=compile_hints)
         fragments = cfg.fragments
@@ -1554,6 +1561,8 @@ class JitFunction:
             arch=backend.target.arch,
             func_name=self.func.__name__,
             link_libs=link_libs,
+            # Extern linking changed the module after it was printed.
+            asm=None if extern_linked else original_ir,
         )
         return _TraceResult(
             compiled_module=compiled_module,
