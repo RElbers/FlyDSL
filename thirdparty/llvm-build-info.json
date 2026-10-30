@@ -27,6 +27,11 @@
         "file": "amdgpu-improve-unclaused-vmem-sequence.patch",
         "description": "Improve the sequence for initial unclaused VMEM on AMDGPU.",
         "upstream_status": "merged into upstream: 739eaa08d45e5f6e5d13b1dd82daf0e5dc27e344"
+      },
+      {
+        "file": "regalloc-local-reassign-budget.patch",
+        "description": "Bound the greedy allocator's local reassignment checks per function (-regalloc-local-reassign-budget, default 500000000 register unit queries), so functions that badly overflow the register file stop taking minutes to allocate; functions that fit stay far below the budget and compile unchanged.",
+        "upstream_status": "not yet submitted"
       }
     ],
     "extensions": []
