@@ -7,6 +7,15 @@ from ...utils import env
 from ..numeric import Numeric
 
 
+def target_arch() -> str:
+    """The arch being compiled for: ``ARCH`` if set, else the installed device.
+
+    ``ARCH`` picks the compile target in ``RocmBackend.detect_target()``, so ops whose form depends on the
+    arch must follow it rather than the device ``get_rocm_arch()`` detects.
+    """
+    return env.compile.arch or get_rocm_arch()
+
+
 def require_lds_dma_support(what):
     """Reject global -> LDS direct loads (``buffer_load_* ... lds``) on gfx11.
 
@@ -16,9 +25,7 @@ def require_lds_dma_support(what):
     how to expand this operator's operand!", so reject it while a Python
     traceback still points at the kernel line that asked for it.
     """
-    # `ARCH` picks the compile target in RocmBackend.detect_target(), so gate on the arch actually
-    # being compiled for rather than on the installed device.
-    arch = env.compile.arch or get_rocm_arch()
+    arch = target_arch()
     if not arch or not arch.startswith("gfx11"):
         return
     raise ValueError(
