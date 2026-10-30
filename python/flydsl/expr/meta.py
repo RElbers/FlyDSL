@@ -41,6 +41,29 @@ def _is_framework_file(filename: str) -> bool:
     return os.path.abspath(filename).startswith(_FLYDSL_PKG_ROOT)
 
 
+_code_source_infos: dict = {}
+
+
+def _code_source_info(code) -> tuple:
+    """Absolute source path and per-code-unit positions of *code*, as ``inspect.getframeinfo`` finds them.
+
+    ``getframeinfo`` resolves the path again and scans ``co_positions()`` up to the current code unit
+    on every call, so capturing every op of a trace grows with the square of the traced kernel body's
+    size. Python 3.10 has no ``co_positions``, so it gets no positions.
+
+    Keyed by identity, not equality: code objects from different files compare equal when their
+    bodies and line numbers match. The entry keeps its code object alive, so the id is not reused.
+    """
+    entry = _code_source_infos.get(id(code))
+    if entry is None or entry[0] is not code:
+        if len(_code_source_infos) >= 1024:
+            _code_source_infos.clear()
+        path = os.path.abspath(inspect.getsourcefile(code) or inspect.getfile(code))
+        positions = tuple(code.co_positions()) if hasattr(code, "co_positions") else ()
+        entry = _code_source_infos[id(code)] = (code, path, positions)
+    return entry[1], entry[2]
+
+
 # --------------------------------------------------------------------------- #
 # Tracing Variable (thread-local)
 # --------------------------------------------------------------------------- #
@@ -117,13 +140,12 @@ def capture_user_location() -> ir.Location:
             if not _is_framework_file(code.co_filename):
                 keep = len(locs) < max_depth
                 if keep or is_boundary:
-                    info = inspect.getframeinfo(frame, context=0)
-                    # ``Traceback.positions`` only exists on Python 3.11+; fall
-                    # back to ``f_lineno`` / col 0 on 3.8-3.10.
-                    pos = getattr(info, "positions", None)
-                    line = pos.lineno if pos is not None and pos.lineno is not None else frame.f_lineno
-                    col = pos.col_offset if pos is not None and pos.col_offset is not None else 0
-                    floc = file_location(info.filename, line, col, context=ctx)
+                    path, positions = _code_source_info(code)
+                    # One position per 2-byte code unit; without one, fall back to f_lineno / col 0.
+                    pos = positions[frame.f_lasti // 2] if positions and frame.f_lasti >= 0 else None
+                    line = pos[0] if pos is not None and pos[0] is not None else frame.f_lineno
+                    col = pos[2] if pos is not None and pos[2] is not None else 0
+                    floc = ir.Location.file(path, line, col, context=ctx)
                     if keep:
                         locs.append(floc)
                     else:
