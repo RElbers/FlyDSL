@@ -554,6 +554,11 @@ def _disk_cache_key(artifact_key: str) -> str:
     return hashlib.sha256(f"{_flydsl_key()}\n{artifact_key}".encode()).hexdigest()
 
 
+# LLVM options are process-global, so a compile must not run while another thread's llvm_options scope
+# has them set. In-process compiles hold the GIL in PassManager.run, so they never overlapped anyway.
+_compile_lock = threading.Lock()
+
+
 class MlirCompiler:
     @classmethod
     def prepare(cls, module: ir.Module, *, backend, compile_hints: dict, link_libs=None):
@@ -612,7 +617,7 @@ class MlirCompiler:
                 "to inspect pre-binary/final MLIR, or run external LLVM tools directly for ISA dumps."
             )
 
-        with _llvm_ctx:
+        with _compile_lock, _llvm_ctx:
             if dump_enabled:
                 asm = module.operation.get_asm(enable_debug_info=True)
                 kernel_names = _infer_kernel_names_from_asm(asm)
