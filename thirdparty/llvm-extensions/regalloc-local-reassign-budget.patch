@@ -1,0 +1,101 @@
+diff --git a/llvm/include/llvm/CodeGen/RegAllocEvictionAdvisor.h b/llvm/include/llvm/CodeGen/RegAllocEvictionAdvisor.h
+index 145a7219e6..1e01768f49 100644
+--- a/llvm/include/llvm/CodeGen/RegAllocEvictionAdvisor.h
++++ b/llvm/include/llvm/CodeGen/RegAllocEvictionAdvisor.h
+@@ -157,6 +157,10 @@ protected:
+   /// Run or not the local reassignment heuristic. This information is
+   /// obtained from the TargetSubtargetInfo.
+   const bool EnableLocalReassign;
++
++  /// Register unit interference queries canReassign has run for this
++  /// function, checked against -regalloc-local-reassign-budget.
++  mutable uint64_t LocalReassignQueries = 0;
+ };
+ 
+ /// Common provider for legacy and new pass managers.
+diff --git a/llvm/lib/CodeGen/RegAllocGreedy.cpp b/llvm/lib/CodeGen/RegAllocGreedy.cpp
+index ef23468b1e..44b42ef70d 100644
+--- a/llvm/lib/CodeGen/RegAllocGreedy.cpp
++++ b/llvm/lib/CodeGen/RegAllocGreedy.cpp
+@@ -82,6 +82,8 @@ using namespace llvm;
+ STATISTIC(NumGlobalSplits, "Number of split global live ranges");
+ STATISTIC(NumLocalSplits,  "Number of split local live ranges");
+ STATISTIC(NumEvicted,      "Number of interferences evicted");
++STATISTIC(NumLocalReassignOverBudget,
++          "Number of local reassignment checks skipped by the budget");
+ 
+ static cl::opt<SplitEditor::ComplementSpillMode> SplitSpillMode(
+     "split-spill-mode", cl::Hidden,
+@@ -139,6 +141,16 @@ static cl::opt<bool> GreedyReverseLocalAssignment(
+              "shorter local live ranges will tend to be allocated first"),
+     cl::Hidden);
+ 
++// The default sits far above what allocations that fit the register file
++// need, so it only cuts off functions that badly overflow it.
++static cl::opt<unsigned> LocalReassignBudget(
++    "regalloc-local-reassign-budget", cl::Hidden,
++    cl::desc("Number of register unit interference queries local "
++             "reassignment may run per function before every further "
++             "local live range is treated as not reassignable. This is a "
++             "compilation cost-saving consideration. 0 means no limit."),
++    cl::init(500000000));
++
+ static cl::opt<unsigned> SplitThresholdForRegWithHint(
+     "split-threshold-for-reg-with-hint",
+     cl::desc("The threshold for splitting a virtual register with a hint, in "
+@@ -589,7 +601,16 @@ MCRegister RAGreedy::tryAssign(const LiveInterval &VirtReg,
+ 
+ bool RegAllocEvictionAdvisor::canReassign(const LiveInterval &VirtReg,
+                                           MCRegister FromReg) const {
++  // Each call walks the whole allocation order of VirtReg. When the register
++  // file is saturated, eviction calls this for most candidates and it almost
++  // always fails, which makes eviction quadratic in the allocation order.
++  // Past the budget, answer as if local reassignment were disabled.
++  if (LocalReassignBudget && LocalReassignQueries >= LocalReassignBudget) {
++    ++NumLocalReassignOverBudget;
++    return false;
++  }
+   auto HasRegUnitInterference = [&](MCRegUnit Unit) {
++    ++LocalReassignQueries;
+     // Instantiate a "subquery", not to be confused with the Queries array.
+     LiveIntervalUnion::Query SubQ(
+         VirtReg, Matrix->getLiveUnions()[static_cast<unsigned>(Unit)]);
+diff --git a/llvm/test/CodeGen/AMDGPU/regalloc-local-reassign-budget.ll b/llvm/test/CodeGen/AMDGPU/regalloc-local-reassign-budget.ll
+new file mode 100644
+index 0000000000..91d9b3eedf
+--- /dev/null
++++ b/llvm/test/CodeGen/AMDGPU/regalloc-local-reassign-budget.ll
+@@ -0,0 +1,33 @@
++; REQUIRES: asserts
++;
++; With tonga's small SGPR file, eviction asks canReassign about every local
++; interference and it always fails. The budget must cut those checks off and,
++; since it answers what they would have answered here, leave the code unchanged.
++; The default budget is far above what this function needs.
++;
++; RUN: llc -mtriple=amdgcn -mcpu=tonga -stats -o %t.default.s %s 2>&1 | FileCheck --check-prefix=UNLIMITED %s
++; RUN: llc -mtriple=amdgcn -mcpu=tonga -stats -regalloc-local-reassign-budget=0 -o %t.unlimited.s %s 2>&1 | FileCheck --check-prefix=UNLIMITED %s
++; RUN: llc -mtriple=amdgcn -mcpu=tonga -stats -regalloc-local-reassign-budget=100 -o %t.budget.s %s 2>&1 | FileCheck --check-prefix=BUDGET %s
++; RUN: diff %t.default.s %t.unlimited.s
++; RUN: diff %t.default.s %t.budget.s
++
++; UNLIMITED-NOT: local reassignment checks skipped by the budget
++; BUDGET: {{[1-9][0-9]*}} regalloc - Number of local reassignment checks skipped by the budget
++
++define amdgpu_kernel void @test(ptr addrspace(1) %out, ptr addrspace(1) %in) {
++entry:
++  %mbcnt.lo = call i32 @llvm.amdgcn.mbcnt.lo(i32 -1, i32 0)
++  %tid = call i32 @llvm.amdgcn.mbcnt.hi(i32 -1, i32 %mbcnt.lo)
++  %aptr = getelementptr <256 x i32>, ptr addrspace(1) %in, i32 %tid
++  %a = load <256 x i32>, ptr addrspace(1) %aptr
++  call void asm sideeffect "", "~{memory}" ()
++  %outptr = getelementptr <256 x i32>, ptr addrspace(1) %in, i32 %tid
++  store <256 x i32> %a, ptr addrspace(1) %outptr
++  call void asm sideeffect "", "~{s4},~{s8},~{s12},~{s16},~{s20},~{s24},~{s28}" ()
++  call void asm sideeffect "", "~{s32},~{s36},~{s40},~{s44},~{s48},~{s52},~{s56}" ()
++  call void asm sideeffect "", "~{s60},~{s64},~{s68}" ()
++  ret void
++}
++
++declare i32 @llvm.amdgcn.mbcnt.lo(i32, i32)
++declare i32 @llvm.amdgcn.mbcnt.hi(i32, i32)
