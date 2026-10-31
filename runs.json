@@ -1,6 +1,6 @@
 {
  "schema": 1,
- "updated": "2026-10-31T11:44:52Z",
+ "updated": "2026-10-31T11:45:11Z",
  "repo": "RElbers/FlyDSL",
  "runs": [
   {
@@ -25,11 +25,11 @@
    "branch": "main",
    "event": "push",
    "title": "[Misc] Bump version to 0.4.2 (#1354)",
-   "status": "queued",
-   "conclusion": null,
+   "status": "completed",
+   "conclusion": "cancelled",
    "url": "https://github.com/RElbers/FlyDSL/actions/runs/41050233342",
    "created_at": "2026-10-30T11:44:23Z",
-   "updated_at": "2026-10-30T11:45:01Z",
+   "updated_at": "2026-10-31T11:45:02Z",
    "actor": "RElbers",
    "jobs": []
   },
