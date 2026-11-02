@@ -1,6 +1,6 @@
 {
  "schema": 1,
- "updated": "2026-11-02T16:06:29Z",
+ "updated": "2026-11-02T21:42:04Z",
  "repo": "RElbers/FlyDSL",
  "runs": [
   {
@@ -10,11 +10,11 @@
    "branch": "faster-trace-locations",
    "event": "pull_request",
    "title": "[DSL] Capture op locations in linear time and print the traced module once",
-   "status": "in_progress",
+   "status": "queued",
    "conclusion": null,
    "url": "https://github.com/RElbers/FlyDSL/actions/runs/41478133296",
    "created_at": "2026-11-02T16:06:05Z",
-   "updated_at": "2026-11-02T16:06:14Z",
+   "updated_at": "2026-11-02T16:06:54Z",
    "actor": "RElbers",
    "jobs": []
   },
