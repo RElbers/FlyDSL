@@ -116,6 +116,23 @@ class _ExitsTheWorker:
         return os._exit, (1,)
 
 
+def test_workers_fork_from_an_interpreter_without_thread_pools(compiles, tmp_path, monkeypatch):
+    # Forking a process with other threads running is unsafe, and torch and numpy start a pool of them at import
+    # unless told not to. The template imports the job's module just before it forks.
+    path = tmp_path / "threads"
+    preamble = f"import os\nopen({str(path)!r}, 'w').write(str(len(os.listdir('/proc/self/task'))))\n"
+    kernel = _kernel_module(tmp_path, monkeypatch, "@flyc.jit", preamble)
+
+    assert precompile([_rmsnorm_job(256, kernel)], workers=1) == [None]
+
+    assert path.read_text() == "1"
+
+
+class _ExitsTheWorker:
+    def __reduce__(self):
+        return os._exit, (1,)
+
+
 def test_workers_run_no_thread_pools_besides_the_compile(compiles, tmp_path, monkeypatch):
     # Idle OpenMP and BLAS pools started by torch and numpy compete with the compiles for the cores. The probe
     # writes the worker's thread count when the worker unpickles the job.
@@ -214,9 +231,10 @@ def test_a_job_that_fails_in_a_worker_does_not_stop_the_rest(compiles, monkeypat
     assert errors[2] is None
 
 
-def _kernel_module(tmp_path, monkeypatch, decorators):
-    """A module on the import path whose ``kernel`` is RMSNorm under ``decorators``."""
-    source = f"""
+def _kernel_module(tmp_path, monkeypatch, decorators, preamble=""):
+    """A module on the import path whose ``kernel`` is RMSNorm under ``decorators``, and that runs ``preamble``
+    when imported."""
+    source = f"""{preamble}
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.autotune import Config, autotune
