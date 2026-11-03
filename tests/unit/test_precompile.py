@@ -29,6 +29,7 @@ from flydsl.autotune import Autotuner, Config  # noqa: E402
 from flydsl.compiler.extern_link import _register_link_metadata  # noqa: E402
 from flydsl.compiler.kernel_function import CompilationContext  # noqa: E402
 from flydsl.compiler.precompile import CompileJob, precompile  # noqa: E402
+from flydsl.runtime.device import get_rocm_arch  # noqa: E402
 from kernels.gemm.gemm_a16w16_gfx950 import (  # noqa: E402
     GEMM_A16W16_DTYPE_BF16,
     gemm_a16w16_gfx950,
@@ -173,6 +174,7 @@ def test_precompile_refuses_an_empty_cache_directory(compiles, monkeypatch):
         precompile([_rmsnorm_job(256)], workers=1)
 
 
+@pytest.mark.skipif(not str(get_rocm_arch()).startswith("gfx95"), reason="the struct-parameter GEMM is gfx95x only")
 def test_a_struct_argument_specializes_the_worker_compile_as_it_does_the_call(compiles):
     # The struct's class is generated for its constexpr values, so it is sent as the struct it was built from.
     param = make_gemm_a16w16_gfx950_param(
