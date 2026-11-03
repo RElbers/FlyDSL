@@ -79,6 +79,12 @@ launcher it returns, which covers kernels built per configuration:
 errors = precompile([CompileJob(build_kernel, args, factory_kwargs=cfg) for cfg in configs], workers=16)
 ```
 
+The same works for a tuner from another library that calls FlyDSL kernels: run
+`precompile` first, in the same process or an earlier one with the same
+`FLYDSL_RUNTIME_CACHE_DIR`, with one job per call the tuner will make. To check
+the jobs match those calls, run the tuner once with `FLYDSL_RUNTIME_RUN_ONLY=1`:
+a call that was not precompiled then raises instead of compiling.
+
 Each entry of the result is None when the job compiled, else why not; such a
 specialization is compiled as usual when it is called. A job cannot be sent to a
 worker when its function is defined inside a function or in the script being
