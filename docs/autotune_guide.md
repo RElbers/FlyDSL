@@ -53,6 +53,53 @@ declare an integer schema parameter on its entry point and list it in `key`, the
 bump it with any change that can move the winner. Softmax does this with
 `tuning_schema`.
 
+## Compiling configs in parallel
+
+`flydsl.compiler.precompile.precompile(jobs, workers)` compiles kernel
+specializations into the JIT disk cache in up to `workers` worker processes, so a
+later call to each one loads it instead of compiling it. To tune faster, compile
+a search's configs this way before it runs; the benchmark loop then only loads
+them:
+
+```python
+from flydsl.compiler.precompile import CompileJob, precompile
+
+jobs = [CompileJob(launch, args, {**kwargs, **c.all_kwargs()}, c.compiler_opts()) for c in configs]
+precompile(jobs, workers=16)
+tuned(*args, **kwargs)
+```
+
+`Config.all_kwargs()` and `Config.compiler_opts()` give a config's call the same
+arguments and compile hints the autotuner uses, so the specializations match. For
+a stacked `@autotune` / `@flyc.jit` kernel, pass the tuner's `.fn`. A `CompileJob`
+can also name a kernel factory, with `factory_kwargs` and the call of the
+launcher it returns, which covers kernels built per configuration:
+
+```python
+errors = precompile([CompileJob(build_kernel, args, factory_kwargs=cfg) for cfg in configs], workers=16)
+```
+
+Each entry of the result is None when the job compiled, else why not; such a
+specialization is compiled as usual when it is called. A job cannot be sent to a
+worker when its function is defined inside a function or in the script being
+run, or an argument does not pickle. Workers rebuild the call with CPU tensors of
+the same shape, strides and dtype, which specialize the kernel exactly as the
+device tensors do, rebuild an `@fx.struct` argument from its field values, which
+needs its struct type defined at module level, and add the compile hints the call
+would get at that point.
+`precompile` raises when the disk cache is off or IR dumps (`FLYDSL_DUMP_IR`,
+`FLYDSL_DEBUG_DUMP_ASM`) bypass it.
+
+Workers are fresh interpreters that import FlyDSL and the kernel module, which
+takes about two seconds and a few hundred MB of host memory each, and exit when
+the call returns. It finishes no sooner than its slowest job compiles.
+
+Because a worker imports the kernel module afresh, it compiles against the
+module's state at import. A captured module-level object other than a constant
+is keyed only by its type, so if the caller changes it after import, the worker
+compiles the old value and a later call loads that artifact as current. Do not
+precompile a kernel that reads such state.
+
 ## Candidate correctness gate
 
 `validate_hook(sig_args)` returns a context manager around one untimed candidate

@@ -1130,7 +1130,13 @@ class JitFunction:
         """Compile one specialization without creating an engine or running it."""
         return self._compile_or_execute(args, kwargs, execute=False)
 
-    def _compile_or_execute(self, args, kwargs, *, execute: bool, return_compiled: bool = False):
+    def _compile_to_disk_cache(self, *args, **kwargs):
+        """Compile one specialization into the disk cache, raising when the cache does not keep it."""
+        return self._compile_or_execute(args, kwargs, execute=False, to_disk_cache=True)
+
+    def _compile_or_execute(
+        self, args, kwargs, *, execute: bool, return_compiled: bool = False, to_disk_cache: bool = False
+    ):
         if ir.Context.current is not None:
             return self.func(*args, **kwargs)
 
@@ -1196,9 +1202,17 @@ class JitFunction:
             # the callbacks so each initialization owns its loaded module.
             dumping = env.debug.dump_ir or env.debug.dump_asm
             manager = None if traced.post_load_processors or dumping else self.cache_manager
-            compiled_func = self._mem_cache.get(cache_key)
+            if to_disk_cache and manager is None:
+                reason = (
+                    "it has post-load initializers"
+                    if traced.post_load_processors
+                    else "IR dumps bypass it" if dumping else "it is off"
+                )
+                raise RuntimeError(f"{self.func.__name__} cannot be compiled into the disk cache: {reason}")
+            # Both caches looked up here answer from memory first; the compile lock below reads the disk itself.
+            compiled_func = None if to_disk_cache else self._mem_cache.get(cache_key)
             disk_key = None if manager is None else _disk_cache_key(cache_key)
-            if compiled_func is None and manager is not None:
+            if compiled_func is None and manager is not None and not to_disk_cache:
                 compiled_func = manager.get(disk_key)
             if compiled_func is not None and not accept_cached(compiled_func):
                 compiled_func = None
@@ -1244,9 +1258,13 @@ class JitFunction:
                             try:
                                 writer(compiled_func)
                             except Exception as e:
+                                if to_disk_cache:
+                                    raise
                                 log().warning(f"Failed to write compile cache: {e}")
 
-            self._mem_cache[cache_key] = compiled_func
+            # A launched call may point into the artifact already here, so it must not be replaced.
+            if not (to_disk_cache and cache_key in self._mem_cache):
+                self._mem_cache[cache_key] = compiled_func
             self._last_compiled = (cache_key, compiled_func)
 
         # OUTSIDE MLIR context/locks: engine initialization and kernel launch.
