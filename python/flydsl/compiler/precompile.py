@@ -170,12 +170,15 @@ def _run_workers(tasks, count, results):
         "-c",
         f"import sys; sys.path[:] = {sys.path!r}; from flydsl.compiler.precompile import _worker_main; _worker_main()",
     ]
+    # Compiling uses neither pool, but torch and numpy start one thread per core for them at import, and those
+    # threads spin and compete with the other workers' compiles.
+    env = dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1")
     workers = []
     unsent = "no compile worker was left to compile it"
     try:
         while len(workers) < count:
             try:
-                workers.append(subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE))
+                workers.append(subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env))
             except OSError as error:
                 unsent = f"cannot start a compile worker: {error}"
                 break

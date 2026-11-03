@@ -111,6 +111,23 @@ class _ExitsTheWorker:
         return os._exit, (1,)
 
 
+def test_workers_run_no_thread_pools_besides_the_compile(compiles, tmp_path, monkeypatch):
+    # Idle OpenMP and BLAS pools started by torch and numpy compete with the compiles for the cores. The probe
+    # writes the worker's thread count when the worker unpickles the job.
+    path = tmp_path / "threads"
+    (tmp_path / "thread_probe.py").write_text(
+        "import os\n\n\nclass Probe:\n    def __reduce__(self):\n        return write, ()\n\n\n"
+        f"def write():\n    open({str(path)!r}, 'w').write(str(len(os.listdir('/proc/self/task'))))\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, "thread_probe", raising=False)
+    probe = importlib.import_module("thread_probe").Probe()
+
+    precompile([CompileJob(rmsnorm_direct, (probe,))], workers=1)
+
+    assert path.read_text() == "1"
+
+
 def test_a_worker_that_dies_is_reported_and_its_unsent_jobs_too(compiles):
     errors = precompile([CompileJob(rmsnorm_direct, (_ExitsTheWorker(),)), _rmsnorm_job(256)], workers=1)
 
