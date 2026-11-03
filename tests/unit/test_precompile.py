@@ -161,10 +161,11 @@ def test_an_interrupt_stops_the_compiles_in_progress_and_the_rest(compiles, monk
     assert started[0].poll() is not None
 
 
-def test_a_worker_that_dies_is_reported_and_its_unsent_jobs_too(compiles):
-    errors = precompile([CompileJob(rmsnorm_direct, (_ExitsTheWorker(),)), _rmsnorm_job(256)], workers=1)
+def test_jobs_left_when_every_worker_died_compile_in_new_workers(compiles):
+    dying = [CompileJob(rmsnorm_direct, (_ExitsTheWorker(),)) for _ in range(2)]
+    errors = precompile(dying + [_rmsnorm_job(block_threads) for block_threads in (128, 256, 512, 256)], workers=2)
 
-    assert errors == ["the compile worker exited", "no compile worker was left to compile it"]
+    assert errors == ["the compile worker exited"] * 2 + [None] * 4
 
 
 def test_precompile_refuses_an_empty_cache_directory(compiles, monkeypatch):

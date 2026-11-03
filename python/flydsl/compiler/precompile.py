@@ -77,10 +77,16 @@ def precompile(jobs: List[CompileJob], workers: int) -> List[Optional[str]]:
             continue
         tasks.put((index, payload.getvalue()))
         modules.add(name.partition(":")[0])
-    if tasks.empty():
-        return results
-
-    _run_workers(tasks, min(workers, tasks.qsize()), sorted(modules), results)
+    failure = None
+    while not tasks.empty():
+        left = tasks.qsize()
+        failure = _run_workers(tasks, min(workers, left), sorted(modules), results)
+        # Jobs are left only when every worker died; each took at least the job it died on with it, so new workers
+        # make progress unless none could start or none was sent a job.
+        if failure is not None or tasks.qsize() == left:
+            break
+    while not tasks.empty():
+        results[tasks.get_nowait()[0]] = failure or "no compile worker was left to compile it"
     return results
 
 
@@ -201,6 +207,7 @@ def _worker_main(jobs_fd, results_fd):
 
 
 def _run_workers(tasks, count, modules, results):
+    """Compile ``tasks`` in ``count`` workers until it is empty or every worker died; return why none started."""
     # Compiling uses neither pool, but torch and numpy start one thread per core for them at import, and those
     # threads spin and compete with the other workers' compiles. The template must not have threads to fork.
     env = dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1")
@@ -208,7 +215,7 @@ def _run_workers(tasks, count, modules, results):
     worker_ends = []
     template = None
     drivers = []
-    unsent = "no compile worker was left to compile it"
+    failure = None
     answered = False
     try:
         try:
@@ -228,7 +235,7 @@ def _run_workers(tasks, count, modules, results):
             fds = [fd for ends in worker_ends for fd in ends]
             template = subprocess.Popen(command, pass_fds=fds, env=env, start_new_session=True)
         except OSError as error:
-            unsent = f"cannot start a compile worker: {error}"
+            failure = f"cannot start a compile worker: {error}"
         finally:
             for ends in worker_ends:
                 for fd in ends:
@@ -256,8 +263,7 @@ def _run_workers(tasks, count, modules, results):
             except subprocess.TimeoutExpired:
                 _kill(template)
                 template.wait()
-    while not tasks.empty():
-        results[tasks.get_nowait()[0]] = unsent
+    return failure
 
 
 def _drive(worker, tasks, results):
