@@ -97,6 +97,14 @@ exit when the call returns. It finishes no sooner than its slowest job compiles.
 Since every call starts its workers again, put all the jobs you know about, for
 every shape you will tune, into one call.
 
+`precompile` needs no GPU, so it can build a cache ahead of time for machines
+that run with `FLYDSL_RUNTIME_RUN_ONLY=1`. Build the jobs from CPU tensors, set
+`ARCH` and `FLYDSL_GPU_ARCH` to the target, and run on a machine with no GPU or
+one of that architecture, since tracing can query the GPU it finds. The machines
+loading the cache need the same FlyDSL build, kernel source and cache-relevant
+environment variables, and calls that specialize the same way. Kernels that link
+external code (`link_extern`) are never written to the cache.
+
 Because a worker imports the kernel module afresh, it compiles against the
 module's state at import. A captured module-level object other than a constant
 is keyed only by its type, so if the caller changes it after import, the worker
