@@ -94,6 +94,8 @@ The workers are forked from one fresh interpreter that imports FlyDSL and the
 kernels' modules once, which takes about two seconds, so they share those
 imports. Each uses a few hundred MB of host memory while it compiles, and all
 exit when the call returns. It finishes no sooner than its slowest job compiles.
+Since every call starts its workers again, put all the jobs you know about, for
+every shape you will tune, into one call.
 
 Because a worker imports the kernel module afresh, it compiles against the
 module's state at import. A captured module-level object other than a constant
