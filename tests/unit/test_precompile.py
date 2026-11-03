@@ -178,6 +178,48 @@ def test_an_interrupt_stops_the_compiles_in_progress_and_the_rest(compiles, monk
     assert started[0].poll() is not None
 
 
+def _processes_naming(marker):
+    found = []
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as file:
+                if marker.encode() in file.read():
+                    found.append(int(pid))
+        except OSError:
+            pass
+    return found
+
+
+def test_the_workers_die_with_a_caller_that_is_killed(compiles, tmp_path):
+    # A killed caller runs no cleanup; the template and its workers must not keep compiling for it.
+    marker = str(tmp_path / "caller-marker")
+    script = tmp_path / "caller.py"
+    script.write_text(f"""import sys, time
+sys.path.insert(0, {marker!r})
+from flydsl.compiler.precompile import CompileJob, precompile
+from kernels.norm.rmsnorm_kernel import rmsnorm_direct
+
+class Sleeps:
+    def __reduce__(self):
+        return time.sleep, (60,)
+
+precompile([CompileJob(rmsnorm_direct, (Sleeps(),)) for _ in range(2)], 2)
+""")
+    caller = subprocess.Popen([sys.executable, str(script)])
+    deadline = time.monotonic() + 60
+    while len(_processes_naming(marker)) < 3 and time.monotonic() < deadline:
+        time.sleep(0.2)
+    assert len(_processes_naming(marker)) == 3  # the template and two workers
+
+    caller.kill()
+    caller.wait()
+    deadline = time.monotonic() + 10
+    while _processes_naming(marker) and time.monotonic() < deadline:
+        time.sleep(0.2)
+
+    assert _processes_naming(marker) == []
+
+
 def test_jobs_left_when_every_worker_died_compile_in_new_workers(compiles):
     dying = [CompileJob(rmsnorm_direct, (_ExitsTheWorker(),)) for _ in range(2)]
     errors = precompile(dying + [_rmsnorm_job(block_threads) for block_threads in (128, 256, 512, 256)], workers=2)

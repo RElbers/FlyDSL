@@ -9,6 +9,7 @@ from the disk cache instead of compiling it.
 """
 
 import contextlib
+import ctypes
 import importlib
 import io
 import os
@@ -156,7 +157,7 @@ def _compile(payload):
     return None
 
 
-def _template_main(modules, status_fd, worker_ends):
+def _template_main(caller, modules, status_fd, worker_ends):
     """Entry point of the process the compile workers fork from.
 
     It imports what every worker needs once, so the workers share it instead of each importing it, then forks one
@@ -164,6 +165,7 @@ def _template_main(modules, status_fd, worker_ends):
     that runs no other thread, which is what makes forking it safe. Before forking it writes to ``status_fd`` None,
     or why it cannot fork the workers.
     """
+    _die_with(caller)
     os.dup2(2, 1)  # whatever a compile prints goes to stderr
     reason = None
     for module in modules:
@@ -177,12 +179,14 @@ def _template_main(modules, status_fd, worker_ends):
         pickle.dump(reason, status)
     if reason is not None:
         return
+    template = os.getpid()
     for index, (jobs_fd, results_fd) in enumerate(worker_ends):
         try:
             pid = os.fork()
         except OSError:
             pid = None  # closing this worker's ends below tells the caller it is gone
         if pid == 0:
+            _die_with(template)
             # A worker holds only its own ends, so the caller sees end of file on a result pipe whose worker died.
             for later in worker_ends[index + 1 :]:
                 for fd in later:
@@ -198,6 +202,13 @@ def _template_main(modules, status_fd, worker_ends):
             os.wait()
         except ChildProcessError:
             return
+
+
+def _die_with(parent):
+    """Have Linux kill this process when ``parent``, which started it, exits without stopping it first."""
+    ctypes.CDLL(None).prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
+    if os.getppid() != parent:  # it exited before this process asked
+        os._exit(1)
 
 
 def _worker_main(jobs_fd, results_fd):
@@ -241,7 +252,7 @@ def _run_workers(tasks, count, modules, results):
                 sys.executable,
                 "-c",
                 f"import sys; sys.path[:] = {sys.path!r}; from flydsl.compiler.precompile import _template_main; "
-                f"_template_main({modules!r}, {status_write}, {worker_ends[1:]!r})",
+                f"_template_main({os.getpid()}, {modules!r}, {status_write}, {worker_ends[1:]!r})",
             ]
             # Its own session, so the workers form a process group that can be killed together.
             fds = [fd for ends in worker_ends for fd in ends]
