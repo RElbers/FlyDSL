@@ -8,8 +8,11 @@ import gc
 import importlib
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import threading
+import time
 import types
 
 import pytest
@@ -127,6 +130,34 @@ def test_workers_run_no_thread_pools_besides_the_compile(compiles, tmp_path, mon
     precompile([CompileJob(rmsnorm_direct, (probe,))], workers=1)
 
     assert path.read_text() == "1"
+
+
+class _SleepsInTheWorker:
+    def __init__(self, seconds):
+        self.seconds = seconds
+
+    def __reduce__(self):
+        return time.sleep, (self.seconds,)
+
+
+def test_an_interrupt_stops_the_compiles_in_progress_and_the_rest(compiles, monkeypatch):
+    started = []
+    popen = subprocess.Popen
+
+    def recorded(*args, **kwargs):
+        started.append(popen(*args, **kwargs))
+        return started[-1]
+
+    monkeypatch.setattr(precompile_module.subprocess, "Popen", recorded)
+    jobs = [CompileJob(rmsnorm_direct, (_SleepsInTheWorker(60),)) for _ in range(2)]
+    threading.Timer(3, os.kill, (os.getpid(), signal.SIGINT)).start()
+    start = time.perf_counter()
+
+    with pytest.raises(KeyboardInterrupt):
+        precompile(jobs, workers=1)
+
+    assert time.perf_counter() - start < 15
+    assert started[0].poll() is not None
 
 
 def test_a_worker_that_dies_is_reported_and_its_unsent_jobs_too(compiles):

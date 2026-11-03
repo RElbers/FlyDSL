@@ -207,6 +207,7 @@ def _run_workers(tasks, count, modules, results):
     workers = []  # this process's (jobs, results) ends of each worker's pipes
     worker_ends = []
     template = None
+    drivers = []
     unsent = "no compile worker was left to compile it"
     answered = False
     try:
@@ -240,16 +241,20 @@ def _run_workers(tasks, count, modules, results):
                 driver.join()
             answered = True
     finally:
-        # Idle workers exit when their job pipes close; a call that was interrupted stops them mid-compile.
+        if template is not None and not answered:
+            # Interrupted: stop the compiles in progress, which also ends the drivers waiting for them.
+            _kill(template)
+            for driver in drivers:
+                driver.join()
+        # Idle workers exit when their job pipes close.
         for pipes in workers:
             for pipe in pipes:
                 _close(pipe)
         if template is not None:
             try:
-                template.wait(timeout=30 if answered else 0)
+                template.wait(timeout=30)
             except subprocess.TimeoutExpired:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(template.pid, signal.SIGKILL)
+                _kill(template)
                 template.wait()
     while not tasks.empty():
         results[tasks.get_nowait()[0]] = unsent
@@ -273,6 +278,12 @@ def _drive(worker, tasks, results):
             _close(jobs)
             _close(worker_results)
             return
+
+
+def _kill(template):
+    # The template leads its own session, so its process group is the template and the workers.
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(template.pid, signal.SIGKILL)
 
 
 def _close(pipe):
