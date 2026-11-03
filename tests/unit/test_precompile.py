@@ -266,6 +266,26 @@ def kernel(x: fx.Tensor, gamma: fx.Tensor, out: fx.Tensor, m: fx.Int32, N: fx.Co
     return importlib.import_module("test_precompile_kernel").kernel
 
 
+def test_a_kernel_module_that_starts_the_gpu_runtime_is_reported(compiles, tmp_path, monkeypatch):
+    # Workers forked from an interpreter whose GPU runtime has started cannot use it.
+    kernel = _kernel_module(tmp_path, monkeypatch, "@flyc.jit", "import torch\ntorch.cuda.init()\n")
+
+    errors = precompile([_rmsnorm_job(256, kernel)], workers=1)
+
+    assert errors[0].startswith("cannot start the compile workers: importing test_precompile_kernel started")
+
+
+def test_an_interpreter_that_exits_while_starting_is_reported(compiles, tmp_path, monkeypatch):
+    # Only the interpreter the workers fork from runs as python -c.
+    kernel = _kernel_module(
+        tmp_path, monkeypatch, "@flyc.jit", "import os, sys\nif sys.argv[0] == '-c':\n    os._exit(3)\n"
+    )
+
+    errors = precompile([_rmsnorm_job(256, kernel), _rmsnorm_job(512, kernel)], workers=2)
+
+    assert errors == ["cannot start the compile workers: it exited while importing the jobs' modules"] * 2
+
+
 def test_jobs_compile_with_the_hints_the_call_gets(compiles, monkeypatch):
     monkeypatch.setattr(rmsnorm_direct, "compile_hints", {"unsafe_fp_math": True})
     job = _rmsnorm_job(256)

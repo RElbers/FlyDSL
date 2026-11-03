@@ -101,7 +101,10 @@ Because a worker imports the kernel module afresh, it compiles against the
 module's state at import. A captured module-level object other than a constant
 is keyed only by its type, so if the caller changes it after import, the worker
 compiles the old value and a later call loads that artifact as current. Do not
-precompile a kernel that reads such state.
+precompile a kernel that reads such state. Nor can a kernel module that starts
+the GPU runtime when imported, for example by querying the device at module
+level, be precompiled: workers forked from it could not use the runtime, so each
+of its jobs is reported instead.
 
 ## Candidate correctness gate
 

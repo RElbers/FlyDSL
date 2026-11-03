@@ -156,19 +156,27 @@ def _compile(payload):
     return None
 
 
-def _template_main(modules, worker_ends):
+def _template_main(modules, status_fd, worker_ends):
     """Entry point of the process the compile workers fork from.
 
     It imports what every worker needs once, so the workers share it instead of each importing it, then forks one
     worker per ``(jobs, results)`` pair of pipe ends in ``worker_ends`` and waits for them. It is a fresh interpreter
-    that never starts a GPU runtime or a thread, which is what makes forking it safe.
+    that runs no other thread, which is what makes forking it safe. Before forking it writes to ``status_fd`` None,
+    or why it cannot fork the workers.
     """
     os.dup2(2, 1)  # whatever a compile prints goes to stderr
+    reason = None
     for module in modules:
         try:
             importlib.import_module(module)
         except Exception:
             pass  # each of its jobs reports the error when its worker imports the module again
+        if reason is None and torch is not None and torch.cuda.is_initialized():
+            reason = f"importing {module} started the GPU runtime, which workers forked from it could not use"
+    with os.fdopen(status_fd, "wb") as status:
+        pickle.dump(reason, status)
+    if reason is not None:
+        return
     for index, (jobs_fd, results_fd) in enumerate(worker_ends):
         try:
             pid = os.fork()
@@ -213,12 +221,16 @@ def _run_workers(tasks, count, modules, results):
     env = dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1")
     workers = []  # this process's (jobs, results) ends of each worker's pipes
     worker_ends = []
+    status = None
     template = None
     drivers = []
     failure = None
     answered = False
     try:
         try:
+            status_read, status_write = os.pipe()
+            status = os.fdopen(status_read, "rb")
+            worker_ends.append((status_write,))
             for _ in range(count):
                 jobs_read, jobs_write = os.pipe()
                 results_read, results_write = os.pipe()
@@ -229,7 +241,7 @@ def _run_workers(tasks, count, modules, results):
                 sys.executable,
                 "-c",
                 f"import sys; sys.path[:] = {sys.path!r}; from flydsl.compiler.precompile import _template_main; "
-                f"_template_main({modules!r}, {worker_ends!r})",
+                f"_template_main({modules!r}, {status_write}, {worker_ends[1:]!r})",
             ]
             # Its own session, so the workers form a process group that can be killed together.
             fds = [fd for ends in worker_ends for fd in ends]
@@ -241,6 +253,13 @@ def _run_workers(tasks, count, modules, results):
                 for fd in ends:
                     os.close(fd)
         if template is not None:
+            try:
+                reason = pickle.load(status)
+            except EOFError:
+                reason = "it exited while importing the jobs' modules"
+            if reason is not None:
+                failure = f"cannot start the compile workers: {reason}"
+        if failure is None:
             drivers = [threading.Thread(target=_drive, args=(worker, tasks, results)) for worker in workers]
             for driver in drivers:
                 driver.start()
@@ -249,7 +268,8 @@ def _run_workers(tasks, count, modules, results):
             answered = True
     finally:
         if template is not None and not answered:
-            # Interrupted: stop the compiles in progress, which also ends the drivers waiting for them.
+            # Interrupted, or the workers could not start: stop any compile in progress, which also ends the drivers
+            # waiting for one.
             _kill(template)
             for driver in drivers:
                 driver.join()
@@ -257,6 +277,8 @@ def _run_workers(tasks, count, modules, results):
         for pipes in workers:
             for pipe in pipes:
                 _close(pipe)
+        if status is not None:
+            _close(status)
         if template is not None:
             try:
                 template.wait(timeout=30)
