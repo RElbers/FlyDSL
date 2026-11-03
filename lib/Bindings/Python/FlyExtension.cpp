@@ -1082,44 +1082,71 @@ NB_MODULE(_mlirDialectsFly, m) {
 
   m.def(
       "set_llvm_option_bool",
-      [](const std::string &name, bool value) -> bool {
+      [](const std::string &name, bool value, bool returnOld) -> nb::object {
         bool oldValue = false;
-        int rc = flydslSetLLVMOptionBool(name.c_str(), value, &oldValue);
+        int rc = flydslSetLLVMOptionBool(name.c_str(), value, returnOld ? &oldValue : nullptr);
         if (rc == 1)
           throw std::runtime_error("Unknown LLVM option: " + name);
         if (rc == 2)
           throw std::runtime_error("LLVM option '" + name + "' is not a bool option");
-        return oldValue;
+        return returnOld ? nb::cast(oldValue) : nb::none();
       },
-      "name"_a, "value"_a, "Set an LLVM bool cl::opt at runtime; returns the previous value.");
+      "name"_a, "value"_a, "return_old"_a = true,
+      "Set an LLVM bool cl::opt at runtime; returns the previous value, or None without "
+      "return_old.");
 
   m.def(
       "set_llvm_option_int",
-      [](const std::string &name, int value) -> int {
+      [](const std::string &name, int value, bool returnOld) -> nb::object {
         int oldValue = 0;
-        int rc = flydslSetLLVMOptionInt(name.c_str(), value, &oldValue);
+        int rc = flydslSetLLVMOptionInt(name.c_str(), value, returnOld ? &oldValue : nullptr);
         if (rc == 1)
           throw std::runtime_error("Unknown LLVM option: " + name);
         if (rc == 2)
           throw std::runtime_error("LLVM option '" + name + "' is not an int option");
-        return oldValue;
+        return returnOld ? nb::cast(oldValue) : nb::none();
       },
-      "name"_a, "value"_a, "Set an LLVM int cl::opt at runtime; returns the previous value.");
+      "name"_a, "value"_a, "return_old"_a = true,
+      "Set an LLVM int cl::opt at runtime; returns the previous value, or None without "
+      "return_old.");
 
   m.def(
       "set_llvm_option_str",
-      [](const std::string &name, const std::string &value) -> std::string {
+      [](const std::string &name, const std::string &value, bool returnOld) -> nb::object {
         char *oldValue = nullptr;
-        int rc = flydslSetLLVMOptionStr(name.c_str(), value.c_str(), &oldValue);
+        int rc =
+            flydslSetLLVMOptionStr(name.c_str(), value.c_str(), returnOld ? &oldValue : nullptr);
         if (rc == 1)
           throw std::runtime_error("Unknown LLVM option: " + name);
         if (rc == 2)
           throw std::runtime_error("LLVM option '" + name + "' is not a string option");
+        if (!returnOld)
+          return nb::none();
         std::string result(oldValue ? oldValue : "");
         flydslFreeLLVMOptionStr(oldValue);
-        return result;
+        return nb::cast(result);
       },
-      "name"_a, "value"_a, "Set an LLVM string cl::opt at runtime; returns the previous value.");
+      "name"_a, "value"_a, "return_old"_a = true,
+      "Set an LLVM string cl::opt at runtime; returns the previous value, or None without "
+      "return_old.");
+
+  m.def(
+      "llvm_option_occurrences",
+      [](const std::string &name) -> int {
+        int occurrences = 0;
+        if (flydslGetLLVMOptionOccurrences(name.c_str(), &occurrences) == 1)
+          throw std::runtime_error("Unknown LLVM option: " + name);
+        return occurrences;
+      },
+      "name"_a, "How many times an LLVM cl::opt has been set since it was last reset.");
+
+  m.def(
+      "reset_llvm_option",
+      [](const std::string &name) {
+        if (flydslResetLLVMOption(name.c_str()) == 1)
+          throw std::runtime_error("Unknown LLVM option: " + name);
+      },
+      "name"_a, "Reset an LLVM cl::opt to its default value and clear its occurrence count.");
 
   static constexpr auto appendTo = [](MlirStringRef str, void *userData) {
     static_cast<std::string *>(userData)->append(str.data, str.length);
