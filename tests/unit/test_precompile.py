@@ -7,6 +7,7 @@ import functools
 import gc
 import importlib
 import os
+import resource
 import shutil
 import signal
 import subprocess
@@ -391,7 +392,29 @@ def test_jobs_report_a_worker_that_cannot_start(compiles, monkeypatch):
 
     errors = precompile([_rmsnorm_job(256), _rmsnorm_job(512)], workers=2)
 
-    assert errors == ["cannot start a compile worker: Resource temporarily unavailable"] * 2
+    assert errors == ["cannot start 2 compile workers: Resource temporarily unavailable"] * 2
+
+
+def test_too_few_open_files_for_the_workers_is_reported(compiles):
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (len(os.listdir("/proc/self/fd")) + 8, hard))
+    try:
+        errors = precompile([_rmsnorm_job(256), _rmsnorm_job(512)], workers=2)
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+    assert errors == ["cannot start 2 compile workers: [Errno 24] Too many open files"] * 2
+
+
+def test_precompile_refuses_fewer_than_one_worker(compiles):
+    with pytest.raises(ValueError, match="at least one worker"):
+        precompile([_rmsnorm_job(256)], workers=0)
+
+
+def test_workers_take_path_objects_on_the_import_path(compiles, tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "path", [tmp_path] + sys.path)
+
+    assert precompile([_rmsnorm_job(256)], workers=1) == [None]
 
 
 def test_precompile_refuses_while_ir_dumps_bypass_the_disk_cache(compiles, tmp_path, monkeypatch):

@@ -59,6 +59,8 @@ def precompile(jobs: List[CompileJob], workers: int) -> List[Optional[str]]:
     ``fx.Stream(None)`` and ``@fx.struct`` instances as their field values, which specialize a kernel exactly as
     the originals do.
     """
+    if workers < 1:
+        raise ValueError(f"precompile needs at least one worker, got {workers}")
     reason = why_no_disk_cache()
     if reason is not None:
         raise RuntimeError(f"precompile needs the JIT disk cache: {reason}")
@@ -247,18 +249,20 @@ def _run_workers(tasks, count, modules, results):
                 results_read, results_write = os.pipe()
                 workers.append((os.fdopen(jobs_write, "wb"), os.fdopen(results_read, "rb")))
                 worker_ends.append((jobs_read, results_write))
-            # Set sys.path outright: python -c would put the working directory in front of it.
+            # Set sys.path outright: python -c would put the working directory in front of it. Its entries may be
+            # path objects, whose repr the template could not evaluate.
+            path = [os.fspath(entry) for entry in sys.path]
             command = [
                 sys.executable,
                 "-c",
-                f"import sys; sys.path[:] = {sys.path!r}; from flydsl.compiler.precompile import _template_main; "
+                f"import sys; sys.path[:] = {path!r}; from flydsl.compiler.precompile import _template_main; "
                 f"_template_main({os.getpid()}, {modules!r}, {status_write}, {worker_ends[1:]!r})",
             ]
             # Its own session, so the workers form a process group that can be killed together.
             fds = [fd for ends in worker_ends for fd in ends]
             template = subprocess.Popen(command, pass_fds=fds, env=env, start_new_session=True)
         except OSError as error:
-            failure = f"cannot start a compile worker: {error}"
+            failure = f"cannot start {count} compile workers: {error}"
         finally:
             for ends in worker_ends:
                 for fd in ends:
