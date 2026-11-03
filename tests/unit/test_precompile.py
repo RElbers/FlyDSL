@@ -185,6 +185,21 @@ def test_jobs_left_when_every_worker_died_compile_in_new_workers(compiles):
     assert errors == ["the compile worker exited"] * 2 + [None] * 4
 
 
+def test_a_worker_dying_while_earlier_workers_compile_is_seen_at_once(compiles):
+    # Each worker must hold only its own pipe ends: one that kept a later worker's result end open would hide
+    # that worker's death from the caller, which would then wait for it forever.
+    jobs = [CompileJob(rmsnorm_direct, (_SleepsInTheWorker(3),)) for _ in range(2)]
+    jobs += [CompileJob(rmsnorm_direct, (_ExitsTheWorker(),)) for _ in range(2)]
+    errors = []
+    call = threading.Thread(target=lambda: errors.extend(precompile(jobs, workers=4)), daemon=True)
+
+    call.start()
+    call.join(timeout=60)
+
+    assert not call.is_alive()
+    assert errors[2:] == ["the compile worker exited"] * 2
+
+
 def test_precompile_refuses_an_empty_cache_directory(compiles, monkeypatch):
     monkeypatch.setenv("FLYDSL_RUNTIME_CACHE_DIR", "")
 
