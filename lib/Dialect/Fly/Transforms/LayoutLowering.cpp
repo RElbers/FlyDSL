@@ -2177,6 +2177,8 @@ public:
     Value src = op.getSrc();
     Value dst = op.getDst();
     Value pred = op.getPred();
+    ArrayAttr aliasScopes = op.getAliasScopesAttr();
+    ArrayAttr noaliasScopes = op.getNoaliasScopesAttr();
 
     auto predMemRefTy = pred ? cast<fly::MemRefType>(pred.getType()) : nullptr;
 
@@ -2236,7 +2238,8 @@ public:
           if (isa<fly::MemRefType>(dst.getType()))
             dst = DecompositionOp::create(rewriter, loc, dst);
         }
-        CopyAtomCall::create(rewriter, loc, copyAtomVal, src, dst, pred);
+        CopyAtomCall::create(rewriter, loc, copyAtomVal, src, dst, pred, aliasScopes,
+                             noaliasScopes);
         rewriter.eraseOp(op);
         return success();
       }
@@ -2266,7 +2269,8 @@ public:
       if (srcLayoutAttr.getShape().isLeaf()) {
         Value srcDecomposition = DecompositionOp::create(rewriter, loc, src);
         Value dstDecomposition = DecompositionOp::create(rewriter, loc, dst);
-        CopyAtomCall::create(rewriter, loc, copyAtomVal, srcDecomposition, dstDecomposition, pred);
+        CopyAtomCall::create(rewriter, loc, copyAtomVal, srcDecomposition, dstDecomposition, pred,
+                             aliasScopes, noaliasScopes);
         rewriter.eraseOp(op);
         return success();
       }
@@ -2274,7 +2278,8 @@ public:
       Value dstUnwrapped = GetOp::create(rewriter, loc, dst, ArrayRef<int32_t>{0});
       Value predUnwrapped =
           pred ? GetOp::create(rewriter, loc, pred, ArrayRef<int32_t>{0}) : nullptr;
-      CopyOp::create(rewriter, loc, copyAtomVal, srcUnwrapped, dstUnwrapped, predUnwrapped);
+      CopyOp::create(rewriter, loc, copyAtomVal, srcUnwrapped, dstUnwrapped, predUnwrapped,
+                     aliasScopes, noaliasScopes);
       rewriter.eraseOp(op);
       return success();
     }
@@ -2308,7 +2313,8 @@ public:
       if (pred)
         predSlice = SliceOp::create(rewriter, loc, predGrouped, coord);
 
-      CopyOp::create(rewriter, loc, copyAtomVal, srcSlice, dstSlice, predSlice);
+      CopyOp::create(rewriter, loc, copyAtomVal, srcSlice, dstSlice, predSlice, aliasScopes,
+                     noaliasScopes);
     }
     rewriter.eraseOp(op);
     return success();
