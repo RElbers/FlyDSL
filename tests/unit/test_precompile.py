@@ -90,7 +90,7 @@ def test_compiled_jobs_load_from_the_disk_cache(compiles):
     assert compiles == []
 
 
-def test_workers_exit_when_their_jobs_are_done(compiles, monkeypatch):
+def test_workers_fork_from_one_interpreter_and_exit_when_their_jobs_are_done(compiles, monkeypatch):
     started = []
     popen = subprocess.Popen
 
@@ -100,10 +100,11 @@ def test_workers_exit_when_their_jobs_are_done(compiles, monkeypatch):
 
     monkeypatch.setattr(precompile_module.subprocess, "Popen", recorded)
 
-    precompile([_rmsnorm_job(256), _rmsnorm_job(512)], workers=2)
+    assert precompile([_rmsnorm_job(256), _rmsnorm_job(512)], workers=2) == [None, None]
 
-    assert len(started) == 2
-    assert all(worker.poll() is not None for worker in started)
+    # The interpreter the workers fork from exits once it has waited for all of them.
+    assert len(started) == 1
+    assert started[0].returncode == 0
 
 
 class _ExitsTheWorker:

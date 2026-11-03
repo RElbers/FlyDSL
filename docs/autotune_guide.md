@@ -90,9 +90,10 @@ would get at that point.
 `precompile` raises when the disk cache is off or IR dumps (`FLYDSL_DUMP_IR`,
 `FLYDSL_DEBUG_DUMP_ASM`) bypass it.
 
-Workers are fresh interpreters that import FlyDSL and the kernel module, which
-takes about two seconds and a few hundred MB of host memory each, and exit when
-the call returns. It finishes no sooner than its slowest job compiles.
+The workers are forked from one fresh interpreter that imports FlyDSL and the
+kernels' modules once, which takes about two seconds, so they share those
+imports. Each uses a few hundred MB of host memory while it compiles, and all
+exit when the call returns. It finishes no sooner than its slowest job compiles.
 
 Because a worker imports the kernel module afresh, it compiles against the
 module's state at import. A captured module-level object other than a constant

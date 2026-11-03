@@ -3,16 +3,19 @@
 
 """Compile many kernel specializations into the JIT disk cache in parallel worker processes.
 
-The workers are fresh interpreters that only import FlyDSL and the kernels' modules, so they never run
-the caller's script. A later call to a compiled specialization then loads it from the disk cache instead
-of compiling it.
+The workers are forked from a fresh interpreter that only imports FlyDSL and the kernels' modules, so they
+never run the caller's script and share those imports. A later call to a compiled specialization then loads it
+from the disk cache instead of compiling it.
 """
 
+import contextlib
+import importlib
 import io
 import os
 import pickle
 import pkgutil
 import queue
+import signal
 import subprocess
 import sys
 import threading
@@ -60,22 +63,24 @@ def precompile(jobs: List[CompileJob], workers: int) -> List[Optional[str]]:
         raise RuntimeError(f"precompile needs the JIT disk cache: {reason}")
     results: List[Optional[str]] = [None] * len(jobs)
     tasks = queue.Queue()
+    modules = set()
     for index, job in enumerate(jobs):
         payload = io.BytesIO()
         try:
             # A factory's jit function gets its own hints from the factory, which runs in the worker.
             fn_hints = job.fn.compile_hints if job.factory_kwargs is None else None
             hints = merge_compile_hints(CompilationContext.get_compile_hints(), job.compile_hints)
-            call = (_importable_name(job.fn), job.factory_kwargs, fn_hints, job.args, job.kwargs, hints)
-            _JobPickler(payload).dump(call)
+            name = _importable_name(job.fn)
+            _JobPickler(payload).dump((name, job.factory_kwargs, fn_hints, job.args, job.kwargs, hints))
         except Exception as error:
             results[index] = f"cannot send to a compile worker: {error}"
             continue
         tasks.put((index, payload.getvalue()))
+        modules.add(name.partition(":")[0])
     if tasks.empty():
         return results
 
-    _run_workers(tasks, min(workers, tasks.qsize()), results)
+    _run_workers(tasks, min(workers, tasks.qsize()), sorted(modules), results)
     return results
 
 
@@ -145,69 +150,132 @@ def _compile(payload):
     return None
 
 
-def _worker_main():
-    """Entry point of a compile worker: compile the jobs read from stdin until it closes.
+def _template_main(modules, worker_ends):
+    """Entry point of the process the compile workers fork from.
 
-    Results go back on a private copy of stdout; stdout itself is pointed at stderr, so whatever a
-    compile prints cannot corrupt them.
+    It imports what every worker needs once, so the workers share it instead of each importing it, then forks one
+    worker per ``(jobs, results)`` pair of pipe ends in ``worker_ends`` and waits for them. It is a fresh interpreter
+    that never starts a GPU runtime or a thread, which is what makes forking it safe.
     """
-    results = os.fdopen(os.dup(1), "wb")
-    os.dup2(2, 1)
+    os.dup2(2, 1)  # whatever a compile prints goes to stderr
+    for module in modules:
+        try:
+            importlib.import_module(module)
+        except Exception:
+            pass  # each of its jobs reports the error when its worker imports the module again
+    for index, (jobs_fd, results_fd) in enumerate(worker_ends):
+        try:
+            pid = os.fork()
+        except OSError:
+            pid = None  # closing this worker's ends below tells the caller it is gone
+        if pid == 0:
+            # A worker holds only its own ends, so the caller sees end of file on a result pipe whose worker died.
+            for later in worker_ends[index + 1 :]:
+                for fd in later:
+                    os.close(fd)
+            try:
+                _worker_main(jobs_fd, results_fd)
+            finally:
+                os._exit(0)
+        os.close(jobs_fd)
+        os.close(results_fd)
+    while True:
+        try:
+            os.wait()
+        except ChildProcessError:
+            return
+
+
+def _worker_main(jobs_fd, results_fd):
+    """Compile the jobs read from ``jobs_fd`` until it closes, writing each result to ``results_fd``."""
+    jobs = os.fdopen(jobs_fd, "rb")
+    results = os.fdopen(results_fd, "wb")
     while True:
         try:
             # Each job arrives as bytes, so one that does not unpickle fails in _compile, not here.
-            payload = pickle.load(sys.stdin.buffer)
+            payload = pickle.load(jobs)
         except EOFError:
             return
         pickle.dump(_compile(payload), results)
         results.flush()
 
 
-def _run_workers(tasks, count, results):
-    # Set sys.path outright: python -c would put the working directory in front of it.
-    command = [
-        sys.executable,
-        "-c",
-        f"import sys; sys.path[:] = {sys.path!r}; from flydsl.compiler.precompile import _worker_main; _worker_main()",
-    ]
+def _run_workers(tasks, count, modules, results):
     # Compiling uses neither pool, but torch and numpy start one thread per core for them at import, and those
-    # threads spin and compete with the other workers' compiles.
+    # threads spin and compete with the other workers' compiles. The template must not have threads to fork.
     env = dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1")
-    workers = []
+    workers = []  # this process's (jobs, results) ends of each worker's pipes
+    worker_ends = []
+    template = None
     unsent = "no compile worker was left to compile it"
+    answered = False
     try:
-        while len(workers) < count:
-            try:
-                workers.append(subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env))
-            except OSError as error:
-                unsent = f"cannot start a compile worker: {error}"
-                break
-        drivers = [threading.Thread(target=_drive, args=(worker, tasks, results)) for worker in workers]
-        for driver in drivers:
-            driver.start()
-        for driver in drivers:
-            driver.join()
+        try:
+            for _ in range(count):
+                jobs_read, jobs_write = os.pipe()
+                results_read, results_write = os.pipe()
+                workers.append((os.fdopen(jobs_write, "wb"), os.fdopen(results_read, "rb")))
+                worker_ends.append((jobs_read, results_write))
+            # Set sys.path outright: python -c would put the working directory in front of it.
+            command = [
+                sys.executable,
+                "-c",
+                f"import sys; sys.path[:] = {sys.path!r}; from flydsl.compiler.precompile import _template_main; "
+                f"_template_main({modules!r}, {worker_ends!r})",
+            ]
+            # Its own session, so the workers form a process group that can be killed together.
+            fds = [fd for ends in worker_ends for fd in ends]
+            template = subprocess.Popen(command, pass_fds=fds, env=env, start_new_session=True)
+        except OSError as error:
+            unsent = f"cannot start a compile worker: {error}"
+        finally:
+            for ends in worker_ends:
+                for fd in ends:
+                    os.close(fd)
+        if template is not None:
+            drivers = [threading.Thread(target=_drive, args=(worker, tasks, results)) for worker in workers]
+            for driver in drivers:
+                driver.start()
+            for driver in drivers:
+                driver.join()
+            answered = True
     finally:
-        # Every job sent has been answered unless this call was interrupted, so no compile is cut short.
-        for worker in workers:
-            worker.kill()
-            worker.wait()
+        # Idle workers exit when their job pipes close; a call that was interrupted stops them mid-compile.
+        for pipes in workers:
+            for pipe in pipes:
+                _close(pipe)
+        if template is not None:
+            try:
+                template.wait(timeout=30 if answered else 0)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(template.pid, signal.SIGKILL)
+                template.wait()
     while not tasks.empty():
         results[tasks.get_nowait()[0]] = unsent
 
 
 def _drive(worker, tasks, results):
+    jobs, worker_results = worker
     while True:
         try:
             index, payload = tasks.get_nowait()
         except queue.Empty:
             return
         try:
-            pickle.dump(payload, worker.stdin)
-            worker.stdin.flush()
-            results[index] = pickle.load(worker.stdout)
+            pickle.dump(payload, jobs)
+            jobs.flush()
+            results[index] = pickle.load(worker_results)
         except Exception:
-            # Also a worker whose output is not a result, which it can no longer be trusted to answer.
+            # Also a worker whose output is not a result, which it can no longer be trusted to answer; closing its
+            # pipes makes it exit.
             results[index] = "the compile worker exited"
-            worker.kill()
+            _close(jobs)
+            _close(worker_results)
             return
+
+
+def _close(pipe):
+    # Closing flushes what is left to write, which fails once the worker at the other end is gone.
+    with contextlib.suppress(OSError):
+        pipe.close()
