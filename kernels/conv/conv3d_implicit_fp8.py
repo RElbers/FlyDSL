@@ -26,6 +26,7 @@ from flydsl.expr.rocdl.universal import make_buffer_ptr
 from flydsl.expr.typing import Vector as Vec
 from kernels.gemm.fp8_gemm_8wave import TiledMmaDriver
 from kernels.gemm.fp8_gemm_utils import (
+    DMA_FENCE_MASK,
     G2SLoader,
     S2RLoader,
     compute_global_swizzle,
@@ -453,7 +454,6 @@ def compile_conv3d_implicit_fp8(n, c, d, h, width, k, kt, kh, kw, st, sh, sw, pt
         # (row_g, col_g), so the element stored must be A[swizzle_128(row_g, col_g)] for
         # S2RLoader to round-trip. Mirrors G2SLoader._lds_dst_at exactly.
         g2s_atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
-        LdsPtr_t = fx.PointerType.get(f8_ir_t, 2, 512)
 
         # Diagnostic only: swap the im2col address for a plain linear GEMM read to isolate
         # the pure-GEMM cost. Produces INCORRECT output.
@@ -487,11 +487,11 @@ def compile_conv3d_implicit_fp8(n, c, d, h, width, k, kt, kh, kw, st, sh, sw, pt
                     safe = fx.Int32((m_row < fx.Int64(npq)).select(lin, fx.Int64(OOB_SENTINEL_ELEM)))
                 else:
                     safe = im2col_safe_elem_pre(spatial, k_base + cc, k_iter)
-                base_i32 = fx.Int32(fx.ptrtoint(lds_dst.ptr)) + fx.Int32(step_off)
-                lds_ptr = fx.inttoptr(LdsPtr_t, base_i32)
-                dst = fx.make_view(lds_ptr, fx.make_layout(1, 1))
+                dst = fx.make_view(fx.add_offset(lds_dst.ptr, step_off), fx.make_layout(1, 1))
                 src = fx.slice(x_div, (None, fx.Int32(safe)))
+                fx.rocdl.sched_barrier(DMA_FENCE_MASK)
                 fx.copy(g2s_atom, src, dst)
+                fx.rocdl.sched_barrier(DMA_FENCE_MASK)
 
         # ---- B G2S: plain KTRSC (k, crs_pad) matrix -> reuse the GEMM loader verbatim ----
         # Row stride is crs_pad, so the tail tile reads the host's zero-pad.
