@@ -45,22 +45,21 @@ CONFIGS = [Config(BLOCK_THREADS=256), Config(BLOCK_THREADS=512), Config(BLOCK_TH
 
 @pytest.fixture
 def compiles(tmp_path, monkeypatch):
-    """The functions traced and compiled in this process, starting from an empty cache in ``tmp_path``."""
+    """The functions compiled in this process, starting from an empty cache in ``tmp_path``."""
     monkeypatch.setenv("FLYDSL_RUNTIME_CACHE_DIR", str(tmp_path / "jit"))
     monkeypatch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "1")
     for kernel in (rmsnorm_direct, gemm_a16w16_gfx950):
         monkeypatch.setattr(kernel, "_mem_cache", {})
-        monkeypatch.setattr(kernel, "_call_state_cache", {})
         monkeypatch.setattr(kernel, "cache_manager", None)
-        monkeypatch.setattr(kernel, "manager_key", None)
     compiled = []
-    trace_and_compile = jit_function.JitFunction._trace_and_compile
+    compile_module = jit_function.MlirCompiler.compile
 
-    def counted(self, *args, **kwargs):
-        compiled.append(self.func.__name__)
-        return trace_and_compile(self, *args, **kwargs)
+    # Every call traces; only a cache miss reaches MlirCompiler.compile.
+    def counted(asm, *, func_name, config):
+        compiled.append(func_name)
+        return compile_module(asm, func_name=func_name, config=config)
 
-    monkeypatch.setattr(jit_function.JitFunction, "_trace_and_compile", counted)
+    monkeypatch.setattr(jit_function.MlirCompiler, "compile", counted)
     return compiled
 
 
@@ -434,7 +433,7 @@ def _rmsnorm_with_a_post_load_step(x: fx.Tensor, gamma: fx.Tensor, out: fx.Tenso
 def test_a_kernel_the_disk_cache_does_not_keep_fails_to_compile_into_it(compiles):
     job = _rmsnorm_job(256)
 
-    with pytest.raises(RuntimeError, match="the disk cache does not keep"):
+    with pytest.raises(RuntimeError, match="post-load initializers"):
         _rmsnorm_with_a_post_load_step._compile_to_disk_cache(*job.args)
 
 

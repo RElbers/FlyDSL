@@ -107,17 +107,17 @@ every shape you will tune, into one call.
 that run with `FLYDSL_RUNTIME_RUN_ONLY=1`. Build the jobs from CPU tensors, set
 `ARCH` and `FLYDSL_GPU_ARCH` to the target, and run on a machine with no GPU or
 one of that architecture, since tracing can query the GPU it finds. The machines
-loading the cache need the same FlyDSL build, kernel source and cache-relevant
-environment variables, and calls that specialize the same way. Kernels that link
-external code (`link_extern`) are never written to the cache.
+loading the cache need the same FlyDSL build and cache-relevant environment
+variables, and calls that trace to the same IR. Kernels with post-load
+initializers, such as a `link_extern` with a `module_init_fn`, are never written
+to the cache.
 
 Because a worker imports the kernel module afresh, it compiles against the
-module's state at import. A captured module-level object other than a constant
-is keyed only by its type, so if the caller changes it after import, the worker
-compiles the old value and a later call loads that artifact as current. Do not
-precompile a kernel that reads such state. Nor can a kernel module that starts
-the GPU runtime when imported, for example by querying the device at module
-level, be precompiled: workers forked from it could not use the runtime, so each
+module's state at import. If the caller has changed state the kernel reads since
+then, the worker's artifact traces to different IR and so has a different key:
+the call compiles as usual instead of loading it. A kernel module that starts the
+GPU runtime when imported, for example by querying the device at module level,
+cannot be precompiled: workers forked from it could not use the runtime, so each
 of its jobs is reported instead.
 
 ## Candidate correctness gate
