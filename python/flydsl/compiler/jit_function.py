@@ -11,7 +11,7 @@ import threading
 import time
 import types
 from collections import namedtuple
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import lru_cache, partial
 from pathlib import Path
@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, List, Optional
 from .._mlir import ir
 from .._mlir.dialects import func
 from .._mlir.passmanager import PassManager
-from ..expr.meta import tracing_context
+from ..expr.meta import source_locations, tracing_context
 from ..expr.typing import Constexpr, Stream
 from ..utils import env, log
 from ..utils.file import atomic_write
@@ -1181,10 +1181,10 @@ class JitFunction:
 
         tracing = effective_hints.get("ktrace", env.ktrace.enable)
         names_lock = name_assignment_lock() if tracing else nullcontext()
-        with names_lock, _create_mlir_context() as ctx, CompilationContext.compile_hints(effective_hints):
-            # Every ordinary JIT/compile request traces before ANY artifact hit.
-            # Only an explicit CompiledFunction skips tracing on invocation.
-            traced = self._trace(ctx, sig, bound, bound_self, execute=execute)
+
+        def trace_and_look_up(ctx, with_locations):
+            with source_locations(with_locations):
+                traced = self._trace(ctx, sig, bound, bound_self, execute=execute)
             asm, config = MlirCompiler.prepare(
                 traced.module,
                 backend=backend,
@@ -1208,6 +1208,25 @@ class JitFunction:
                 compiled_func = manager.get(disk_key)
             if compiled_func is not None and not accept_cached(compiled_func):
                 compiled_func = None
+            return traced, config, cache_key, manager, disk_key, compiled_func
+
+        with names_lock, CompilationContext.compile_hints(effective_hints), ExitStack() as mlir_contexts:
+            # Every ordinary JIT/compile request traces before ANY artifact hit.
+            # Only an explicit CompiledFunction skips tracing on invocation.
+            # The key holds source locations only with debug info, so a hit is served from a
+            # trace that skips them. A miss traces again with them for lowering, and so does an
+            # MLIR error, whose diagnostics point at the user's source. Each trace gets its own
+            # context, since a context renames a dialect resource whose name it already holds.
+            looked_up = None
+            if not env.debug.enable_debug_info:
+                try:
+                    looked_up = trace_and_look_up(mlir_contexts.enter_context(_create_mlir_context()), False)
+                except Exception as exc:
+                    if not _cites_ir_locations(exc):
+                        raise
+            if looked_up is None or looked_up[-1] is None:
+                looked_up = trace_and_look_up(mlir_contexts.enter_context(_create_mlir_context()), True)
+            traced, config, cache_key, manager, disk_key, compiled_func = looked_up
 
             if compiled_func is None:
                 if env.runtime.run_only:
@@ -1275,6 +1294,15 @@ class JitFunction:
         compiled._backend = self._backend_target.backend
         compiled._aot_spec, compiled._aot_error = _prepare_aot_signature(self, bound, artifact)
         return compiled
+
+
+def _cites_ir_locations(exc: BaseException) -> bool:
+    """Whether *exc*, or an exception it was raised from, reports MLIR diagnostics and their locations."""
+    while exc is not None:
+        if isinstance(exc, (ir.MLIRError, DSLCompileError)):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
 
 
 def _ensure_stream_arg(jit_args: list) -> bool:
