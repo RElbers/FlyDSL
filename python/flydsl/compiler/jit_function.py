@@ -4,6 +4,7 @@
 import ctypes
 import hashlib
 import inspect
+import io
 import json
 import os
 import pickle
@@ -11,7 +12,7 @@ import threading
 import time
 import types
 from collections import namedtuple
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import lru_cache, partial
 from pathlib import Path
@@ -20,7 +21,7 @@ from typing import Any, Callable, Dict, List, Optional
 from .._mlir import ir
 from .._mlir.dialects import func
 from .._mlir.passmanager import PassManager
-from ..expr.meta import tracing_context
+from ..expr.meta import source_locations, tracing_context
 from ..expr.typing import Constexpr, Stream
 from ..utils import env, log
 from ..utils.file import atomic_write
@@ -506,11 +507,13 @@ def _run_pass_manager(pm: PassManager, module: ir.Module) -> None:
             raise DSLCompileError(str(exc), diagnostics=diags) from exc
 
 
-def _artifact_cache_key(asm: str, cfg: PipelineConfig, backend, *, link_libs=None, post_load_processors=()) -> str:
+def _artifact_cache_key(
+    module_ir: bytes, cfg: PipelineConfig, backend, *, link_libs=None, post_load_processors=()
+) -> str:
     """Identify the lowering input and loaded-module initialization within this process.
 
-    ``asm`` is the prepared module text, omitting source locations when DWARF
-    is disabled. Lowering retains locations for diagnostics. Do not elide
+    ``module_ir`` is the prepared module bytecode, omitting source locations when
+    DWARF is disabled. Lowering retains locations for diagnostics. Do not elide
     constants/resources or canonicalize away attributes. ``backend.hash()``
     may carry live toolchain configuration, so it is read per request; the loaded
     compiler files cannot change in-process, so only :func:`_disk_cache_key`
@@ -539,7 +542,7 @@ def _artifact_cache_key(asm: str, cfg: PipelineConfig, backend, *, link_libs=Non
             for proc in post_load_processors
         ]
     key = hashlib.sha256(json.dumps(config, sort_keys=True, separators=(",", ":")).encode())
-    key.update(asm.encode())
+    key.update(module_ir)
     return key.hexdigest()
 
 
@@ -548,22 +551,42 @@ def _disk_cache_key(artifact_key: str) -> str:
     return hashlib.sha256(f"{_flydsl_key()}\n{artifact_key}".encode()).hexdigest()
 
 
+def _key_bytecode(module: ir.Module, *, strip_locations: bool) -> bytes:
+    """Serialize *module* for the artifact key, without its source locations if asked.
+
+    Bytecode version 2 predates use-list orders, which record the order the IR was
+    built in rather than what it is, and which the text form never held either.
+    """
+    op = module.operation
+    if strip_locations:
+        op = op.clone()
+        pm = PassManager.parse("builtin.module(strip-debuginfo)", context=module.context)
+        pm.enable_verifier(False)
+        pm.run(op)
+    buffer = io.BytesIO()
+    op.write_bytecode(buffer, desired_version=2)
+    return buffer.getvalue()
+
+
 class MlirCompiler:
     @classmethod
-    def prepare(cls, module: ir.Module, *, backend, compile_hints: dict, link_libs=None):
-        """Render the exact lowering input: hinted module text and resolved pipeline.
+    def prepare(cls, module: ir.Module, *, backend, compile_hints: dict, link_libs=None, located: bool = True):
+        """Render the key input of the lowering: hinted module bytecode and resolved pipeline.
 
-        The text follows the cache location policy. On a miss, :meth:`compile`
-        parses the same prepared module with source locations for diagnostics.
+        The bytecode follows the cache location policy. A *located* module is the one
+        a miss lowers, so it is verified first. A module traced without source
+        locations is only hashed: an invalid one matches no artifact, and the located
+        trace that follows the miss reports the error.
         """
-        try:
-            module.operation.verify()
-        except ir.MLIRError as exc:
-            records = diag_records_from_mlir_error(exc)
-            raise DSLCompileError("MLIR verification failed", diagnostics=records) from exc
+        if located:
+            try:
+                module.operation.verify()
+            except ir.MLIRError as exc:
+                records = diag_records_from_mlir_error(exc)
+                raise DSLCompileError("MLIR verification failed", diagnostics=records) from exc
 
         backend.lower_compile_hints(module, compile_hints=compile_hints)
-        asm = module.operation.get_asm(enable_debug_info=env.debug.enable_debug_info, assume_verified=True)
+        module_ir = _key_bytecode(module, strip_locations=located and not env.debug.enable_debug_info)
         cfg = _pipeline_fragments_for_mode(backend, compile_hints=compile_hints)
         if cfg.external and link_libs:
             raise RuntimeError(
@@ -575,11 +598,11 @@ class MlirCompiler:
             cfg.fragments, found = _append_link_lib_options_to_attach_targets(cfg.fragments, link_opt)
             if not found:
                 raise RuntimeError("link_libs specified but no attach-target fragment found in pipeline")
-        return asm, cfg
+        return module_ir, cfg
 
     @classmethod
     def compile(cls, asm: str, *, func_name: str, config: PipelineConfig) -> ir.Module:
-        """Lower the text and configuration resolved by :meth:`prepare`."""
+        """Lower the module text with the configuration resolved by :meth:`prepare`."""
         module = ir.Module.parse(asm)
         fragments = config.fragments
         pre_binary_fragments = config.pre_binary
@@ -1175,18 +1198,19 @@ class JitFunction:
 
         tracing = effective_hints.get("ktrace", env.ktrace.enable)
         names_lock = name_assignment_lock() if tracing else nullcontext()
-        with names_lock, _create_mlir_context() as ctx, CompilationContext.compile_hints(effective_hints):
-            # Every ordinary JIT/compile request traces before ANY artifact hit.
-            # Only an explicit CompiledFunction skips tracing on invocation.
-            traced = self._trace(ctx, sig, bound, bound_self, execute=execute)
-            asm, config = MlirCompiler.prepare(
+
+        def trace_and_look_up(ctx, with_locations):
+            with source_locations(with_locations):
+                traced = self._trace(ctx, sig, bound, bound_self, execute=execute)
+            module_ir, config = MlirCompiler.prepare(
                 traced.module,
                 backend=backend,
                 compile_hints=effective_hints,
                 link_libs=traced.link_libs,
+                located=with_locations,
             )
             cache_key = _artifact_cache_key(
-                asm,
+                module_ir,
                 config,
                 backend,
                 link_libs=traced.link_libs,
@@ -1202,6 +1226,25 @@ class JitFunction:
                 compiled_func = manager.get(disk_key)
             if compiled_func is not None and not accept_cached(compiled_func):
                 compiled_func = None
+            return traced, config, cache_key, manager, disk_key, compiled_func
+
+        with names_lock, CompilationContext.compile_hints(effective_hints), ExitStack() as mlir_contexts:
+            # Every ordinary JIT/compile request traces before ANY artifact hit.
+            # Only an explicit CompiledFunction skips tracing on invocation.
+            # The key holds source locations only with debug info, so a hit is served from a
+            # trace that skips them. A miss traces again with them for lowering, and so does an
+            # MLIR error, whose diagnostics point at the user's source. Each trace gets its own
+            # context, since a context renames a dialect resource whose name it already holds.
+            looked_up = None
+            if not env.debug.enable_debug_info:
+                try:
+                    looked_up = trace_and_look_up(mlir_contexts.enter_context(_create_mlir_context()), False)
+                except Exception as exc:
+                    if not _cites_ir_locations(exc):
+                        raise
+            if looked_up is None or looked_up[-1] is None:
+                looked_up = trace_and_look_up(mlir_contexts.enter_context(_create_mlir_context()), True)
+            traced, config, cache_key, manager, disk_key, compiled_func = looked_up
 
             if compiled_func is None:
                 if env.runtime.run_only:
@@ -1269,6 +1312,15 @@ class JitFunction:
         compiled._backend = self._backend_target.backend
         compiled._aot_spec, compiled._aot_error = _prepare_aot_signature(self, bound, artifact)
         return compiled
+
+
+def _cites_ir_locations(exc: BaseException) -> bool:
+    """Whether *exc*, or an exception it was raised from, reports MLIR diagnostics and their locations."""
+    while exc is not None:
+        if isinstance(exc, (ir.MLIRError, DSLCompileError)):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
 
 
 def _ensure_stream_arg(jit_args: list) -> bool:

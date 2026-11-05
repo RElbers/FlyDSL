@@ -88,3 +88,21 @@ def test_compile_error_points_at_the_kernel(monkeypatch):
     first = raised.value.diagnostics[0]
     assert "unrealized_conversion_cast" in first.message
     assert first.chain[0].filename == __file__
+
+
+@pytest.mark.l1a_compile_no_target_dialect
+def test_verifier_error_points_at_the_source_without_debug_info(monkeypatch):
+    for name, value in {"ARCH": "gfx942", "COMPILE_ONLY": "1", "FLYDSL_RUNTIME_ENABLE_CACHE": "0"}.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("FLYDSL_DEBUG_ENABLE_DEBUG_INFO", raising=False)
+
+    @flyc.jit
+    def launch(x: fx.Int32):
+        # An addi without operands fails verification.
+        ir.Operation.create("arith.addi", results=[ir.IntegerType.get_signless(32)])
+
+    with pytest.raises(DSLCompileError) as raised:
+        launch(1)
+
+    assert "expected 2 operands" in raised.value.diagnostics[0].message
+    assert raised.value.diagnostics[0].chain[0].filename == __file__

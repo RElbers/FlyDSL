@@ -125,7 +125,8 @@ def _attach_attrs(op, unit_attrs: Optional[List[str]], value_attrs: Optional[Dic
 def func_def_location(func: Callable, context=None) -> ir.Location:
     """File location of *func*'s ``def`` line (the kernel/jit definition)."""
     try:
-        line = inspect.getsourcelines(func)[1]
+        # The line inspect.getsourcelines reports, without tokenizing the function's source.
+        line = inspect.findsource(inspect.unwrap(func))[1] + 1
     except (OSError, TypeError):
         line = 0
     return file_location(inspect.getfile(func), line, 0, context)
