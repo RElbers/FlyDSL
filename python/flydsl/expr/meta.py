@@ -23,6 +23,7 @@ __all__ = [
     "capture_user_location",
     "dsl_loc_tracing",
     "dsl_wrap_result",
+    "source_locations",
     "tracing_context",
     "tracing_option",
 ]
@@ -132,6 +133,17 @@ def tracing_context(func=None, **options):
             _tls.location_cache = None
 
 
+@contextlib.contextmanager
+def source_locations(enabled: bool):
+    """Build source locations as usual, or every location as unknown for IR whose locations go unread."""
+    previous = getattr(_tls, "skip_locations", False)
+    _tls.skip_locations = not enabled
+    try:
+        yield
+    finally:
+        _tls.skip_locations = previous
+
+
 def tracing_option(key, default=None):
     """Return the ambient value of *key*, innermost tracing frame first."""
     stack = getattr(_tls, "stack", None)
@@ -144,6 +156,8 @@ def tracing_option(key, default=None):
 
 def file_location(filename: str, line: int, col: int = 0, context=None) -> ir.Location:
     ctx = context or ir.Context.current
+    if getattr(_tls, "skip_locations", False):
+        return ir.Location.unknown(context=ctx)
     if filename and not filename.startswith("<"):
         filename = os.path.abspath(filename)
     return ir.Location.file(filename, line, col, context=ctx)
@@ -156,6 +170,8 @@ def capture_user_location() -> ir.Location:
     every user frame from the innermost (where the op is written) up to the
     tracing boundary.
     """
+    if getattr(_tls, "skip_locations", False):
+        return ir.Location.unknown()
     stack = getattr(_tls, "stack", None)
     boundary = stack[-1][0] if stack else None
     max_depth = env.debug.max_loc_depth
@@ -215,8 +231,8 @@ def dsl_loc_tracing(fn: "Callable[_P, _R]") -> "Callable[_P, _R]":
 
     @wraps(fn)
     def wrapper(*args: "_P.args", **kwargs: "_P.kwargs") -> "_R":
-        if getattr(_tls, "active_loc", None) is not None:
-            # Already inside a captured scope
+        if getattr(_tls, "active_loc", None) is not None or getattr(_tls, "skip_locations", False):
+            # Already inside a captured scope, or no location to capture
             return fn(*args, **kwargs)
         loc = capture_user_location()
         _tls.active_loc = loc

@@ -281,6 +281,35 @@ def launch(x: fx.Int32):
     assert a.launch.cache_manager.cache_dir == tmp_path / "cache" / "launch"
 
 
+@pytest.mark.parametrize("debug", [False, True])
+def test_only_a_miss_traces_with_source_locations(frontend, monkeypatch, debug):
+    monkeypatch.setenv("FLYDSL_DEBUG_ENABLE_DEBUG_INFO", str(int(debug)))
+    located = []
+    trace = jf.JitFunction._trace
+
+    def recording_trace(self, *args, **kwargs):
+        traced = trace(self, *args, **kwargs)
+        located.append(Path(__file__).name in traced.module.operation.get_asm(enable_debug_info=True))
+        return traced
+
+    monkeypatch.setattr(jf.JitFunction, "_trace", recording_trace)
+
+    @flyc.jit
+    def launch(x: fx.Int32):
+        # A context renames a resource whose name it already holds, so the traces must not share one.
+        tensor = jf.ir.RankedTensorType.get((4,), jf.ir.IntegerType.get_signless(32))
+        data = jf.ir.DenseResourceElementsAttr.get_from_buffer(array("i", range(4)), "weights", tensor)
+        jf.ir.Operation.create("arith.constant", results=[tensor], attributes={"value": data})
+        _ = x + 1
+
+    _compile(launch, 1)
+    launch._mem_cache.clear()
+    _compile(launch, 1)
+    # Debug info puts source locations in the key, so every trace captures them.
+    assert located == ([True, True] if debug else [False, True, False])
+    assert len(frontend) == 1
+
+
 def test_lowering_inputs_outside_the_ir_split_artifacts(frontend, monkeypatch):
     monkeypatch.delenv("LLVM_GFX1250_ANY_XNACK_CODEGEN", raising=False)
 
@@ -750,7 +779,8 @@ def test_autotune_times_jit_candidates_through_compiled_handles(frontend, monkey
 
     configs = [Config(scale=2), Config(scale=3)]
     Autotuner(launch, configs, key=["x"], warmup=2, rep=3, do_bench_fn=bench).resolve_config(5)
-    assert len(traced) == len(frontend) == 2  # One trace and compile per config.
+    # One compile per config; its miss traces without, then with source locations.
+    assert len(traced) == 2 * len(frontend) == 4
     assert len(launched) == 10 and len({id(artifact) for artifact in launched}) == 2
 
 
@@ -779,7 +809,9 @@ def test_autotune_compiles_argument_free_jit_candidates_under_their_hints(fronte
 
     configs = [Config(waves_per_eu=1), Config(waves_per_eu=2)]
     Autotuner(launch, configs, key=[], warmup=2, rep=3, do_bench_fn=bench).resolve_config()
-    assert hints == [1, 2]  # One trace per config, under that config's hints.
+    # Each trace runs under its config's hints. The first config misses and traces again with source
+    # locations; the second builds the same IR and hits its artifact.
+    assert hints == [1, 1, 2]
     assert len(launched) == 10
 
 
