@@ -218,6 +218,19 @@ def test_resource_constant_contents_are_not_elided(frontend):
     assert len(frontend) == 2
 
 
+def test_op_properties_are_in_the_key():
+    def key(flags):
+        source = f"""llvm.func @f(%p: !llvm.ptr, %i: i64) -> !llvm.ptr {{
+          %r = llvm.getelementptr {flags} %p[%i] : (!llvm.ptr, i64) -> !llvm.ptr, i8
+          llvm.return %r : !llvm.ptr
+        }}"""
+        with jf.ir.Context():
+            return jf._key_bytecode(jf.ir.Module.parse(source), strip_locations=False)
+
+    # The GEP flags are op properties, which older bytecode versions leave out.
+    assert len({key(""), key("inbounds"), key("nuw")}) == 3
+
+
 class _FakeCudaStream:
     cuda_stream = 1234
 

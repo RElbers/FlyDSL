@@ -4,6 +4,7 @@
 import ctypes
 import hashlib
 import inspect
+import io
 import json
 import os
 import pickle
@@ -512,11 +513,13 @@ def _run_pass_manager(pm: PassManager, module: ir.Module) -> None:
             raise DSLCompileError(str(exc), diagnostics=diags) from exc
 
 
-def _artifact_cache_key(asm: str, cfg: PipelineConfig, backend, *, link_libs=None, post_load_processors=()) -> str:
+def _artifact_cache_key(
+    module_ir: bytes, cfg: PipelineConfig, backend, *, link_libs=None, post_load_processors=()
+) -> str:
     """Identify the lowering input and loaded-module initialization within this process.
 
-    ``asm`` is the prepared module text, omitting source locations when DWARF
-    is disabled. Lowering retains locations for diagnostics. Do not elide
+    ``module_ir`` is the prepared module bytecode, omitting source locations when
+    DWARF is disabled. Lowering retains locations for diagnostics. Do not elide
     constants/resources or canonicalize away attributes. ``backend.hash()``
     may carry live toolchain configuration, so it is read per request; the loaded
     compiler files cannot change in-process, so only :func:`_disk_cache_key`
@@ -545,7 +548,7 @@ def _artifact_cache_key(asm: str, cfg: PipelineConfig, backend, *, link_libs=Non
             for proc in post_load_processors
         ]
     key = hashlib.sha256(json.dumps(config, sort_keys=True, separators=(",", ":")).encode())
-    key.update(asm.encode())
+    key.update(module_ir)
     return key.hexdigest()
 
 
@@ -554,13 +557,31 @@ def _disk_cache_key(artifact_key: str) -> str:
     return hashlib.sha256(f"{_flydsl_key()}\n{artifact_key}".encode()).hexdigest()
 
 
+def _key_bytecode(module: ir.Module, *, strip_locations: bool) -> bytes:
+    """Serialize *module* for the artifact key, without its source locations if asked.
+
+    Writes the current bytecode version: versions before 5 leave out op properties
+    such as inbounds or nsw, so modules that differ only in them would share a key.
+    """
+    op = module.operation
+    if strip_locations:
+        op = op.clone()
+        pm = PassManager.parse("builtin.module(strip-debuginfo)", context=module.context)
+        pm.enable_verifier(False)
+        pm.run(op)
+    buffer = io.BytesIO()
+    op.write_bytecode(buffer)
+    return buffer.getvalue()
+
+
 class MlirCompiler:
     @classmethod
-    def prepare(cls, module: ir.Module, *, backend, compile_hints: dict, link_libs=None):
-        """Render the exact lowering input: hinted module text and resolved pipeline.
+    def prepare(cls, module: ir.Module, *, backend, compile_hints: dict, link_libs=None, located: bool = True):
+        """Render the key input of the lowering: hinted module bytecode and resolved pipeline.
 
-        The text follows the cache location policy. On a miss, :meth:`compile`
-        parses the same prepared module with source locations for diagnostics.
+        The bytecode follows the cache location policy. A *located* module is the one
+        a miss lowers. Every module is verified before it is keyed, since an invalid
+        module can serialize to the same bytes as a valid one.
         """
         try:
             module.operation.verify()
@@ -569,7 +590,7 @@ class MlirCompiler:
             raise DSLCompileError("MLIR verification failed", diagnostics=records) from exc
 
         backend.lower_compile_hints(module, compile_hints=compile_hints)
-        asm = module.operation.get_asm(enable_debug_info=env.debug.enable_debug_info, assume_verified=True)
+        module_ir = _key_bytecode(module, strip_locations=located and not env.debug.enable_debug_info)
         cfg = _pipeline_fragments_for_mode(backend, compile_hints=compile_hints)
         if cfg.external and link_libs:
             raise RuntimeError(
@@ -581,11 +602,11 @@ class MlirCompiler:
             cfg.fragments, found = _append_link_lib_options_to_attach_targets(cfg.fragments, link_opt)
             if not found:
                 raise RuntimeError("link_libs specified but no attach-target fragment found in pipeline")
-        return asm, cfg
+        return module_ir, cfg
 
     @classmethod
     def compile(cls, asm: str, *, func_name: str, config: PipelineConfig) -> ir.Module:
-        """Lower the text and configuration resolved by :meth:`prepare`."""
+        """Lower the module text with the configuration resolved by :meth:`prepare`."""
         module = ir.Module.parse(asm)
         fragments = config.fragments
         pre_binary_fragments = config.pre_binary
@@ -1185,14 +1206,15 @@ class JitFunction:
         def trace_and_look_up(ctx, with_locations):
             with source_locations(with_locations):
                 traced = self._trace(ctx, sig, bound, bound_self, execute=execute)
-            asm, config = MlirCompiler.prepare(
+            module_ir, config = MlirCompiler.prepare(
                 traced.module,
                 backend=backend,
                 compile_hints=effective_hints,
                 link_libs=traced.link_libs,
+                located=with_locations,
             )
             cache_key = _artifact_cache_key(
-                asm,
+                module_ir,
                 config,
                 backend,
                 link_libs=traced.link_libs,
