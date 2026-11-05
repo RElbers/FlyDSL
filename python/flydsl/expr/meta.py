@@ -116,6 +116,7 @@ def tracing_context(func=None, **options):
     owns_cache = func is not None and getattr(_tls, "source_position_cache", None) is None
     if owns_cache:
         _tls.source_position_cache = {}
+        _tls.location_cache = {}
     boundary = getattr(func, "__code__", None)
     if boundary is None and stack:
         boundary = stack[-1][0]
@@ -128,6 +129,7 @@ def tracing_context(func=None, **options):
             stack.pop()
         if owns_cache:
             _tls.source_position_cache = None
+            _tls.location_cache = None
 
 
 def tracing_option(key, default=None):
@@ -158,9 +160,7 @@ def capture_user_location() -> ir.Location:
     boundary = stack[-1][0] if stack else None
     max_depth = env.debug.max_loc_depth
     ctx = ir.Context.current
-    locs = []
-    boundary_loc = None
-    dropped = 0
+    frames = []
 
     frame = inspect.currentframe().f_back
     try:
@@ -168,33 +168,35 @@ def capture_user_location() -> ir.Location:
             code = frame.f_code
             is_boundary = boundary is not None and code is boundary
             if not _is_framework_file(code.co_filename):
-                keep = len(locs) < max_depth
-                if keep or is_boundary:
-                    path, line, col = _frame_position(frame)
-                    floc = ir.Location.file(path, line, col, context=ctx)
-                    if keep:
-                        locs.append(floc)
-                    else:
-                        # Always keep the kernel frame: it is the top of the stack.
-                        boundary_loc = floc
-                else:
-                    dropped += 1
+                frames.append(frame)
+                if len(frames) == max_depth and not is_boundary:
+                    # Past the depth limit only the kernel frame is kept: it is the top of the stack.
+                    frame = None if boundary is None else frame.f_back
+                    while frame is not None and frame.f_code is not boundary:
+                        frame = frame.f_back
+                    if frame is not None and not _is_framework_file(frame.f_code.co_filename):
+                        frames.append(frame)
+                    break
             if is_boundary:
                 break
             frame = frame.f_back
     finally:
         del frame
 
-    # The kernel boundary frame is always kept as the outermost call-site
-    if boundary_loc is not None:
-        locs.append(boundary_loc)
-
-    if not locs:
+    if not frames:
         return ir.Location.unknown()
-    callee, callers = locs[0], locs[1:]
-    if not callers:
-        return callee
-    return ir.Location.callsite(callee, callers)
+
+    # A trace builds many ops at each source position, so it builds each chain once. The source
+    # position cache keeps the code objects alive, so their ids stay unique while this cache lives.
+    cache = getattr(_tls, "location_cache", None)
+    key = (ctx, *[(id(f.f_code), f.f_lasti) for f in frames])
+    loc = None if cache is None else cache.get(key)
+    if loc is None:
+        callee, *callers = [ir.Location.file(*_frame_position(f), context=ctx) for f in frames]
+        loc = ir.Location.callsite(callee, callers) if callers else callee
+        if cache is not None:
+            cache[key] = loc
+    return loc
 
 
 def dsl_loc_tracing(fn: "Callable[_P, _R]") -> "Callable[_P, _R]":
