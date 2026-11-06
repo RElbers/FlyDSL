@@ -53,6 +53,73 @@ declare an integer schema parameter on its entry point and list it in `key`, the
 bump it with any change that can move the winner. Softmax does this with
 `tuning_schema`.
 
+## Compiling configs in parallel
+
+`flydsl.compiler.precompile.precompile(jobs, workers)` compiles kernel
+specializations into the JIT disk cache in up to `workers` worker processes, so a
+later call to each one loads it instead of compiling it. To tune faster, compile
+a search's configs this way before it runs; the benchmark loop then only loads
+them:
+
+```python
+from flydsl.compiler.precompile import CompileJob, precompile
+
+jobs = [CompileJob(launch, args, {**kwargs, **c.all_kwargs()}, c.compiler_opts()) for c in configs]
+precompile(jobs, workers=16)
+tuned(*args, **kwargs)
+```
+
+`Config.all_kwargs()` and `Config.compiler_opts()` give a config's call the same
+arguments and compile hints the autotuner uses, so the specializations match. For
+a stacked `@autotune` / `@flyc.jit` kernel, pass the tuner's `.fn`. A `CompileJob`
+can also name a kernel factory, with `factory_kwargs` and the call of the
+launcher it returns, which covers kernels built per configuration:
+
+```python
+errors = precompile([CompileJob(build_kernel, args, factory_kwargs=cfg) for cfg in configs], workers=16)
+```
+
+The same works for a tuner from another library that calls FlyDSL kernels: run
+`precompile` first, in the same process or an earlier one with the same
+`FLYDSL_RUNTIME_CACHE_DIR`, with one job per call the tuner will make. To check
+the jobs match those calls, run the tuner once with `FLYDSL_RUNTIME_RUN_ONLY=1`:
+a call that was not precompiled then raises instead of compiling.
+
+Each entry of the result is None when the job compiled, else why not; such a
+specialization is compiled as usual when it is called. A job cannot be sent to a
+worker when its function is defined inside a function or in the script being
+run, or an argument does not pickle. Workers rebuild the call with CPU tensors of
+the same shape, strides and dtype, which specialize the kernel exactly as the
+device tensors do, rebuild an `@fx.struct` argument from its field values, which
+needs its struct type defined at module level, and add the compile hints the call
+would get at that point.
+`precompile` raises when the disk cache is off or IR dumps (`FLYDSL_DUMP_IR`,
+`FLYDSL_DEBUG_DUMP_ASM`) bypass it.
+
+The workers are forked from one fresh interpreter that imports FlyDSL and the
+kernels' modules once, which takes about two seconds, so they share those
+imports. Each uses a few hundred MB of host memory while it compiles, and all
+exit when the call returns. It finishes no sooner than its slowest job compiles.
+Since every call starts its workers again, put all the jobs you know about, for
+every shape you will tune, into one call.
+
+`precompile` needs no GPU, so it can build a cache ahead of time for machines
+that run with `FLYDSL_RUNTIME_RUN_ONLY=1`. Build the jobs from CPU tensors, set
+`ARCH` and `FLYDSL_GPU_ARCH` to the target, and run on a machine with no GPU or
+one of that architecture, since tracing can query the GPU it finds. The machines
+loading the cache need the same FlyDSL build and cache-relevant environment
+variables, and calls that trace to the same IR. Kernels with post-load
+initializers, such as a `link_extern` with a `module_init_fn`, are never written
+to the cache.
+
+Because a worker imports the kernel module afresh, it compiles against the
+module's state at import. If the caller has changed state the kernel reads since
+then, the worker's artifact traces to different IR and so has a different key:
+the call compiles as usual instead of loading it. A kernel module that starts the
+GPU runtime when imported, for example by querying the device at module level,
+cannot be precompiled: workers forked from it could not use the runtime, so each
+of its jobs is reported instead.
+
 ## Candidate correctness gate
 
 `validate_hook(sig_args)` returns a context manager around one untimed candidate
