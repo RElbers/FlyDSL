@@ -15,6 +15,7 @@ add_mlir_dialect_library(MLIRFlyDialect
   Transforms/ConvertAtomCallToSSAForm.cpp
   Transforms/PromoteRegMemToVectorSSA.cpp
   Transforms/IntSwizzleSimplify.cpp
+  Transforms/ConvertSCFToCF.cpp
 
   DEPENDS
   MLIRFlyIncGen
@@ -27,6 +28,7 @@ add_mlir_dialect_library(MLIRFlyDialect
   MLIRGPUDialect
   MLIRIR
   MLIRLLVMDialect
+  MLIRSCFToControlFlow
   MLIRSCFTransforms
   MLIRTargetLLVMIRExport
   MLIRTransforms
