@@ -525,44 +525,16 @@ class Numeric(metaclass=NumericMeta):
 
     @staticmethod
     def from_ir_type(ir_type):
-        ir2dsl_map = {
-            T.bool(): Boolean,
-            T.f64(): Float64,
-            T.f32(): Float32,
-            T.f16(): Float16,
-            T.bf16(): BFloat16,
-            T.i64(): Int64,
-            T.i32(): Int32,
-            T.i16(): Int16,
-            T.i8(): Int8,
-            T.i(4): Int4,
-            T.si64(): Int64,
-            T.si32(): Int32,
-            T.si16(): Int16,
-            T.si8(): Int8,
-            T.ui64(): Uint64,
-            T.ui32(): Uint32,
-            T.ui16(): Uint16,
-            T.ui8(): Uint8,
-            T.i(128): Int128,
-            T.si(128): Int128,
-            T.ui(128): Uint128,
-            T.f8E5M2(): Float8E5M2,
-            T.f8E4M3(): Float8E4M3,
-            T.f8E4M3FN(): Float8E4M3FN,
-            Float8E4M3FNUZ.ir_type: Float8E4M3FNUZ,  # not in upstream MLIR extras T
-            T.f8E4M3B11FNUZ(): Float8E4M3B11FNUZ,
-            T.f8E8M0FNU(): Float8E8M0FNU,
-            T.f6E2M3FN(): Float6E2M3FN,
-            T.f6E3M2FN(): Float6E3M2FN,
-            T.f4E2M1FN(): Float4E2M1FN,
-        }
+        global _NUMERIC_BY_TYPE_KEY
         # Handle IndexType specially since it maps to Index
         if isinstance(ir_type, ir.IndexType):
             return Index
-        if ir_type not in ir2dsl_map:
+        if _NUMERIC_BY_TYPE_KEY is None:
+            _NUMERIC_BY_TYPE_KEY = {_context_free_type_key(ty): cls for ty, cls in _numeric_ir_types().items()}
+        dsl_type = _NUMERIC_BY_TYPE_KEY.get(_context_free_type_key(ir_type))
+        if dsl_type is None:
             raise ValueError(f"unsupported mlir type: {ir_type}")
-        return ir2dsl_map[ir_type]
+        return dsl_type
 
     def __add__(self, other):
         return _make_binop(operator.add)(self, other)
@@ -927,6 +899,55 @@ _FLOAT_RANK = {Float64: 3, Float32: 2, Float16: 1, BFloat16: 1}
 # ── Type promotion (added to Numeric after all subclasses exist) ──────
 
 _FLOAT_BY_MIN_WIDTH = {16: Float16, 32: Float32, 64: Float64}
+
+
+def _numeric_ir_types():
+    return {
+        T.bool(): Boolean,
+        T.f64(): Float64,
+        T.f32(): Float32,
+        T.f16(): Float16,
+        T.bf16(): BFloat16,
+        T.i64(): Int64,
+        T.i32(): Int32,
+        T.i16(): Int16,
+        T.i8(): Int8,
+        T.i(4): Int4,
+        T.si64(): Int64,
+        T.si32(): Int32,
+        T.si16(): Int16,
+        T.si8(): Int8,
+        T.ui64(): Uint64,
+        T.ui32(): Uint32,
+        T.ui16(): Uint16,
+        T.ui8(): Uint8,
+        T.i(128): Int128,
+        T.si(128): Int128,
+        T.ui(128): Uint128,
+        T.f8E5M2(): Float8E5M2,
+        T.f8E4M3(): Float8E4M3,
+        T.f8E4M3FN(): Float8E4M3FN,
+        Float8E4M3FNUZ.ir_type: Float8E4M3FNUZ,  # not in upstream MLIR extras T
+        T.f8E4M3B11FNUZ(): Float8E4M3B11FNUZ,
+        T.f8E8M0FNU(): Float8E8M0FNU,
+        T.f6E2M3FN(): Float6E2M3FN,
+        T.f6E3M2FN(): Float6E3M2FN,
+        T.f4E2M1FN(): Float4E2M1FN,
+    }
+
+
+# Built on first use; a type key outlives the context the table was built in.
+_NUMERIC_BY_TYPE_KEY = None
+_INTEGER_TYPE_ID = ir.IntegerType.static_typeid
+
+
+def _context_free_type_key(ir_type):
+    """Identify a builtin type without its context: integer parameters, else the type's TypeID."""
+    type_id = ir_type.typeid
+    if type_id != _INTEGER_TYPE_ID:
+        return type_id
+    int_type = ir.IntegerType(ir_type)
+    return int_type.width, int_type.is_signed, int_type.is_unsigned
 
 
 def _widen_float(float_type, min_width):

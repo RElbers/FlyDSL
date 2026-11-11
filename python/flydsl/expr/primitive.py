@@ -241,24 +241,35 @@ def _is_int_tuple_value(value):
 
 
 def _expand_int_tuple_leaves(value):
-    from .numeric import Int32, Int64, Numeric
+    # Plain ints, values and tuples are expanded before the imports below, which cost more than they do.
+    if isinstance(value, int):
+        return value
+    if isinstance(value, ir.Value):
+        value_type = value.type
+        if isinstance(value_type, IntTupleType):
+            return _expand_int_tuple_leaves(value.to_py_value())
+        # widen narrow dynamic ints to i32
+        if isinstance(value_type, ir.IntegerType) and value_type.width < 32:
+            from .numeric import Int32
+
+            return Int32(value).value
+        if isinstance(value_type, ir.IndexType):
+            from .numeric import Int64
+
+            return Int64(value).value
+        return value
+    if isinstance(value, (list, tuple)):
+        return tuple([_expand_int_tuple_leaves(v) for v in value])
+
+    from .numeric import Int32, Numeric
     from .typing import Basis
 
-    if _is_int_tuple_value(value):
-        return _expand_int_tuple_leaves(value.to_py_value())
-    # widen narrow dynamic ints to i32
     if isinstance(value, Numeric):
         if isinstance(value.value, ir.Value) and type(value).width < 32:
             return Int32(value).value
         return _expand_int_tuple_leaves(value.value)
-    if isinstance(value, ir.Value) and isinstance(value.type, ir.IntegerType) and value.type.width < 32:
-        return Int32(value).value
-    if isinstance(value, ir.Value) and isinstance(value.type, ir.IndexType):
-        return Int64(value).value
     if isinstance(value, Basis):
         return _Basis(_expand_int_tuple_leaves(value.value), value.modes)
-    if isinstance(value, (list, tuple)):
-        return tuple(_expand_int_tuple_leaves(v) for v in value)
     return value
 
 

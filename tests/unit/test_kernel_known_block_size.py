@@ -310,7 +310,8 @@ class TestKnownBlockSizeTraceAccessor:
             _kn(x).launch(grid=(1, 1, 1), block=(128, 4, 2), stream=stream)
 
         _get_source_ir(_launch, self.x)
-        assert seen == [(128, 4, 2)]
+        # A miss traces twice: without source locations, then with them.
+        assert set(seen) == {(128, 4, 2)}
 
     def test_sees_the_size_inferred_from_static_launch_dims(self):
         seen = []
@@ -324,7 +325,7 @@ class TestKnownBlockSizeTraceAccessor:
             _kn(x).launch(grid=(1, 1, 1), block=(256, 1, 1), stream=stream)
 
         _get_source_ir(_launch, self.x)
-        assert seen == [(256, 1, 1)]
+        assert set(seen) == {(256, 1, 1)}
 
     def test_raises_for_a_dynamic_launch(self):
         @flyc.kernel
@@ -355,4 +356,4 @@ class TestKnownBlockSizeTraceAccessor:
             _kn(x).launch(grid=(1, 1, 1), block=(64, 1, 1), stream=stream)
 
         _get_source_ir(_launch, self.x)
-        assert seen == [(64, 1, 1)]
+        assert set(seen) == {(64, 1, 1)}
