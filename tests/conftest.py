@@ -150,6 +150,7 @@ _WINDOWS_SKIPS = {
     "test_external_llvm_codegen.py": "fake tools are POSIX shebang scripts",
     "test_inject_asm.py": "redirects HOME; Windows reads USERPROFILE",
     "test_compile_error_locations.py": "compares unescaped Windows paths",
+    "test_precompile.py": "precompile needs Linux and reports every job elsewhere",
 }
 
 
