@@ -282,6 +282,14 @@ calls reuse a fixed specialization without tracing. See
 [compilation and caching](kernel_authoring_guide.md#9-compilation-and-caching)
 for invalidation boundaries, external inputs, and run-only behavior.
 
+**Diagnostics.** An MLIR error from the pipeline becomes a `DSLCompileError`
+that points at the user's source. Warnings and remarks from any pass are issued
+as Python `UserWarning`s once compilation succeeds, at the user's source line when
+`FLYDSL_DEBUG_ENABLE_DEBUG_INFO=1`, otherwise with a hint to set it. They follow
+Python's warning filters, so a run with `-W error` turns them into exceptions,
+and they only appear when the kernel actually compiles, not on a JIT cache hit.
+MLIR notes are dropped.
+
 ### 3.4 Precompilation and C export
 
 `flyc.compile(launcher, *specialization_args)` uses the same tracing, lowering,
