@@ -7,11 +7,12 @@
 
 import ast
 import types
+from functools import partial
 from textwrap import dedent
 
 import pytest
 
-from flydsl._mlir.dialects import arith, func
+from flydsl._mlir.dialects import arith, func, scf
 from flydsl._mlir.ir import Context, FunctionType, InsertionPoint, IntegerType, Location, Module
 from flydsl.compiler.ast_rewriter import InsertEmptyYieldForSCFFor
 from flydsl.expr.numeric import Int32
@@ -227,33 +228,31 @@ def test_ast_rewrite_for_multi_var_generates_dispatch():
 # ---------------------------------------------------------------------------
 
 
-def _for_dispatch_ir(*, unroll=-1, unroll_full=False, prefetch_depth=None, prefetch_assume_independent=False):
-    """Build a single-iter-arg scf.for via dispatch and return its module text."""
+def _for_dispatch_ir(*, with_iter_args=True, **directives):
+    """Build an scf.for via dispatch and return its module text."""
     with Context(), Location.unknown():
         module = Module.create()
         i32 = IntegerType.get_signless(32)
         with InsertionPoint(module.body):
-            f = func.FuncOp("t", FunctionType.get([], [i32]))
+            f = func.FuncOp("t", FunctionType.get([], [i32] if with_iter_args else []))
             entry = f.add_entry_block()
             with InsertionPoint(entry):
                 acc = Int32(arith.ConstantOp(i32, 0).result)
 
-                def body_fn(iv, names, acc):
-                    return {"acc": acc + Int32(arith.ConstantOp(i32, 1).result)}
+                def body_fn(iv, names, *args):
+                    if args:
+                        return {"acc": args[0] + Int32(arith.ConstantOp(i32, 1).result)}
 
                 r = InsertEmptyYieldForSCFFor.scf_for_dispatch(
                     0,
                     8,
                     1,
                     body_fn,
-                    result_names=("acc",),
-                    result_values=(acc,),
-                    unroll=unroll,
-                    unroll_full=unroll_full,
-                    prefetch_depth=prefetch_depth,
-                    prefetch_assume_independent=prefetch_assume_independent,
+                    result_names=("acc",) if with_iter_args else (),
+                    result_values=(acc,) if with_iter_args else (),
+                    **directives,
                 )
-                func.ReturnOp([r.ir_value()])
+                func.ReturnOp([r.ir_value()] if with_iter_args else [])
         assert module.operation.verify()
         return str(module)
 
@@ -420,71 +419,82 @@ def test_no_unroll_hint_after_lowering_by_default():
 # ---------------------------------------------------------------------------
 
 
-def test_for_dispatch_prefetch_depth_attr():
-    ir_text = _for_dispatch_ir(prefetch_depth=4)
-    assert "fly.prefetch_depth = 4 : i64" in ir_text
-    assert "loop_annotation" not in ir_text
-
-
-def test_for_dispatch_no_prefetch_depth_by_default():
-    assert "fly.prefetch_depth" not in _for_dispatch_ir()
-
-
-@pytest.mark.parametrize("kwargs", [{"unroll": 4}, {"unroll": 1}, {"unroll_full": True}])
-def test_for_dispatch_prefetch_depth_with_unroll_rejected(kwargs):
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        _for_dispatch_ir(prefetch_depth=4, **kwargs)
-
-
-@pytest.mark.parametrize("depth", [0, -1, 33])
-def test_for_dispatch_prefetch_depth_out_of_range_rejected(depth):
-    with pytest.raises(ValueError, match="prefetch_depth"):
-        _for_dispatch_ir(prefetch_depth=depth)
-
-
-@pytest.mark.parametrize("depth", [True, "4", 4.0])
-def test_for_dispatch_prefetch_depth_non_int_rejected(depth):
-    with pytest.raises(TypeError, match="prefetch_depth"):
-        _for_dispatch_ir(prefetch_depth=depth)
-
-
-def test_for_dispatch_prefetch_assume_independent_attr():
-    ir_text = _for_dispatch_ir(prefetch_depth=4, prefetch_assume_independent=True)
-    assert "fly.prefetch_assume_independent" in ir_text
-    assert "fly.prefetch_assume_independent" not in _for_dispatch_ir(prefetch_depth=4)
-
-
-def test_for_dispatch_prefetch_assume_independent_requires_depth():
-    with pytest.raises(ValueError, match="requires `prefetch_depth`"):
-        _for_dispatch_ir(prefetch_assume_independent=True)
-
-
-@pytest.mark.parametrize("value", [1, "yes", None])
-def test_for_dispatch_prefetch_assume_independent_non_bool_rejected(value):
-    with pytest.raises(TypeError, match="prefetch_assume_independent"):
-        _for_dispatch_ir(prefetch_depth=4, prefetch_assume_independent=value)
-
-
-def test_scf_range_prefetch_depth_attr():
-    """The init-carrying generator path also honors prefetch_depth."""
-    from flydsl._mlir.dialects import scf
-
+def _for_range_ir(init_kind, **directives):
+    """Build through the generator path, preserving the distinction between init=[] and no init."""
     with Context(), Location.unknown():
         module = Module.create()
         i32 = IntegerType.get_signless(32)
         with InsertionPoint(module.body):
             f = func.FuncOp("t", FunctionType.get([], []))
-            entry = f.add_entry_block()
-            with InsertionPoint(entry):
-                zero = Int32(arith.ConstantOp(i32, 0).result)
-                for _iv, _args in InsertEmptyYieldForSCFFor.scf_range(
-                    0, 8, 1, init=[zero.ir_value()], prefetch_depth=2, prefetch_assume_independent=True
-                ):
-                    scf.YieldOp(list(_args))
+            with InsertionPoint(f.add_entry_block()):
+                zero = arith.ConstantOp(i32, 0).result
+                init = {"state": [zero], "empty": [], "none": None}[init_kind]
+                for item in InsertEmptyYieldForSCFFor.scf_range(0, 8, 1, init=init, **directives):
+                    scf.YieldOp(item[1] if init is not None else [])
                 func.ReturnOp([])
         assert module.operation.verify()
-        assert "fly.prefetch_depth = 2 : i64" in str(module)
-        assert "fly.prefetch_assume_independent" in str(module)
+        return str(module)
+
+
+@pytest.fixture(
+    params=[
+        pytest.param(_for_dispatch_ir, id="dispatch-state"),
+        pytest.param(partial(_for_dispatch_ir, with_iter_args=False), id="dispatch-empty"),
+        pytest.param(partial(_for_range_ir, "state"), id="range-state"),
+        pytest.param(partial(_for_range_ir, "empty"), id="range-empty"),
+        pytest.param(partial(_for_range_ir, "none"), id="range-no-init"),
+    ]
+)
+def loop_ir(request):
+    return request.param
+
+
+@pytest.mark.parametrize("depth", [1, 4, 32])
+def test_prefetch_depth_attr(loop_ir, depth):
+    ir_text = loop_ir(prefetch_depth=depth)
+    assert f"fly.prefetch_depth = {depth} : i64" in ir_text
+    assert "fly.prefetch_loc" in ir_text
+    assert "loop_annotation" not in ir_text
+
+
+def test_no_prefetch_depth_by_default(loop_ir):
+    assert "fly.prefetch_" not in loop_ir()
+
+
+@pytest.mark.parametrize("kwargs", [{"unroll": 4}, {"unroll": 1}, {"unroll_full": True}])
+def test_prefetch_depth_with_unroll_rejected(loop_ir, kwargs):
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        loop_ir(prefetch_depth=4, **kwargs)
+
+
+@pytest.mark.parametrize("depth", [0, -1, 33])
+def test_prefetch_depth_out_of_range_rejected(loop_ir, depth):
+    with pytest.raises(ValueError, match="prefetch_depth"):
+        loop_ir(prefetch_depth=depth)
+
+
+@pytest.mark.parametrize("depth", [True, "4", 4.0])
+def test_prefetch_depth_non_int_rejected(loop_ir, depth):
+    with pytest.raises(TypeError, match="prefetch_depth"):
+        loop_ir(prefetch_depth=depth)
+
+
+def test_prefetch_assume_independent_attr(loop_ir):
+    ir_text = loop_ir(prefetch_depth=4, prefetch_assume_independent=True)
+    assert "fly.prefetch_assume_independent" in ir_text
+    assert "fly.prefetch_assume_independent" not in loop_ir(prefetch_depth=4)
+
+
+def test_prefetch_assume_independent_requires_depth(loop_ir):
+    with pytest.raises(ValueError, match="requires `prefetch_depth`"):
+        loop_ir(prefetch_assume_independent=True)
+
+
+@pytest.mark.parametrize("depth", [None, 4])
+@pytest.mark.parametrize("value", [1, "yes", None])
+def test_prefetch_assume_independent_non_bool_rejected(loop_ir, depth, value):
+    with pytest.raises(TypeError, match="prefetch_assume_independent"):
+        loop_ir(prefetch_depth=depth, prefetch_assume_independent=value)
 
 
 def test_ast_rewrite_for_threads_prefetch_depth():
@@ -499,9 +509,10 @@ def test_ast_rewrite_for_threads_prefetch_depth():
 
     init_path = _rewrite_for_loops("""
         def s(n):
-            for i, (acc,) in range(0, n, 1, init=[0], prefetch_depth=8):
+            for i, (acc,) in range(0, n, 1, init=[0], prefetch_depth=8, prefetch_assume_independent=True):
                 acc = acc + 1
             return acc
         """)
     assert "scf_range(" in init_path
     assert "prefetch_depth=8" in init_path
+    assert "prefetch_assume_independent=True" in init_path

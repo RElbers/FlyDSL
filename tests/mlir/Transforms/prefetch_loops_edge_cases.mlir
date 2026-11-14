@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 FlyDSL Project Contributors
-// RUN: %fly-opt %s --pass-pipeline='builtin.module(gpu.module(fly-rocdl-prefetch-loops),canonicalize)' | FileCheck %s --implicit-check-not=fly.prefetch_depth --implicit-check-not=fly.prefetch_assume_independent
+// RUN: %fly-opt %s --pass-pipeline='builtin.module(gpu.module(fly-rocdl-prefetch-loops),canonicalize)' | FileCheck %s --implicit-check-not=fly.prefetch_depth --implicit-check-not=fly.prefetch_assume_independent --implicit-check-not=fly.prefetch_loc
 // RUN: %fly-opt %s --pass-pipeline='builtin.module(gpu.module(fly-rocdl-prefetch-loops))' -verify-diagnostics -o /dev/null
 
 // The FileCheck run adds canonicalize only to fold constant bounds and trip counts, which some
@@ -747,6 +747,60 @@ gpu.module @prefetch_edges {
       scf.yield %s : f32
     } {fly.prefetch_depth = 4 : i64}
     llvm.store %r, %out : f32, !llvm.ptr<1>
+    gpu.return
+  }
+
+  // SCF rejects a loop that yields an unchanged iter_arg. A rejection before SCF modifies the IR
+  // must remain a remark, and the prepared loop must remain valid without a pipeline prologue.
+  // CHECK-LABEL: gpu.func @rejected_without_unrolling
+  // CHECK-NOT: llvm.load
+  // CHECK: scf.for
+  // CHECK: llvm.load
+  // CHECK: llvm.store
+  // CHECK-NOT: llvm.load
+  // CHECK-NOT: scf.for
+  // CHECK: gpu.return
+  gpu.func @rejected_without_unrolling(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i64) kernel {
+    %c0 = arith.constant 0 : i64
+    %c1 = arith.constant 1 : i64
+    %init = arith.constant 0 : i32
+    // expected-remark @below {{loop not pipelined (prefetch_depth=1): the pipeliner rejected it (in rejected_without_unrolling)}}
+    %r = scf.for %i = %c0 to %n step %c1 iter_args(%carry = %init) -> i32 : i64 {
+      %p = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i64) -> !llvm.ptr<1>, i32
+      %v = llvm.load %p : !llvm.ptr<1> -> i32
+      %q = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i64) -> !llvm.ptr<1>, i32
+      llvm.store %v, %q : i32, !llvm.ptr<1>
+      scf.yield %carry : i32
+    } {fly.prefetch_depth = 1 : i64, fly.prefetch_assume_independent}
+    gpu.return
+  }
+
+  // The same rejection after unrolling retains the unrolled main loop and its serial remainder.
+  // CHECK-LABEL: gpu.func @rejected_after_unrolling
+  // CHECK: %[[STEP:.*]] = arith.constant 4 : i64
+  // CHECK-NOT: llvm.load
+  // CHECK: scf.for {{.*}} step %[[STEP]]
+  // CHECK-COUNT-4: llvm.load
+  // CHECK: llvm.store
+  // CHECK-NOT: llvm.load
+  // CHECK: scf.for
+  // CHECK: llvm.load
+  // CHECK: llvm.store
+  // CHECK-NOT: llvm.load
+  // CHECK-NOT: scf.for
+  // CHECK: gpu.return
+  gpu.func @rejected_after_unrolling(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i64) kernel {
+    %c0 = arith.constant 0 : i64
+    %c1 = arith.constant 1 : i64
+    %init = arith.constant 0 : i32
+    // expected-remark @below {{loop not pipelined (prefetch_depth=4): the pipeliner rejected it; the loop is only unrolled (in rejected_after_unrolling)}}
+    %r = scf.for %i = %c0 to %n step %c1 iter_args(%carry = %init) -> i32 : i64 {
+      %p = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i64) -> !llvm.ptr<1>, i32
+      %v = llvm.load %p : !llvm.ptr<1> -> i32
+      %q = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i64) -> !llvm.ptr<1>, i32
+      llvm.store %v, %q : i32, !llvm.ptr<1>
+      scf.yield %carry : i32
+    } {fly.prefetch_depth = 4 : i64, fly.prefetch_assume_independent}
     gpu.return
   }
 }

@@ -170,8 +170,8 @@ def test_prefetch_depth_matches_plain_range(body_name, i32_bounds, depth):
         assert all(torch.equal(a, b) for a, b in zip(got, want)), f"n={n}"
 
 
-def _launch_and_read(launch, inp, *scalars, out_init=0.0):
-    out = torch.full((BLK,), out_init, device="cuda")
+def _launch_and_read(launch, inp, *scalars, out_len=BLK, out_init=0.0):
+    out = torch.full((out_len,), out_init, device="cuda")
     launch(inp, out, *scalars, torch.cuda.current_stream())
     torch.cuda.synchronize()
     return out.cpu()
@@ -179,13 +179,9 @@ def _launch_and_read(launch, inp, *scalars, out_init=0.0):
 
 def _compare_on_sizes(reference, pipelined, inp, sizes, out_len):
     for n in sizes:
-        outs = []
-        for launch in (reference, pipelined):
-            out = torch.zeros(out_len, device="cuda")
-            launch(inp, out, n, torch.cuda.current_stream())
-            torch.cuda.synchronize()
-            outs.append(out.cpu())
-        assert torch.equal(*outs), f"n={n}"
+        want = _launch_and_read(reference, inp, n, out_len=out_len)
+        got = _launch_and_read(pipelined, inp, n, out_len=out_len)
+        assert torch.equal(got, want), f"n={n}"
 
 
 def _bounds_launcher(depth):
@@ -349,10 +345,7 @@ def _carried_offset_launcher(depth):
 def test_prefetch_depth_loop_shapes(make_launcher, sizes, depth):
     reference, pipelined = make_launcher(None), make_launcher(depth)
     inp = torch.rand(max(SIZES), device="cuda", generator=torch.Generator(device="cuda").manual_seed(0))
-    for n in sizes:
-        want = _launch_and_read(reference, inp, n)
-        got = _launch_and_read(pipelined, inp, n)
-        assert torch.equal(got, want), f"n={n}"
+    _compare_on_sizes(reference, pipelined, inp, sizes, BLK)
 
 
 def _scatter_launcher(depth):
@@ -406,10 +399,7 @@ def test_prefetch_depth_accumulator_in_memory_left_unchanged(depth, assume):
     # it the load reads the same address in every iteration, so the pass leaves it unchanged either way.
     reference, candidate = _accumulate_in_memory_launcher(None, False), _accumulate_in_memory_launcher(depth, assume)
     inp = torch.arange(1, 1025, device="cuda", dtype=torch.float32)
-    for n in (0, 1, 10, 37):
-        want = _launch_and_read(reference, inp, n)
-        got = _launch_and_read(candidate, inp, n)
-        assert torch.equal(got, want), f"n={n}"
+    _compare_on_sizes(reference, candidate, inp, (0, 1, 10, 37), BLK)
 
 
 def _buffer_loads_in_llvm_ir(launch, args, tmp_path, monkeypatch):

@@ -41,7 +41,7 @@ def _sum_launcher(depth, name):
     return launch
 
 
-def _max_loads_left_in_flight(isa):
+def _max_load_wait_threshold(isa):
     """The largest count of outstanding loads the ISA waits down to (vmcnt, or loadcnt on gfx12)."""
     counts = [int(c) for c in re.findall(r"vmcnt\((\d+)\)", isa)]
     counts += [int(c, 0) for c in re.findall(r"s_wait_loadcnt\s+(0x[0-9a-fA-F]+|\d+)", isa)]
@@ -52,7 +52,7 @@ def _compiled_isa(launch, tmp_path, monkeypatch, arch):
     monkeypatch.setenv("FLYDSL_GPU_ARCH", arch)
     monkeypatch.setenv("COMPILE_ONLY", "1")
     monkeypatch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
-    monkeypatch.setenv("FLYDSL_DUMP_IR", "1")
+    monkeypatch.setenv("FLYDSL_DEBUG_DUMP_ASM", "1")
     monkeypatch.setenv("FLYDSL_DUMP_DIR", str(tmp_path))
     launch(torch.empty(BLK * 8), torch.empty(BLK), BLK * 8)
     dumped = list(tmp_path.glob("*/*_final_isa.s"))
@@ -65,4 +65,4 @@ def test_prefetch_depth_keeps_loads_in_flight(arch, tmp_path, monkeypatch):
     # At depth 4 the pipelined loop issues 4 loads before waiting on the first: the ISA waits down
     # to 3 outstanding loads somewhere. A loop that waits for every load reaches at most 0.
     isa = _compiled_isa(_sum_launcher(4, f"prefetch_isa_{arch}"), tmp_path, monkeypatch, arch)
-    assert _max_loads_left_in_flight(isa) >= 3
+    assert _max_load_wait_threshold(isa) >= 3

@@ -1077,15 +1077,12 @@ class InsertEmptyYieldForSCFFor(Transformer):
 
     @staticmethod
     def _apply_loop_directives(for_op, *, unroll, unroll_full, prefetch_depth, prefetch_assume_independent):
-        InsertEmptyYieldForSCFFor._apply_loop_unroll(for_op, unroll, unroll_full)
-        InsertEmptyYieldForSCFFor._apply_loop_prefetch(
-            for_op, prefetch_depth, unroll, unroll_full, prefetch_assume_independent
-        )
+        """Validate and attach the directives shared by both loop builders.
 
-    @staticmethod
-    def _apply_loop_prefetch(for_op, prefetch_depth, unroll, unroll_full, prefetch_assume_independent):
-        """Mark an ``scf.for`` for the ``fly-rocdl-prefetch-loops`` pass, which unrolls the loop
-        itself, so ``prefetch_depth`` excludes ``unroll`` / ``unroll_full``."""
+        Prefetching unrolls the loop in MLIR, so it cannot be combined with an
+        LLVM unroll hint. Keep unroll validation first for consistent errors.
+        """
+        InsertEmptyYieldForSCFFor._apply_loop_unroll(for_op, unroll, unroll_full)
         if not isinstance(prefetch_assume_independent, bool):
             raise TypeError(
                 "for-loop `prefetch_assume_independent` must be a Python bool constant, "
@@ -1132,32 +1129,22 @@ class InsertEmptyYieldForSCFFor(Transformer):
         start_val = InsertEmptyYieldForSCFFor._to_index(start)
         stop_val = InsertEmptyYieldForSCFFor._to_index(stop)
         step_val = InsertEmptyYieldForSCFFor._to_index(step)
-        if init is not None:
-            init = [as_ir_value(v) for v in init]
-            loc = capture_user_location()
-            for_op = scf.ForOp(start_val, stop_val, step_val, init, loc=loc)
-            InsertEmptyYieldForSCFFor._apply_loop_directives(
-                for_op,
-                unroll=unroll,
-                unroll_full=unroll_full,
-                prefetch_depth=prefetch_depth,
-                prefetch_assume_independent=prefetch_assume_independent,
-            )
-            _locate_block_args(for_op.body, loc)
-            with ir.InsertionPoint(for_op.body):
+        init_args = [as_ir_value(v) for v in init] if init is not None else []
+        loc = capture_user_location()
+        for_op = scf.ForOp(start_val, stop_val, step_val, init_args, loc=loc)
+        InsertEmptyYieldForSCFFor._apply_loop_directives(
+            for_op,
+            unroll=unroll,
+            unroll_full=unroll_full,
+            prefetch_depth=prefetch_depth,
+            prefetch_assume_independent=prefetch_assume_independent,
+        )
+        _locate_block_args(for_op.body, loc)
+        with ir.InsertionPoint(for_op.body):
+            # An explicit init=[], like a nonempty init, yields a pair.
+            if init is not None:
                 yield for_op.induction_variable, list(for_op.inner_iter_args)
-        else:
-            loc = capture_user_location()
-            for_op = scf.ForOp(start_val, stop_val, step_val, loc=loc)
-            InsertEmptyYieldForSCFFor._apply_loop_directives(
-                for_op,
-                unroll=unroll,
-                unroll_full=unroll_full,
-                prefetch_depth=prefetch_depth,
-                prefetch_assume_independent=prefetch_assume_independent,
-            )
-            _locate_block_args(for_op.body, loc)
-            with ir.InsertionPoint(for_op.body):
+            else:
                 yield for_op.induction_variable
 
     @staticmethod
@@ -1205,27 +1192,12 @@ class InsertEmptyYieldForSCFFor(Transformer):
                 f"(e.g. fx.Int32(0), fx.Float32(0.0))."
             )
 
-        if not result_names:
-            loc = capture_user_location()
-            for_op = scf.ForOp(start_val, stop_val, step_val, loc=loc)
-            InsertEmptyYieldForSCFFor._apply_loop_directives(
-                for_op,
-                unroll=unroll,
-                unroll_full=unroll_full,
-                prefetch_depth=prefetch_depth,
-                prefetch_assume_independent=prefetch_assume_independent,
-            )
-            _locate_block_args(for_op.body, loc)
-            with ir.InsertionPoint(for_op.body):
-                iv = for_op.induction_variable
-                body_fn(iv, result_names)
-                scf.YieldOp([], loc=capture_user_location())
-            return ReplaceIfWithDispatch._pack_named_values(result_names, result_values)
-
         # Unpack carried states to flat iter_args; `exemplar` re-packs body +
         # results. scf.for infers its result types from iter_args, so the flat
         # types are unused here.
-        exemplar, state_raw, _ = _unpack_states(result_values)
+        state_raw = []
+        if result_names:
+            exemplar, state_raw, _ = _unpack_states(result_values)
 
         loc = capture_user_location()
         for_op = scf.ForOp(start_val, stop_val, step_val, state_raw, loc=loc)
@@ -1240,6 +1212,11 @@ class InsertEmptyYieldForSCFFor(Transformer):
 
         with ir.InsertionPoint(for_op.body):
             iv = for_op.induction_variable
+            if not result_names:
+                body_fn(iv, result_names)
+                scf.YieldOp([], loc=capture_user_location())
+                return ReplaceIfWithDispatch._pack_named_values(result_names, result_values)
+
             # pack the flat inner_iter_args back into each name's container shape
             inner_args = _pack_states(for_op.inner_iter_args, exemplar)
 

@@ -34,31 +34,34 @@ def FlyROCDLClusterAttrPass : Pass<"fly-rocdl-cluster-attr"> {
 def FlyROCDLPrefetchLoopsPass : Pass<"fly-rocdl-prefetch-loops"> {
   let summary = "Software-pipeline scf.for loops marked with fly.prefetch_depth";
   let description = [{
-    Rewrites each `scf.for` carrying `fly.prefetch_depth = N` (set by
-    `range(..., prefetch_depth=N)`) so up to N loads per lane are in flight at
-    once, instead of waiting for each iteration's load before the next one
-    issues. The loop is unrolled by N and pipelined in two stages: each
-    steady-state iteration issues the next N loads together, ahead of the
-    previous N iterations' compute (it still waits for them before its
-    backedge). In the prologue and epilogue of a runtime trip count, reads,
-    side effects and integer division or remainder only run for in-range
-    iterations.
+    Unrolls `scf.for` loops carrying `fly.prefetch_depth = N` by N, then
+    pipelines them in two stages. The load stage contains top-level loads
+    and their address computations. The compute stage contains the remaining
+    operations, one unrolled iteration later. Loaded values cross the
+    backedge in registers, so loads complete before the backedge. Dynamic
+    prologues and epilogues guard reads, side effects and operations that
+    cannot execute speculatively. Remainder loops remain serial.
 
     Loads move ahead of earlier iterations' writes, so a loop that may write
-    memory is only pipelined with `fly.prefetch_assume_independent` (set by
-    `prefetch_assume_independent=True`), which asserts that no iteration reads
-    memory an earlier one wrote. A loop whose order of loads, stores,
-    synchronization or address computation the move would change, such as one
-    with a barrier, or with a load whose address depends on a value the loop
-    computes after its loads, is left unchanged with a remark naming the
-    reason.
+    memory requires `fly.prefetch_assume_independent`. This asserts that no
+    iteration reads memory an earlier iteration wrote. Known memory,
+    synchronization and load-address dependences still prevent pipelining.
 
-    Narrow integer bounds are widened to i64; a loop is left unchanged if its
-    step times the depth overflows a signed 64-bit integer (a runtime 64-bit
-    step is assumed not to). Loops with a lane-exchange op (including calls,
-    inline asm and AMDGPU intrinsic calls) and lane-dependent bounds are first
-    split at the wave's shortest trip count. Run inside `gpu.module(...)` after
-    `convert-fly-to-rocdl` and before `fly-convert-scf-to-cf`.
+    N must be between 1 and 32. Narrow integer bounds are widened to i64.
+    The pass rejects loops whose step times N may overflow a signed i64,
+    except that runtime i64 and index steps are assumed not to overflow.
+    Loops with lane exchanges and bounds not proven wave-uniform are split
+    at the wave's shortest trip count, rounded down to a multiple of N.
+
+    Frontend markers are consumed on both success and rejection. Legality
+    failures leave the loop unchanged apart from its markers and emit a
+    remark. A clean SCF pipeliner rejection retains any loop preparation and
+    unrolling already applied. Failure after SCF has changed the IR fails
+    the pass.
+
+    Run inside `gpu.module(...)` after `convert-fly-to-rocdl` and before
+    `convert-scf-to-cf`. The Python frontend sets the markers for
+    `range(..., prefetch_depth=N, prefetch_assume_independent=True)`.
   }];
   let dependentDialects = [
     "arith::ArithDialect",

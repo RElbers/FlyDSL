@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 FlyDSL Project Contributors
-// RUN: %fly-opt %s --pass-pipeline='builtin.module(gpu.module(fly-rocdl-prefetch-loops))' | FileCheck %s --implicit-check-not=fly.prefetch_depth --implicit-check-not=fly.prefetch_assume_independent
+// RUN: %fly-opt %s --pass-pipeline='builtin.module(gpu.module(fly-rocdl-prefetch-loops))' | FileCheck %s --implicit-check-not=fly.prefetch_depth --implicit-check-not=fly.prefetch_assume_independent --implicit-check-not=fly.prefetch_loc
 // RUN: %fly-opt %s --pass-pipeline='builtin.module(gpu.module(fly-rocdl-prefetch-loops))' -verify-diagnostics -o /dev/null
 
 // Each marked loop is either pipelined, or left unchanged with a remark saying why (checked by
@@ -34,7 +34,7 @@ gpu.module @prefetch_loops {
       %v = llvm.load %pin : !llvm.ptr<1> -> f32
       %pout = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
       llvm.store %v, %pout : f32, !llvm.ptr<1>
-    } {fly.prefetch_assume_independent, fly.prefetch_depth = 4 : i64}
+    } {fly.prefetch_assume_independent, fly.prefetch_depth = 4 : i64, fly.prefetch_loc = loc(unknown)}
     gpu.return
   }
 
@@ -61,7 +61,8 @@ gpu.module @prefetch_loops {
     gpu.return
   }
 
-  // A barrier leaves the loop unchanged.
+  // A barrier leaves the loop unchanged. The recorded frontend location takes precedence over
+  // the loop's location in re-parsed IR, even when that recorded location is unknown.
   // CHECK-LABEL: gpu.func @with_barrier
   // CHECK:      scf.for
   // CHECK-NEXT:   llvm.getelementptr
@@ -74,14 +75,14 @@ gpu.module @prefetch_loops {
   gpu.func @with_barrier(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
     %c0 = arith.constant 0 : i32
     %c1 = arith.constant 1 : i32
-    // expected-remark @below {{loop not pipelined (prefetch_depth=4): it contains a barrier}}
+    // expected-remark @unknown {{loop not pipelined (prefetch_depth=4): it contains a barrier}}
     scf.for %i = %c0 to %n step %c1 : i32 {
       %pin = llvm.getelementptr %in[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
       %v = llvm.load %pin : !llvm.ptr<1> -> f32
       gpu.barrier
       %pout = llvm.getelementptr %out[%i] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, f32
       llvm.store %v, %pout : f32, !llvm.ptr<1>
-    } {fly.prefetch_assume_independent, fly.prefetch_depth = 4 : i64}
+    } {fly.prefetch_assume_independent, fly.prefetch_depth = 4 : i64, fly.prefetch_loc = loc(unknown)}
     gpu.return
   }
 
