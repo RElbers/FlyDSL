@@ -294,6 +294,44 @@ Three pitfalls (all covered in `/prefetch-data-load`):
 3. **Build shared-memory views at the top of the kernel**, not inside the loop
    body, or the epilogue use hits an SSA dominance error.
 
+### Grouped loads with `assume_independent`
+
+For a loop that loads, computes and stores, `range(..., unroll=N)` often
+gains nothing. LLVM cannot prove that a load does not read what an earlier
+iteration stored, so each load still waits for the previous store. Add
+`assume_independent=True` to assert that no iteration reads memory that any
+thread wrote in an earlier iteration. Writes by other lanes and waves count:
+a loop that hands data between lanes from one iteration to the next is not
+independent, even when each thread reads only what other threads wrote.
+
+```python
+for i in range(start, n, step, unroll=4, assume_independent=True):
+    out[i] = f(inp[i])
+```
+
+FlyDSL then unrolls the loop by N itself. It issues each group's N loads,
+with their address computations, before the group's compute and stores. A
+serial remainder loop runs the iterations that do not fill a group. Nothing
+runs speculatively and nothing crosses a group boundary; the cost is N loaded
+values live at once. It helps most when few waves hide the load latency. With
+wide loads at high occupancy, it can be slower than plain `range`, so measure
+both on the target GPU.
+
+The directive is ignored, leaving plain `unroll=N`, when the loop:
+
+- Has a barrier, a memory-counter wait, an LDS or asynchronous copy, a print
+  or assert, a fence, a volatile or acquire-ordered access, private memory, or
+  inline assembly with side effects.
+- Loads after a possible store in the same iteration, or reads the same
+  address every iteration from a buffer it writes.
+- Has no top-level load, or a load address computed from something other
+  than loads and pure arithmetic.
+- Exchanges values across lanes, such as a shuffle or an MFMA, and its bounds
+  are not provably the same across the wave.
+
+The `fly-rocdl-unroll-independent` pass gives the reason in an MLIR remark,
+which `fly-opt` prints; the Python JIT does not show remarks.
+
 ### Async copy (global → LDS DMA)
 
 On gfx942/gfx950, `use_async_copy=True` streams A directly from global memory

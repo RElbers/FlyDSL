@@ -223,7 +223,7 @@ def test_ast_rewrite_for_multi_var_generates_dispatch():
 # ---------------------------------------------------------------------------
 
 
-def _for_dispatch_ir(*, unroll=-1, unroll_full=False):
+def _for_dispatch_ir(*, unroll=-1, unroll_full=False, assume_independent=False):
     """Build a single-iter-arg scf.for via dispatch and return its module text."""
     with Context(), Location.unknown():
         module = Module.create()
@@ -246,6 +246,7 @@ def _for_dispatch_ir(*, unroll=-1, unroll_full=False):
                     result_values=(acc,),
                     unroll=unroll,
                     unroll_full=unroll_full,
+                    assume_independent=assume_independent,
                 )
                 func.ReturnOp([r.ir_value()])
         assert module.operation.verify()
@@ -261,6 +262,7 @@ def test_for_dispatch_unroll_full_attr():
 def test_for_dispatch_unroll_count_attr():
     ir_text = _for_dispatch_ir(unroll=4)
     assert "llvm.loop_unroll<count = 4 : i32>" in ir_text
+    assert "fly.assume_independent" not in ir_text
 
 
 def test_for_dispatch_unroll_one_disables():
@@ -280,6 +282,60 @@ def test_for_dispatch_unroll_conflict_rejected():
 def test_for_dispatch_unroll_non_constant_rejected():
     with pytest.raises(TypeError, match="unroll"):
         _for_dispatch_ir(unroll="4")
+
+
+def test_for_dispatch_assume_independent_marks_loop():
+    # The marker rides alongside the unroll hint, which a loop the pass rejects keeps.
+    ir_text = _for_dispatch_ir(unroll=4, assume_independent=True)
+    assert "llvm.loop_unroll<count = 4 : i32>" in ir_text
+    assert "fly.assume_independent" in ir_text
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{}, {"unroll": 1}, {"unroll_full": True}, {"unroll": 33}],
+    ids=["no_unroll", "unroll_1", "unroll_full", "unroll_33"],
+)
+def test_for_dispatch_assume_independent_needs_unroll_count(kwargs):
+    with pytest.raises(ValueError, match="assume_independent"):
+        _for_dispatch_ir(assume_independent=True, **kwargs)
+
+
+def test_for_dispatch_assume_independent_non_constant_rejected():
+    with pytest.raises(TypeError, match="assume_independent"):
+        _for_dispatch_ir(unroll=4, assume_independent=1)
+
+
+@pytest.mark.parametrize("with_init", [False, True], ids=["no_init", "init"])
+def test_scf_range_assume_independent(with_init):
+    """Both scf_range paths attach the marker and the hint, and validate the same way."""
+    from flydsl._mlir.dialects import scf
+
+    def build(**directives):
+        with Context(), Location.unknown():
+            module = Module.create()
+            i32 = IntegerType.get_signless(32)
+            with InsertionPoint(module.body):
+                f = func.FuncOp("t", FunctionType.get([], []))
+                with InsertionPoint(f.add_entry_block()):
+                    zero = Int32(arith.ConstantOp(i32, 0).result)
+                    if with_init:
+                        for _iv, _args in InsertEmptyYieldForSCFFor.scf_range(
+                            0, 8, 1, init=[zero.ir_value()], **directives
+                        ):
+                            scf.YieldOp(list(_args))
+                    else:
+                        for _iv in InsertEmptyYieldForSCFFor.scf_range(0, 8, 1, **directives):
+                            scf.YieldOp([])
+                    func.ReturnOp([])
+            assert module.operation.verify()
+            return str(module)
+
+    ir_text = build(unroll=4, assume_independent=True)
+    assert "llvm.loop_unroll<count = 4 : i32>" in ir_text
+    assert "fly.assume_independent" in ir_text
+    with pytest.raises(ValueError, match="assume_independent"):
+        build(unroll_full=True, assume_independent=True)
 
 
 def test_scf_range_unroll_annotation():
@@ -326,6 +382,13 @@ def test_ast_rewrite_for_threads_unroll_kwargs():
         """)
     assert "scf_for_dispatch(" in auto
     assert "unroll=4" in auto
+
+    independent = rewrite("""
+        def s(n):
+            for i in range(0, n, 1, unroll=4, assume_independent=True):
+                pass
+        """)
+    assert "assume_independent=True" in independent
 
     init_path = rewrite("""
         def s(n):

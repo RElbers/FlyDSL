@@ -493,6 +493,22 @@ def my_kernel(data: fx.Tensor, N: fx.Constexpr[int]):
         ...
 ```
 
+A runtime `range` accepts these loop directives as keywords. Each value must
+be a Python constant, written as a keyword in the `range(...)` call itself.
+
+| Directive | Effect |
+|---|---|
+| `unroll=N` | LLVM unrolls the loop by N. `unroll=1` disables unrolling. |
+| `unroll_full=True` | LLVM unrolls the loop fully. Cannot be combined with `unroll`. |
+| `assume_independent=True` | Requires `unroll=N` with 2 <= N <= 32. FlyDSL unrolls the loop by N and issues each group's loads before its other operations. |
+
+`assume_independent=True` asserts that no iteration reads memory that any
+thread wrote in an earlier iteration, including other lanes and waves, not
+just the reading thread itself. The compiler cannot check this; if the
+assertion is false, results are wrong. When the compiler cannot apply the directive, the loop
+behaves as with `unroll=N` alone. See "Grouped loads with
+`assume_independent`" in the [kernel tuning guide](kernel_tuning_guide.md).
+
 ### 5.2 `const_expr()`
 
 Mark a value as compile-time constant:

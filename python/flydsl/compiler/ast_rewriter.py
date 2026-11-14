@@ -1011,6 +1011,10 @@ class ReplaceIfWithDispatch(Transformer):
         return _pack_states(op.results, exemplar)[0]
 
 
+# The largest range(..., unroll=N, assume_independent=True); kMaxFactor in fly-rocdl-unroll-independent.
+_MAX_INDEPENDENT_UNROLL = 32
+
+
 @ASTRewriter.register
 class InsertEmptyYieldForSCFFor(Transformer):
     _counter = 0
@@ -1020,7 +1024,7 @@ class InsertEmptyYieldForSCFFor(Transformer):
     # a loop is emitted; they are NOT loop-carried state (``init``) nor the
     # positional start/stop/step. To add a new directive, add its name here and a
     # matching keyword-only parameter on the builders -- no other change needed.
-    _LOOP_DIRECTIVE_KWARGS = ("unroll", "unroll_full")
+    _LOOP_DIRECTIVE_KWARGS = ("unroll", "unroll_full", "assume_independent")
 
     @staticmethod
     def _to_index(val):
@@ -1039,7 +1043,7 @@ class InsertEmptyYieldForSCFFor(Transformer):
         raise TypeError(f"_to_index expected ir.Value, object with ir_value(), or int; got {type(val).__name__}")
 
     @staticmethod
-    def _apply_loop_unroll(for_op, unroll, unroll_full):
+    def _apply_loop_unroll(for_op, unroll, unroll_full, assume_independent=False):
         """Attach an LLVM ``loop_annotation`` unroll hint to an ``scf.for``.
 
         ``unroll``/``unroll_full`` are unrolling directives only and are kept
@@ -1053,11 +1057,29 @@ class InsertEmptyYieldForSCFFor(Transformer):
 
         The attribute rides ``scf.for`` -> ``cf`` -> ``llvm.br`` and becomes
         ``!llvm.loop`` metadata; the LLVM backend performs the actual unrolling.
+
+        ``assume_independent=True`` asserts that no iteration reads memory that
+        any thread (not only the reading one) wrote in an earlier iteration.
+        It requires ``unroll=N`` with 2 <= N <= 32 and
+        adds the ``fly.assume_independent`` marker: the
+        ``fly-rocdl-unroll-independent`` pass then unrolls the loop itself and
+        issues each group's loads first. A loop the pass rejects keeps the hint.
         """
         if isinstance(unroll, bool) or not isinstance(unroll, int):
             raise TypeError(f"for-loop `unroll` must be a Python int constant, got {type(unroll).__name__}")
         if not isinstance(unroll_full, bool):
             raise TypeError(f"for-loop `unroll_full` must be a Python bool constant, got {type(unroll_full).__name__}")
+        if not isinstance(assume_independent, bool):
+            raise TypeError(
+                f"for-loop `assume_independent` must be a Python bool constant, got {type(assume_independent).__name__}"
+            )
+        if assume_independent and (unroll_full or unroll < 2):
+            raise ValueError("for-loop `assume_independent=True` requires `unroll=N` with N >= 2")
+        if assume_independent and unroll > _MAX_INDEPENDENT_UNROLL:
+            raise ValueError(
+                f"for-loop `unroll` must be at most {_MAX_INDEPENDENT_UNROLL} with `assume_independent=True`, "
+                f"got {unroll}"
+            )
         if unroll_full:
             if unroll != -1:
                 raise ValueError("for-loop `unroll` and `unroll_full=True` are mutually exclusive")
@@ -1069,9 +1091,11 @@ class InsertEmptyYieldForSCFFor(Transformer):
         else:
             return
         for_op.attributes["loop_annotation"] = ir.Attribute.parse(f"#llvm.loop_annotation<unroll = {body}>")
+        if assume_independent:
+            for_op.attributes["fly.assume_independent"] = ir.UnitAttr.get()
 
     @staticmethod
-    def scf_range(start, stop=None, step=None, *, init=None, unroll=-1, unroll_full=False):
+    def scf_range(start, stop=None, step=None, *, init=None, unroll=-1, unroll_full=False, assume_independent=False):
         if stop is None:
             stop = start
             start = 0
@@ -1084,21 +1108,30 @@ class InsertEmptyYieldForSCFFor(Transformer):
             init = [as_ir_value(v) for v in init]
             loc = capture_user_location()
             for_op = scf.ForOp(start_val, stop_val, step_val, init, loc=loc)
-            InsertEmptyYieldForSCFFor._apply_loop_unroll(for_op, unroll, unroll_full)
+            InsertEmptyYieldForSCFFor._apply_loop_unroll(for_op, unroll, unroll_full, assume_independent)
             _locate_block_args(for_op.body, loc)
             with ir.InsertionPoint(for_op.body):
                 yield for_op.induction_variable, list(for_op.inner_iter_args)
         else:
             loc = capture_user_location()
             for_op = scf.ForOp(start_val, stop_val, step_val, loc=loc)
-            InsertEmptyYieldForSCFFor._apply_loop_unroll(for_op, unroll, unroll_full)
+            InsertEmptyYieldForSCFFor._apply_loop_unroll(for_op, unroll, unroll_full, assume_independent)
             _locate_block_args(for_op.body, loc)
             with ir.InsertionPoint(for_op.body):
                 yield for_op.induction_variable
 
     @staticmethod
     def scf_for_dispatch(
-        start, stop, step, body_fn, *, result_names=(), result_values=(), unroll=-1, unroll_full=False
+        start,
+        stop,
+        step,
+        body_fn,
+        *,
+        result_names=(),
+        result_values=(),
+        unroll=-1,
+        unroll_full=False,
+        assume_independent=False,
     ):
         start_val = as_ir_value(start)
         stop_val = as_ir_value(stop)
@@ -1134,7 +1167,7 @@ class InsertEmptyYieldForSCFFor(Transformer):
         if not result_names:
             loc = capture_user_location()
             for_op = scf.ForOp(start_val, stop_val, step_val, loc=loc)
-            InsertEmptyYieldForSCFFor._apply_loop_unroll(for_op, unroll, unroll_full)
+            InsertEmptyYieldForSCFFor._apply_loop_unroll(for_op, unroll, unroll_full, assume_independent)
             _locate_block_args(for_op.body, loc)
             with ir.InsertionPoint(for_op.body):
                 iv = for_op.induction_variable
@@ -1149,7 +1182,7 @@ class InsertEmptyYieldForSCFFor(Transformer):
 
         loc = capture_user_location()
         for_op = scf.ForOp(start_val, stop_val, step_val, state_raw, loc=loc)
-        InsertEmptyYieldForSCFFor._apply_loop_unroll(for_op, unroll, unroll_full)
+        InsertEmptyYieldForSCFFor._apply_loop_unroll(for_op, unroll, unroll_full, assume_independent)
         _locate_block_args(for_op.body, loc)
 
         with ir.InsertionPoint(for_op.body):
