@@ -294,6 +294,111 @@ Three pitfalls (all covered in `/prefetch-data-load`):
 3. **Build shared-memory views at the top of the kernel**, not inside the loop
    body, or the epilogue use hits an SSA dominance error.
 
+### Compiler prefetch with `range(..., prefetch_depth=N)`
+
+Use `prefetch_depth=N` to issue a group of iterations' loads ahead of its
+compute. The compiler unrolls the loop by N and pipelines it in two stages.
+Each steady-state iteration issues the next group's loads before computing
+with the previous group's values. The loaded values cross the backedge in
+registers, so the loads must complete before the next iteration starts.
+Register allocation determines how much computation overlaps the loads.
+
+N must be a Python integer from 1 through 32. The directive supports runtime
+trip counts and both forms of `range`, with and without `init=`. It cannot be
+combined with `unroll` or `unroll_full`.
+
+In this example, each thread accumulates four elements per row. The kernel
+uses `BLOCK` threads and a tensor `A` shaped `(n_rows, BLOCK * 4)`:
+
+```python
+tid = fx.thread_idx.x
+rows = fx.zipped_divide(fx.rocdl.make_buffer_tensor(A), (1, BLOCK * 4))
+copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
+tile, tv = fx.make_layout_tv(fx.make_layout((1, BLOCK), (1, 1)), fx.make_layout((1, 4), (1, 1)))
+thr_copy = fx.make_tiled_copy(copy_atom, tv, tile).get_slice(tid)
+acc = fx.Float32(0.0)
+for r, state in range(fx.Int32(0), n_rows, fx.Int32(1), init=[acc], prefetch_depth=4):
+    src = thr_copy.partition_S(fx.slice(rows, (None, r)))
+    frag = fx.make_fragment_like(src)
+    fx.copy(copy_atom, src, frag)
+    acc = yield [state[0] + frag[0] + frag[1] + frag[2] + frag[3]]
+```
+
+Iterations that do not fill a group run in a serial remainder loop. The
+prologue and epilogue guard loads, side effects, and arithmetic such as
+integer division and remainder against out-of-range iterations. Load
+addresses can also be carried between iterations, as with a pointer that is
+incremented after its load.
+
+**Loops that write memory.** Loads move ahead of earlier iterations' writes.
+By default, the compiler rejects a loop that may write memory because even
+separate tensor arguments can alias. Set `prefetch_assume_independent=True`
+only when no iteration reads memory an earlier iteration wrote. Violating
+this assertion can produce incorrect results.
+
+For a layout-based copy loop, use `init=[]` to avoid automatic inference of
+loop-carried copy objects. With `thr_copy` and `copy_atom` defined as in the
+previous example, divide the input and output tensors into rows:
+
+```python
+rows_in = fx.zipped_divide(fx.rocdl.make_buffer_tensor(A), (1, BLOCK * 4))
+rows_out = fx.zipped_divide(fx.rocdl.make_buffer_tensor(Out), (1, BLOCK * 4))
+for r, _ in range(fx.Int32(0), n_rows, fx.Int32(1), init=[], prefetch_depth=4, prefetch_assume_independent=True):
+    src = thr_copy.partition_S(fx.slice(rows_in, (None, r)))
+    frag = fx.make_fragment_like(src)
+    fx.copy(copy_atom, src, frag)
+    frag.store(frag.load() * 2.0)
+    fx.copy(copy_atom, frag, thr_copy.partition_D(fx.slice(rows_out, (None, r))))
+    yield []
+```
+
+The assertion allows eligible loops to pipeline. It does not override a load
+following a possible store in the same iteration, or an invariant-address
+load from a buffer the loop writes. A reduction that accumulates in registers
+needs no assertion.
+
+**Rejected loops.** The compiler emits a remark with the reason when it
+cannot pipeline a marked loop. Legality checks reject loops containing:
+
+- Barriers, explicit memory-counter waits, prints, asserts, or asynchronous
+  copies and copies into or out of LDS.
+- Fences, volatile accesses, atomics with acquire or stronger ordering, or
+  private-memory accesses.
+- Writes without the independence assertion, or either memory dependence
+  described above.
+- No top-level load, or a load address that depends on the compute stage.
+- An operation that needs guarding but cannot produce a zero placeholder
+  of its result type. Supported types are integers, floats, index, pointers,
+  and vectors of supported element types.
+
+The pass also rejects nonpositive constant steps and steps whose product
+with N may overflow signed i64. Runtime i64 and index steps are assumed not
+to overflow. Narrow integer bounds are widened to i64 for loop control.
+
+These checks leave the loop unchanged apart from consuming its directives.
+A later rejection by SCF's pipeliner can leave the loop prepared and unrolled
+without pipelining it. The remark identifies when only unrolling succeeded.
+
+Loops containing lane exchanges, such as shuffles or MFMA, need a uniform
+split between the main loop and its tail. Unless the bounds are proven
+wave-uniform, the compiler reduces the trip count across the wave and rounds
+the minimum down to a multiple of N. Each lane's remaining iterations run in
+a serial tail. Opaque calls, inline assembly, and unknown operations also
+require this treatment.
+
+**Choosing a depth.** Start with N=2 or 4 and compare with plain `range` and
+`unroll=N`. Prefetching can help when narrow loads expose latency and there
+are too few active waves to hide it. Wide loads near peak bandwidth may gain
+nothing, while additional live values increase register pressure. Short
+loops also pay for the prologue, epilogue, and remainder.
+
+Inspect the generated ISA for outstanding loads at memory waits, and use
+`/isa-resource-diff` to compare registers and spills. Unrolling alone may
+expose independent loads to LLVM's scheduler. For loops that write memory,
+the independence assertion lets this pass move loads across iterations even
+when LLVM cannot prove that the buffers do not alias. Measure both directives
+on the target GPU.
+
 ### Async copy (global → LDS DMA)
 
 On gfx942/gfx950, `use_async_copy=True` streams A directly from global memory
