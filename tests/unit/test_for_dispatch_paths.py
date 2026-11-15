@@ -223,7 +223,7 @@ def test_ast_rewrite_for_multi_var_generates_dispatch():
 # ---------------------------------------------------------------------------
 
 
-def _for_dispatch_ir(*, unroll=-1, unroll_full=False, assume_independent=False):
+def _for_dispatch_ir(*, unroll=-1, unroll_full=False, assume_independent=False, pipeline=False):
     """Build a single-iter-arg scf.for via dispatch and return its module text."""
     with Context(), Location.unknown():
         module = Module.create()
@@ -247,6 +247,7 @@ def _for_dispatch_ir(*, unroll=-1, unroll_full=False, assume_independent=False):
                     unroll=unroll,
                     unroll_full=unroll_full,
                     assume_independent=assume_independent,
+                    pipeline=pipeline,
                 )
                 func.ReturnOp([r.ir_value()])
         assert module.operation.verify()
@@ -301,6 +302,21 @@ def test_for_dispatch_assume_independent_needs_unroll_count(kwargs):
         _for_dispatch_ir(assume_independent=True, **kwargs)
 
 
+def test_for_dispatch_pipeline_marks_loop():
+    ir_text = _for_dispatch_ir(unroll=4, assume_independent=True, pipeline=True)
+    assert "llvm.loop_unroll<count = 4 : i32>" in ir_text
+    assert "fly.assume_independent" in ir_text
+    assert "fly.pipeline" in ir_text
+    assert "fly.pipeline" not in _for_dispatch_ir(unroll=4, assume_independent=True)
+
+
+def test_for_dispatch_pipeline_needs_assume_independent():
+    with pytest.raises(ValueError, match="pipeline"):
+        _for_dispatch_ir(unroll=4, pipeline=True)
+    with pytest.raises(TypeError, match="pipeline"):
+        _for_dispatch_ir(unroll=4, assume_independent=True, pipeline=1)
+
+
 def test_for_dispatch_assume_independent_non_constant_rejected():
     with pytest.raises(TypeError, match="assume_independent"):
         _for_dispatch_ir(unroll=4, assume_independent=1)
@@ -334,6 +350,7 @@ def test_scf_range_assume_independent(with_init):
     ir_text = build(unroll=4, assume_independent=True)
     assert "llvm.loop_unroll<count = 4 : i32>" in ir_text
     assert "fly.assume_independent" in ir_text
+    assert "fly.pipeline" in build(unroll=4, assume_independent=True, pipeline=True)
     with pytest.raises(ValueError, match="assume_independent"):
         build(unroll_full=True, assume_independent=True)
 
@@ -385,10 +402,11 @@ def test_ast_rewrite_for_threads_unroll_kwargs():
 
     independent = rewrite("""
         def s(n):
-            for i in range(0, n, 1, unroll=4, assume_independent=True):
+            for i in range(0, n, 1, unroll=4, assume_independent=True, pipeline=True):
                 pass
         """)
     assert "assume_independent=True" in independent
+    assert "pipeline=True" in independent
 
     init_path = rewrite("""
         def s(n):

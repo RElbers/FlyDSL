@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""Compile-only check of range(..., unroll=N, assume_independent=True), with no GPU.
+"""Compile-only checks of range(..., unroll=N, assume_independent=True[, pipeline=True]), with no GPU.
 
 The device test compares results with plain range, which also passes when each load is waited on
 before the next one issues. This test checks the final ISA for loads in flight.
@@ -24,13 +24,15 @@ pytestmark = [pytest.mark.l1b_target_dialect, pytest.mark.rocm_lower]
 BLK = 64
 
 
-def _scatter_launcher(assume_independent, name):
+def _scatter_launcher(assume_independent, name, pipeline=False):
     @flyc.kernel(name=name, known_block_size=[BLK, 1, 1])
     def k(inp: fx.Tensor, out: fx.Tensor, n: fx.Int32) -> None:
         rin = buffer_ops.create_buffer_resource(inp, max_size=True)
         rout = buffer_ops.create_buffer_resource(out, max_size=True)
         tid = arith.index_cast(T.i32, gpu.thread_id("x"))
-        for i in range(fx.Int32(tid), n, fx.Int32(BLK), unroll=4, assume_independent=assume_independent):
+        for i in range(
+            fx.Int32(tid), n, fx.Int32(BLK), unroll=4, assume_independent=assume_independent, pipeline=pipeline
+        ):
             x = ArithValue(buffer_ops.buffer_load(rin, i, vec_width=1, dtype=T.f32))
             # Enough dependent work per element that LLVM computes the first element on its own.
             for _ in fx.range_constexpr(16):
@@ -64,3 +66,12 @@ def test_assume_independent_keeps_loads_in_flight(assume_independent, tmp_path, 
     launch = _scatter_launcher(assume_independent, f"unroll_independent_isa_{assume_independent}")
     max_vmcnt = _max_vmcnt(launch, tmp_path, monkeypatch)
     assert (max_vmcnt >= 3) == assume_independent, max_vmcnt
+
+
+@pytest.mark.parametrize("pipeline", [False, True], ids=["grouped", "pipelined"])
+def test_pipeline_keeps_next_group_in_flight(pipeline, tmp_path, monkeypatch):
+    # Pipelined, the loop issues the next group's 4 loads before it waits for the current group, so
+    # it waits with at least those 4 still outstanding. Grouped, it never has more than 3.
+    launch = _scatter_launcher(True, f"unroll_independent_pipeline_isa_{pipeline}", pipeline)
+    max_vmcnt = _max_vmcnt(launch, tmp_path, monkeypatch)
+    assert (max_vmcnt >= 4) == pipeline, max_vmcnt

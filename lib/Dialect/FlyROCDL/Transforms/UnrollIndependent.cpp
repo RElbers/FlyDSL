@@ -16,7 +16,9 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Diagnostics.h"
@@ -52,6 +54,8 @@ namespace {
 
 /// Set by `assume_independent=True`: no iteration reads memory any thread wrote in an earlier one.
 constexpr StringLiteral kAssumeIndependentAttr = "fly.assume_independent";
+/// Set by `pipeline=True`: also issue the next group's loads before the current group's other ops.
+constexpr StringLiteral kPipelineAttr = "fly.pipeline";
 /// The frontend's LLVM unroll hint, which carries N.
 constexpr StringLiteral kLoopAnnotationAttr = "loop_annotation";
 
@@ -454,6 +458,7 @@ void hoistLoadSlice(RewriterBase &rewriter, Block *body) {
 struct UnrollRequest {
   scf::ForOp loop;
   int64_t factor;
+  bool pipeline;
   std::string kernelName;
 
   /// An active InFlightDiagnostic converts to failure in legality checks. The pass treats these
@@ -476,11 +481,12 @@ int64_t getUnrollCount(scf::ForOp forOp) {
   return annotation.getUnroll().getCount().getInt();
 }
 
-/// Reads the marker and removes it, so no loop keeps it whatever happens next.
+/// Reads the markers and removes them, so no loop keeps them whatever happens next.
 std::optional<UnrollRequest> takeUnrollRequest(scf::ForOp forOp) {
+  bool pipeline = static_cast<bool>(forOp->removeAttr(kPipelineAttr));
   if (!forOp->removeAttr(kAssumeIndependentAttr))
     return std::nullopt;
-  UnrollRequest request{forOp, getUnrollCount(forOp), {}};
+  UnrollRequest request{forOp, getUnrollCount(forOp), pipeline, {}};
   if (auto symbol = forOp->getParentOfType<SymbolOpInterface>())
     request.kernelName = symbol.getName().str();
   return request;
@@ -572,8 +578,10 @@ LogicalResult checkLoop(const UnrollRequest &request) {
 /// step times N. A narrow loop computes them in i64, where they cannot wrap, and keeps its own
 /// type, whose arithmetic must not wrap either: if they do not fit, the main loop runs no
 /// iteration and the remainder loop runs them all. Folds when the bounds are constant.
+/// The pipeliner computes the main loop's span plus one step in the loop's type, so a pipelined
+/// loop also needs that to fit.
 std::pair<Value, Value> buildMainLoopBounds(RewriterBase &rewriter, scf::ForOp forOp,
-                                            int64_t factor) {
+                                            int64_t factor, bool pipeline) {
   Location loc = forOp.getLoc();
   auto narrowTy = dyn_cast<IntegerType>(forOp.getLowerBound().getType());
   if (narrowTy && narrowTy.getWidth() >= 64)
@@ -613,6 +621,11 @@ std::pair<Value, Value> buildMainLoopBounds(RewriterBase &rewriter, scf::ForOp f
   // Separate conditions, so a constant step stays constant.
   Value stepFits = fitsNarrow(mainStep);
   Value fits = rewriter.createOrFold<arith::AndIOp>(loc, stepFits, fitsNarrow(mainUb));
+  if (pipeline) {
+    Value spanAndStep = rewriter.createOrFold<arith::AddIOp>(
+        loc, rewriter.createOrFold<arith::SubIOp>(loc, mainUb, lb), mainStep);
+    fits = rewriter.createOrFold<arith::AndIOp>(loc, fits, fitsNarrow(spanAndStep));
+  }
   return {narrowOr(fits, mainUb, forOp.getLowerBound()),
           narrowOr(stepFits, mainStep, forOp.getStep())};
 }
@@ -623,6 +636,12 @@ void disableLlvmUnroll(scf::ForOp forOp) {
   auto old = forOp->getAttrOfType<LLVM::LoopAnnotationAttr>(kLoopAnnotationAttr);
   auto unroll =
       LLVM::LoopUnrollAttr::get(ctx, /*disable=*/BoolAttr::get(ctx, true), {}, {}, {}, {}, {}, {});
+  if (!old) {
+    forOp->setAttr(kLoopAnnotationAttr,
+                   LLVM::LoopAnnotationAttr::get(ctx, {}, {}, {}, unroll, {}, {}, {}, {}, {}, {},
+                                                 {}, {}, {}, {}, {}));
+    return;
+  }
   auto annotation = LLVM::LoopAnnotationAttr::get(
       ctx, old.getDisableNonforced(), old.getVectorize(), old.getInterleave(), unroll,
       old.getUnrollAndJam(), old.getLicm(), old.getDistribute(), old.getPipeline(), old.getPeeled(),
@@ -633,11 +652,11 @@ void disableLlvmUnroll(scf::ForOp forOp) {
 
 /// Unroll by N with a serial remainder loop, then hoist each group's loads. The main loop runs only
 /// whole groups, so every hoisted load also ran in the original loop.
-void unrollAndHoistLoads(RewriterBase &rewriter, scf::ForOp forOp, int64_t factor) {
+void unrollAndHoistLoads(RewriterBase &rewriter, scf::ForOp forOp, int64_t factor, bool pipeline) {
   Location loc = forOp.getLoc();
   Value step = forOp.getStep();
   rewriter.setInsertionPoint(forOp);
-  auto [mainUb, mainStep] = buildMainLoopBounds(rewriter, forOp, factor);
+  auto [mainUb, mainStep] = buildMainLoopBounds(rewriter, forOp, factor, pipeline);
 
   // The remainder loop runs the original loop from where the main loop stops.
   rewriter.setInsertionPointAfter(forOp);
@@ -666,6 +685,92 @@ void unrollAndHoistLoads(RewriterBase &rewriter, scf::ForOp forOp, int64_t facto
   hoistLoadSlice(rewriter, body);
 }
 
+/// Moves `forOp` into `scf.if (lb < ub)`, which yields the loop's inits when it runs no iteration.
+void guardByFirstIteration(RewriterBase &rewriter, scf::ForOp forOp) {
+  Location loc = forOp.getLoc();
+  rewriter.setInsertionPoint(forOp);
+  Value runs = rewriter.createOrFold<arith::CmpIOp>(loc, arith::CmpIPredicate::slt,
+                                                    forOp.getLowerBound(), forOp.getUpperBound());
+  bool hasResults = forOp.getNumResults() > 0;
+  auto guard = scf::IfOp::create(rewriter, loc, forOp.getResultTypes(), runs,
+                                 /*addThenBlock=*/true, /*addElseBlock=*/hasResults);
+  rewriter.replaceAllUsesWith(forOp.getResults(), guard.getResults());
+  rewriter.moveOpBefore(forOp, guard.thenBlock(), guard.thenBlock()->end());
+  rewriter.setInsertionPointToEnd(guard.thenBlock());
+  scf::YieldOp::create(rewriter, loc, forOp.getResults());
+  if (hasResults) {
+    rewriter.setInsertionPointToEnd(guard.elseBlock());
+    scf::YieldOp::create(rewriter, loc, forOp.getInitArgs());
+  }
+}
+
+/// Without a barrier, LLVM's scheduler sinks the next group's loads into the current group's
+/// compute, which shortens the time they have to complete.
+void pinLoadStage(RewriterBase &rewriter, scf::ForOp loop) {
+  Operation *lastLoad = nullptr;
+  for (Operation &op : loop.getBody()->without_terminator())
+    if (isMovableLoad(&op))
+      lastLoad = &op;
+  assert(lastLoad && "the legality checks require a top-level load");
+  rewriter.setInsertionPointAfter(lastLoad);
+  ROCDL::SchedBarrier::create(rewriter, lastLoad->getLoc(), ROCDL::SchedGroupMask::none);
+}
+
+/// Pipelines the grouped main loop in two stages: each group's load slice, then the rest, so the
+/// next group's loads issue before the current group's other ops. The loop runs only inside a guard
+/// for at least one group, so the pipeliner's prologue and epilogue never run past the trip count
+/// and need no predicate. Failure means the pipeliner changed the IR before failing.
+LogicalResult pipelineGroups(RewriterBase &rewriter, scf::ForOp forOp,
+                             const UnrollRequest &request) {
+  // The pipeliner rejects a yield of the iter arg itself, which always holds the init value.
+  auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+  for (auto [arg, init, yielded] :
+       llvm::zip(forOp.getRegionIterArgs(), forOp.getInitArgs(), yield->getOpOperands()))
+    if (yielded.get() == arg)
+      rewriter.modifyOpInPlace(yield, [&] { yielded.set(init); });
+  guardByFirstIteration(rewriter, forOp);
+
+  scf::PipeliningOption options;
+  options.supportDynamicLoops = true;
+  options.peelEpilogue = true;
+  options.getScheduleFn = [](scf::ForOp loop,
+                             std::vector<std::pair<Operation *, unsigned>> &schedule) {
+    SmallVector<Operation *> ops;
+    for (Operation &op : loop.getBody()->without_terminator())
+      ops.push_back(&op);
+    OpSet slice = collectLoadSlice(ops, loop);
+    for (Operation *op : ops)
+      schedule.emplace_back(op, slice.contains(op) ? 0 : 1);
+  };
+  options.predicateFn = [](RewriterBase &, Operation *op, Value) { return op; };
+
+  rewriter.setInsertionPoint(forOp);
+  std::string message;
+  bool changedIR = false;
+  FailureOr<scf::ForOp> pipelined = failure();
+  {
+    // A clean rejection becomes a remark: Python's PassManager.run fails on any reported error.
+    ScopedDiagnosticHandler capture(forOp.getContext(), [&](Diagnostic &diag) {
+      if (message.empty())
+        message = diag.str();
+      return success();
+    });
+    pipelined = scf::pipelineForLoop(rewriter, forOp, options, &changedIR);
+  }
+  if (succeeded(pipelined)) {
+    disableLlvmUnroll(*pipelined);
+    pinLoadStage(rewriter, *pipelined);
+    return success();
+  }
+  if (changedIR)
+    return forOp.emitError("the pipeliner failed after changing the loop: ") << message;
+  mlir::emitRemark(forOp.getLoc())
+      << "pipeline ignored (unroll=" << request.factor
+      << "), the loop's groups are not pipelined: the pipeliner rejected it"
+      << (message.empty() ? "" : " (" + message + ")");
+  return success();
+}
+
 class FlyROCDLUnrollIndependentPass
     : public mlir::fly_rocdl::impl::FlyROCDLUnrollIndependentPassBase<
           FlyROCDLUnrollIndependentPass> {
@@ -681,9 +786,13 @@ public:
       if (std::optional<UnrollRequest> request = takeUnrollRequest(forOp))
         requests.push_back(std::move(*request));
     });
-    for (const UnrollRequest &request : requests)
-      if (succeeded(checkLoop(request)))
-        unrollAndHoistLoads(rewriter, request.loop, request.factor);
+    for (const UnrollRequest &request : requests) {
+      if (failed(checkLoop(request)))
+        continue;
+      unrollAndHoistLoads(rewriter, request.loop, request.factor, request.pipeline);
+      if (request.pipeline && failed(pipelineGroups(rewriter, request.loop, request)))
+        return signalPassFailure();
+    }
   }
 };
 

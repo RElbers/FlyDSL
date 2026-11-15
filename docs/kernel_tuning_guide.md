@@ -332,6 +332,31 @@ The directive is ignored, leaving plain `unroll=N`, when the loop:
 The `fly-rocdl-unroll-independent` pass gives the reason in an MLIR remark,
 which `fly-opt` prints; the Python JIT does not show remarks.
 
+**Pipelining the groups.** Grouped loads still wait at the start of each
+group. Add `pipeline=True` to also issue the next group's loads before the
+current group's compute and stores, so they are in flight across that
+compute:
+
+```python
+for i in range(start, n, step, unroll=4, assume_independent=True, pipeline=True):
+    out[i] = f(inp[i])
+```
+
+The same rules decide whether the loop is transformed. The next group's loads
+are held at the top of the loop body by a scheduling barrier; without it,
+LLVM moves them into the current group's compute.
+
+- **Short loops.** The pipelined loop runs only when the loop has at least
+  one full group. Its prologue and epilogue need no guards, so a loop of a
+  few groups costs about as much as the grouped loop.
+- **Registers.** The current group's values and the next group's loads are
+  live at once. In an attention kernel from aiter with two online-softmax
+  loops, both pipelined, plain `range` uses 64 VGPRs; `unroll=2` with `pipeline=True` uses 131 and `unroll=4`
+  uses 184 when `waves_per_eu=2` allows it. Under `waves_per_eu=8`, which
+  caps the kernel at 64 VGPRs, the same loops spill 215 and 552 VGPRs. Check
+  spills with `/isa-resource-diff`, and relax `waves_per_eu` or lower N when
+  the pipelined loop spills.
+
 ### Async copy (global → LDS DMA)
 
 On gfx942/gfx950, `use_async_copy=True` streams A directly from global memory

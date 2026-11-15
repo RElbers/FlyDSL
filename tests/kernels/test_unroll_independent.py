@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""range(..., unroll=N, assume_independent=True) on the GPU: every output bit-identical to plain range.
+"""range(..., unroll=N, assume_independent=True[, pipeline=True]) on the GPU: every output bit-identical to
+plain range.
 
 Each lane runs a grid-stride loop, so the sizes give the lanes trip counts of 0, 1, N - 1, N, N + 1 and
 non-multiples of N, with neighbouring lanes one trip apart. Further tests cover runtime bounds with
@@ -35,23 +36,23 @@ MAX_N = BLK * 64
 
 
 def _sizes(factor):
-    trips = [0, 1, factor - 1, factor, factor + 1, 2 * factor + 3, 37]
+    trips = [0, 1, factor - 1, factor, factor + 1, 2 * factor, 2 * factor + 3, 3 * factor, 37]
     return [0] + [BLK * t + BLK // 2 + 1 for t in trips]
 
 
-def _directives(factor):
+def _directives(factor, pipeline):
     """The range keywords; `factor=None` is plain range, the reference. The AST rewriter forwards
-    only literal keywords to the loop builder, so the kernels spell both out."""
-    return (-1, False) if factor is None else (factor, True)
+    only literal keywords to the loop builder, so the kernels spell them out."""
+    return (-1, False, False) if factor is None else (factor, True, pipeline)
 
 
 def _load(rsrc, i):
     return buffer_ops.buffer_load(rsrc, i, vec_width=1, dtype=T.f32)
 
 
-def _body_launcher(body, factor, i32_bounds):
+def _body_launcher(body, factor, i32_bounds, pipeline=False):
     """`factor=None` is plain range, the reference."""
-    unroll, independent = _directives(factor)
+    unroll, independent, pipe = _directives(factor, pipeline)
 
     if i32_bounds:
         # A plain `for` with reassigned variables lowers with i32 bounds.
@@ -61,7 +62,9 @@ def _body_launcher(body, factor, i32_bounds):
             rout = buffer_ops.create_buffer_resource(out, max_size=True)
             tid = arith.index_cast(T.i32, gpu.thread_id("x"))
             acc = fx.Float32(0.0)
-            for i in range(fx.Int32(tid), n, fx.Int32(BLK), unroll=unroll, assume_independent=independent):
+            for i in range(
+                fx.Int32(tid), n, fx.Int32(BLK), unroll=unroll, assume_independent=independent, pipeline=pipe
+            ):
                 acc = body(rin, rout, i, acc)
             buffer_ops.buffer_store(acc, rout, ArithValue(tid) + MAX_N)
 
@@ -81,6 +84,7 @@ def _body_launcher(body, factor, i32_bounds):
                 init=[acc],
                 unroll=unroll,
                 assume_independent=independent,
+                pipeline=pipe,
             ):
                 new_acc = body(rin, rout, arith.index_cast(T.i32, i), st[0])
                 acc = yield [new_acc]
@@ -119,19 +123,20 @@ def _run(launch, n, *, seed=0):
     return out.cpu()
 
 
+@pytest.mark.parametrize("pipeline", [False, True], ids=["grouped", "pipelined"])
 @pytest.mark.parametrize("factor", FACTORS)
 @pytest.mark.parametrize("i32_bounds", [True, False], ids=["i32_bounds", "index_bounds"])
 @pytest.mark.parametrize("body", list(BODIES))
-def test_unroll_independent_matches_plain_range(body, i32_bounds, factor):
+def test_unroll_independent_matches_plain_range(body, i32_bounds, factor, pipeline):
     reference = _body_launcher(BODIES[body], None, i32_bounds)
-    unrolled = _body_launcher(BODIES[body], factor, i32_bounds)
+    unrolled = _body_launcher(BODIES[body], factor, i32_bounds, pipeline)
     for n in _sizes(factor):
         assert torch.equal(_run(unrolled, n), _run(reference, n)), f"n={n}"
 
 
-def _carried_offset_launcher(factor):
+def _carried_offset_launcher(factor, pipeline=False):
     # The load's offset is carried from one iteration to the next and bumped after the load.
-    unroll, independent = _directives(factor)
+    unroll, independent, pipe = _directives(factor, pipeline)
 
     @flyc.kernel(known_block_size=[BLK, 1, 1])
     def k(inp: fx.Tensor, out: fx.Tensor, n: fx.Int32) -> None:
@@ -140,7 +145,7 @@ def _carried_offset_launcher(factor):
         tid = arith.index_cast(T.i32, gpu.thread_id("x"))
         acc = fx.Float32(0.0)
         for i, st in range(
-            0, n, 1, init=[fx.Int32(tid), fx.Float32(0.0)], unroll=unroll, assume_independent=independent
+            0, n, 1, init=[fx.Int32(tid), fx.Float32(0.0)], unroll=unroll, assume_independent=independent, pipeline=pipe
         ):
             x = _load(rin, st[0])
             buffer_ops.buffer_store(x, rout, st[0])
@@ -154,15 +159,16 @@ def _carried_offset_launcher(factor):
     return launch
 
 
+@pytest.mark.parametrize("pipeline", [False, True], ids=["grouped", "pipelined"])
 @pytest.mark.parametrize("factor", FACTORS)
-def test_unroll_independent_carried_offset(factor):
-    reference, unrolled = _carried_offset_launcher(None), _carried_offset_launcher(factor)
-    for trips in [0, 1, factor - 1, factor, factor + 1, 2 * factor + 3, 37]:
+def test_unroll_independent_carried_offset(factor, pipeline):
+    reference, unrolled = _carried_offset_launcher(None), _carried_offset_launcher(factor, pipeline)
+    for trips in [0, 1, factor - 1, factor, factor + 1, 2 * factor, 2 * factor + 3, 3 * factor, 37]:
         assert torch.equal(_run(unrolled, trips), _run(reference, trips)), f"trips={trips}"
 
 
-def _bounds_launcher(factor):
-    unroll, independent = _directives(factor)
+def _bounds_launcher(factor, pipeline=False):
+    unroll, independent, pipe = _directives(factor, pipeline)
 
     @flyc.kernel(known_block_size=[BLK, 1, 1])
     def k(inp: fx.Tensor, out: fx.Tensor, lb: fx.Int32, ub: fx.Int32, step: fx.Int32) -> None:
@@ -170,7 +176,7 @@ def _bounds_launcher(factor):
         rin = buffer_ops.create_buffer_resource(inp, max_size=False, num_records_bytes=4096)
         tid = arith.index_cast(T.i32, gpu.thread_id("x"))
         acc = fx.Float32(0.0)
-        for i in range(lb, ub, step, unroll=unroll, assume_independent=independent):
+        for i in range(lb, ub, step, unroll=unroll, assume_independent=independent, pipeline=pipe):
             acc = ArithValue(acc) * 0.5 + ArithValue(_load(rin, i))
         buffer_ops.buffer_store(acc, buffer_ops.create_buffer_resource(out, max_size=True), tid)
 
@@ -181,11 +187,12 @@ def _bounds_launcher(factor):
     return launch
 
 
+@pytest.mark.parametrize("pipeline", [False, True], ids=["grouped", "pipelined"])
 @pytest.mark.parametrize("factor", FACTORS)
-def test_unroll_independent_runtime_bounds(factor):
+def test_unroll_independent_runtime_bounds(factor, pipeline):
     # Empty ranges with ub < lb stay empty, and neither the span, the trip count nor the step times N
     # may wrap in i32.
-    reference, unrolled = _bounds_launcher(None), _bounds_launcher(factor)
+    reference, unrolled = _bounds_launcher(None), _bounds_launcher(factor, pipeline)
     inp = torch.arange(1, 1025, device="cuda", dtype=torch.float32)
     for bounds in [
         (100, 90, 4),
@@ -210,15 +217,15 @@ def test_unroll_independent_runtime_bounds(factor):
         assert torch.equal(results[1], results[0]), bounds
 
 
-def _strided_launcher(factor):
-    unroll, independent = _directives(factor)
+def _strided_launcher(factor, pipeline=False):
+    unroll, independent, pipe = _directives(factor, pipeline)
 
     @flyc.kernel(known_block_size=[BLK, 1, 1])
     def k(inp: fx.Tensor, out: fx.Tensor, n: fx.Int32, stride: fx.Int32) -> None:
         rin = buffer_ops.create_buffer_resource(inp, max_size=True)
         rout = buffer_ops.create_buffer_resource(out, max_size=True)
         tid = arith.index_cast(T.i32, gpu.thread_id("x"))
-        for i in range(fx.Int32(0), n, fx.Int32(1), unroll=unroll, assume_independent=independent):
+        for i in range(fx.Int32(0), n, fx.Int32(1), unroll=unroll, assume_independent=independent, pipeline=pipe):
             x = _load(rin, ArithValue(i) * ArithValue(stride) + ArithValue(tid))
             buffer_ops.buffer_store(x, rout, ArithValue(i) * BLK + ArithValue(tid))
 
@@ -229,11 +236,11 @@ def _strided_launcher(factor):
     return launch
 
 
-def _check_no_load_past_the_trip_count(factor):
+def _check_no_load_past_the_trip_count(factor, pipeline):
     inp = torch.ones(BLK, device="cuda")
     for n in (0, 1):
         outs = []
-        for launch in (_strided_launcher(None), _strided_launcher(factor)):
+        for launch in (_strided_launcher(None), _strided_launcher(factor, pipeline)):
             out = torch.zeros(BLK * factor, device="cuda")
             launch(inp, out, n, 1 << 28, torch.cuda.current_stream())
             torch.cuda.synchronize()
@@ -241,15 +248,16 @@ def _check_no_load_past_the_trip_count(factor):
         assert torch.equal(outs[1], outs[0]), f"n={n}"
 
 
+@pytest.mark.parametrize("pipeline", [False, True], ids=["grouped", "pipelined"])
 @pytest.mark.parametrize("factor", FACTORS)
-def test_unroll_independent_does_not_load_past_the_trip_count(factor):
+def test_unroll_independent_does_not_load_past_the_trip_count(factor, pipeline):
     # Iterations are 1 GiB apart and the buffer holds one row, with an unbounded (max_size) buffer
     # resource: any iteration past the trip count would fault the GPU. The check runs in a subprocess,
     # so a fault fails this test instead of aborting the pytest run.
     here = Path(__file__).resolve().parent
     code = (
         f"import sys; sys.path.insert(0, {str(here)!r}); "
-        f"import test_unroll_independent as t; t._check_no_load_past_the_trip_count({factor})"
+        f"import test_unroll_independent as t; t._check_no_load_past_the_trip_count({factor}, {pipeline})"
     )
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=600)
     assert result.returncode == 0, result.stderr[-4000:]
@@ -270,10 +278,11 @@ def _shuffle(rin, rout, i, acc):
     return ArithValue(acc) + ArithValue(x) * ArithValue(gpu.shuffle_xor(x, 1, BLK))
 
 
+@pytest.mark.parametrize("pipeline", [False, True], ids=["grouped", "pipelined"])
 @pytest.mark.parametrize("factor", [4])
 @pytest.mark.parametrize("body", [_accumulate_in_memory, _shuffle], ids=["accumulate_in_memory", "shuffle"])
-def test_unroll_independent_rejected_loops_match_plain_range(body, factor):
-    reference, candidate = _body_launcher(body, None, True), _body_launcher(body, factor, True)
+def test_unroll_independent_rejected_loops_match_plain_range(body, factor, pipeline):
+    reference, candidate = _body_launcher(body, None, True), _body_launcher(body, factor, True, pipeline)
     for n in _sizes(factor):
         assert torch.equal(_run(candidate, n), _run(reference, n)), f"n={n}"
 
@@ -288,10 +297,14 @@ def _buffer_loads_in_llvm_ir(launch, tmp_path, monkeypatch):
     return sum("call" in line and "buffer.load" in line for line in dumped[0].read_text().splitlines())
 
 
-@pytest.mark.parametrize("factor", [None, 4])
-def test_unroll_independent_runs_in_the_compile_pipeline(factor, tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "factor, pipeline, want",
+    [(None, False, 1), (4, False, 5), (4, True, 9)],
+    ids=["plain", "grouped", "pipelined"],
+)
+def test_unroll_independent_runs_in_the_compile_pipeline(factor, pipeline, want, tmp_path, monkeypatch):
     # A comparison with plain range also passes if the pass never runs. Unrolled by N, the loop's
-    # one load becomes N loads in the main loop and one in the remainder loop.
-    launch = _body_launcher(_scatter, factor, True)
-    want = 1 if factor is None else factor + 1
+    # one load becomes N loads in the main loop and one in the remainder loop; pipelined, N more
+    # in the prologue.
+    launch = _body_launcher(_scatter, factor, True, pipeline)
     assert _buffer_loads_in_llvm_ir(launch, tmp_path, monkeypatch) == want
