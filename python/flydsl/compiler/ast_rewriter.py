@@ -1068,6 +1068,10 @@ class InsertEmptyYieldForSCFFor(Transformer):
         ``pipeline=True`` requires ``assume_independent=True`` and adds the
         ``fly.pipeline`` marker: the pass also issues the next group's loads
         before the current group's other operations.
+
+        ``pipeline="lds"`` also adds the ``fly.pipeline_lds`` marker: the next
+        group's loads go to LDS as asynchronous DMAs instead of registers. It
+        also allows ``unroll=1``.
         """
         if isinstance(unroll, bool) or not isinstance(unroll, int):
             raise TypeError(f"for-loop `unroll` must be a Python int constant, got {type(unroll).__name__}")
@@ -1077,12 +1081,15 @@ class InsertEmptyYieldForSCFFor(Transformer):
             raise TypeError(
                 f"for-loop `assume_independent` must be a Python bool constant, got {type(assume_independent).__name__}"
             )
-        if assume_independent and (unroll_full or unroll < 2):
-            raise ValueError("for-loop `assume_independent=True` requires `unroll=N` with N >= 2")
-        if not isinstance(pipeline, bool):
-            raise TypeError(f"for-loop `pipeline` must be a Python bool constant, got {type(pipeline).__name__}")
+        if not isinstance(pipeline, bool) and pipeline != "lds":
+            raise TypeError(f'for-loop `pipeline` must be a Python bool constant or "lds", got {pipeline!r}')
         if pipeline and not assume_independent:
-            raise ValueError("for-loop `pipeline=True` requires `assume_independent=True`")
+            raise ValueError(f"for-loop `pipeline={pipeline!r}` requires `assume_independent=True`")
+        min_unroll = 1 if pipeline == "lds" else 2
+        if assume_independent and (unroll_full or unroll < min_unroll):
+            raise ValueError(
+                'for-loop `assume_independent=True` requires `unroll=N` with N >= 2, or N >= 1 with `pipeline="lds"`'
+            )
         if assume_independent and unroll > _MAX_INDEPENDENT_UNROLL:
             raise ValueError(
                 f"for-loop `unroll` must be at most {_MAX_INDEPENDENT_UNROLL} with `assume_independent=True`, "
@@ -1103,6 +1110,8 @@ class InsertEmptyYieldForSCFFor(Transformer):
             for_op.attributes["fly.assume_independent"] = ir.UnitAttr.get()
         if pipeline:
             for_op.attributes["fly.pipeline"] = ir.UnitAttr.get()
+        if pipeline == "lds":
+            for_op.attributes["fly.pipeline_lds"] = ir.UnitAttr.get()
 
     @staticmethod
     def scf_range(

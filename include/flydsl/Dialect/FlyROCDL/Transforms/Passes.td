@@ -57,6 +57,17 @@ def FlyROCDLUnrollIndependentPass : Pass<"fly-rocdl-unroll-independent"> {
     vector stores do not update, so a load of what an earlier iteration
     stored could be stale; the marker's assertion rules that out.
 
+    A pipelined loop that also carries `fly.pipeline_lds` stages its buffer
+    loads through LDS: each becomes a `rocdl.raw.ptr.buffer.load.async.lds`
+    into a two-slot, wave-private ring (one LDS global per loop), closed by
+    `rocdl.asyncmark`, and its value is read back from LDS before its first
+    use, after a `rocdl.wait.asyncmark`. A load stays in registers when it is
+    not 4, 12 or 16 bytes, its resource is not proven wave-uniform, or its
+    value addresses another load or is carried unchanged to the next
+    iteration; a scalar buffer load stays in its scalar register. Staging needs a gfx950 target, a kernel `known_block_size`
+    and room in the 160 KiB of LDS; otherwise the loop is pipelined in
+    registers, with a remark. With `fly.pipeline_lds`, N may be 1.
+
     The marker asserts that no iteration reads memory that any thread wrote
     in an earlier iteration. The pass still rejects a loop with a barrier, a
     memory-counter wait, an LDS or asynchronous copy, a print or assert, a
@@ -67,7 +78,7 @@ def FlyROCDLUnrollIndependentPass : Pass<"fly-rocdl-unroll-independent"> {
     whose load addresses depend on other operations; and a loop with a lane
     exchange whose bounds are not proven wave-uniform.
 
-    N must be from 2 to 32. The pass rejects unsigned loops and loops whose
+    N must be from 2 to 32 (1 to 32 with `fly.pipeline_lds`). The pass rejects unsigned loops and loops whose
     constant step times N overflows a signed i64. A narrow loop keeps its
     type: the main loop's bounds are computed in i64, and when they do not
     fit the type, the remainder loop runs every iteration; when pipelining,

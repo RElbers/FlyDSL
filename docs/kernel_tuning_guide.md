@@ -358,6 +358,17 @@ LLVM moves them into the current group's compute.
   the pipelined loop spills.
 - **Wave-uniform values.** A vector load whose value is passed through `readfirstlane`, such as a page-table entry that addresses the group's other loads, makes the loop wait for every load issued so far (`vmcnt(0)`) before it can continue. Load such a value with `fx.rocdl.s_buffer_load` instead: it lands in a scalar register, is waited for on its own counter, and the directive moves it like any other load. The scalar cache does not see vector stores, so this relies on the same assertion as the directive: no iteration reads what an earlier one wrote.
 
+**Staging through LDS.** On gfx950, `pipeline="lds"` carries the next group's loads in LDS instead of registers. Each staged buffer load becomes an asynchronous DMA into a two-slot ring of LDS that is private to the wave, and its value is read back from LDS right before its first use. The loop waits once per group, for the group it is about to read, so no register holds a value in flight across the back edge. It also accepts `unroll=1`, which pipelines single iterations:
+
+```python
+for i in range(start, n, step, unroll=1, assume_independent=True, pipeline="lds"):
+    out[i] = f(inp[i])
+```
+
+- **Which loads.** A buffer load of 4, 12 or 16 bytes per lane whose buffer resource is the same across the wave. A load whose value addresses another load, such as a page-table entry, or is carried unchanged to the next iteration stays in registers in the same loop, and so does a scalar load from `fx.rocdl.s_buffer_load`.
+- **LDS cost.** The ring takes 2 x waves per block x 64 lanes x (4 bytes per load of up to 4 bytes, 16 per larger load) per group, so it can limit occupancy where registers did not. In aiter's `fp8_mqa_logits` (2 waves, 12 loads per iteration), `unroll=2` with `pipeline=True` uses 256 VGPRs and spills 36; with `pipeline="lds"` it uses 166 VGPRs and no spills, but 72 KiB of LDS per block, which allows 2 blocks per CU. `unroll=1` halves the ring.
+- **Fallback.** On other targets, without `known_block_size` on the kernel, or when the ring would not fit in the 160 KiB of LDS next to the kernel's static LDS, the loop is pipelined in registers as with `pipeline=True`, and the pass says why in a remark. The pass cannot see dynamic LDS (`SharedAllocator(static=False)` or a launch `smem`): such a kernel must leave room for the ring, or its launch fails.
+
 ### Async copy (global → LDS DMA)
 
 On gfx942/gfx950, `use_async_copy=True` streams A directly from global memory

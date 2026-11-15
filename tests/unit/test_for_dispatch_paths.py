@@ -317,6 +317,23 @@ def test_for_dispatch_pipeline_needs_assume_independent():
         _for_dispatch_ir(unroll=4, assume_independent=True, pipeline=1)
 
 
+def test_for_dispatch_pipeline_lds_marks_loop():
+    # pipeline="lds" adds its own marker next to fly.pipeline, and alone allows unroll=1.
+    ir_text = _for_dispatch_ir(unroll=1, assume_independent=True, pipeline="lds")
+    assert "llvm.loop_unroll<disable = true, count = 1 : i32>" in ir_text
+    assert "fly.pipeline, fly.pipeline_lds" in ir_text
+    assert "fly.pipeline_lds" not in _for_dispatch_ir(unroll=4, assume_independent=True, pipeline=True)
+
+
+def test_for_dispatch_pipeline_lds_validation():
+    with pytest.raises(ValueError, match="pipeline"):
+        _for_dispatch_ir(unroll=4, pipeline="lds")
+    with pytest.raises(TypeError, match="pipeline"):
+        _for_dispatch_ir(unroll=4, assume_independent=True, pipeline="registers")
+    with pytest.raises(ValueError, match="assume_independent"):
+        _for_dispatch_ir(unroll=1, assume_independent=True, pipeline=True)
+
+
 def test_for_dispatch_assume_independent_non_constant_rejected():
     with pytest.raises(TypeError, match="assume_independent"):
         _for_dispatch_ir(unroll=4, assume_independent=1)
@@ -351,6 +368,7 @@ def test_scf_range_assume_independent(with_init):
     assert "llvm.loop_unroll<count = 4 : i32>" in ir_text
     assert "fly.assume_independent" in ir_text
     assert "fly.pipeline" in build(unroll=4, assume_independent=True, pipeline=True)
+    assert "fly.pipeline_lds" in build(unroll=1, assume_independent=True, pipeline="lds")
     with pytest.raises(ValueError, match="assume_independent"):
         build(unroll_full=True, assume_independent=True)
 

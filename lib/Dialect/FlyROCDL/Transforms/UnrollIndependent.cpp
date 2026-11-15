@@ -13,6 +13,9 @@
 //
 // A rejected loop keeps the frontend's LLVM unroll hint, so it behaves as with plain unroll=N, and
 // gets a remark saying why.
+//
+// pipeline="lds" (fly.pipeline_lds) carries the pipelined loop's next group in an LDS ring instead
+// of registers: see "LDS staging" below.
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
@@ -26,11 +29,13 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/Interfaces/DataLayoutInterfaces.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/RegionUtils.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -58,12 +63,15 @@ namespace {
 constexpr StringLiteral kAssumeIndependentAttr = "fly.assume_independent";
 /// Set by `pipeline=True`: also issue the next group's loads before the current group's other ops.
 constexpr StringLiteral kPipelineAttr = "fly.pipeline";
+/// Set with fly.pipeline by `pipeline="lds"`: carry the next group's loads in LDS, not registers.
+constexpr StringLiteral kPipelineLdsAttr = "fly.pipeline_lds";
 /// The frontend's LLVM unroll hint, which carries N.
 constexpr StringLiteral kLoopAnnotationAttr = "loop_annotation";
 
 /// Larger factors grow the IR and the live registers without hiding more latency.
 constexpr int64_t kMaxFactor = 32;
 
+constexpr unsigned kSharedAddressSpace = 3;
 constexpr unsigned kPrivateAddressSpace = 5;
 
 //===----------------------------------------------------------------------===//
@@ -221,9 +229,9 @@ bool propagatesUniformity(Operation *op) {
 class WaveUniformityAnalysis {
 public:
   bool hasUniformTripCount(scf::ForOp forOp);
+  bool isUniform(Value value);
 
 private:
-  bool isUniform(Value value);
   DenseMap<Value, bool> knownUniform;
 };
 
@@ -483,6 +491,7 @@ struct UnrollRequest {
   scf::ForOp loop;
   int64_t factor;
   bool pipeline;
+  bool lds;
   std::string kernelName;
 
   /// An active InFlightDiagnostic converts to failure in legality checks. The pass treats these
@@ -507,10 +516,11 @@ int64_t getUnrollCount(scf::ForOp forOp) {
 
 /// Reads the markers and removes them, so no loop keeps them whatever happens next.
 std::optional<UnrollRequest> takeUnrollRequest(scf::ForOp forOp) {
-  bool pipeline = static_cast<bool>(forOp->removeAttr(kPipelineAttr));
+  bool lds = static_cast<bool>(forOp->removeAttr(kPipelineLdsAttr));
+  bool pipeline = static_cast<bool>(forOp->removeAttr(kPipelineAttr)) || lds;
   if (!forOp->removeAttr(kAssumeIndependentAttr))
     return std::nullopt;
-  UnrollRequest request{forOp, getUnrollCount(forOp), pipeline, {}};
+  UnrollRequest request{forOp, getUnrollCount(forOp), pipeline, lds, {}};
   if (auto symbol = forOp->getParentOfType<SymbolOpInterface>())
     request.kernelName = symbol.getName().str();
   return request;
@@ -554,8 +564,12 @@ LogicalResult checkHazards(Operation *op, const UnrollRequest &request) {
 LogicalResult checkLoop(const UnrollRequest &request) {
   scf::ForOp forOp = request.loop;
   Block *body = forOp.getBody();
-  if (request.factor < 2 || request.factor > kMaxFactor)
-    return request.emitRemark("it needs an unroll count from 2 to " + Twine(kMaxFactor));
+  // With LDS staging, the groups of one iteration still get a pipeline; in registers they would
+  // only add copies.
+  int64_t minFactor = request.lds ? 1 : 2;
+  if (request.factor < minFactor || request.factor > kMaxFactor)
+    return request.emitRemark("it needs an unroll count from " + Twine(minFactor) + " to " +
+                              Twine(kMaxFactor));
   WalkResult hazards =
       body->walk([&](Operation *op) -> WalkResult { return checkHazards(op, request); });
   if (hazards.wasInterrupted())
@@ -696,17 +710,285 @@ void unrollAndHoistLoads(RewriterBase &rewriter, scf::ForOp forOp, int64_t facto
   });
 
   Block *body = forOp.getBody();
-  generateUnrolledLoop(
-      body, forOp.getInductionVar(), factor,
-      [&](unsigned i, Value iv, OpBuilder b) -> Value {
-        Value offset = arith::MulIOp::create(
-            b, loc, step, arith::ConstantOp::create(b, loc, b.getIntegerAttr(iv.getType(), i)));
-        return arith::AddIOp::create(b, loc, iv, offset);
-      },
-      /*annotateFn=*/nullptr, forOp.getRegionIterArgs(), body->getTerminator()->getOperands());
+  if (factor > 1)
+    generateUnrolledLoop(
+        body, forOp.getInductionVar(), factor,
+        [&](unsigned i, Value iv, OpBuilder b) -> Value {
+          Value offset = arith::MulIOp::create(
+              b, loc, step, arith::ConstantOp::create(b, loc, b.getIntegerAttr(iv.getType(), i)));
+          return arith::AddIOp::create(b, loc, iv, offset);
+        },
+        /*annotateFn=*/nullptr, forOp.getRegionIterArgs(), body->getTerminator()->getOperands());
   disableLlvmUnroll(forOp);
   disableLlvmUnroll(remainder);
   hoistLoadSlice(rewriter, body);
+}
+
+//===----------------------------------------------------------------------===//
+// LDS staging
+//===----------------------------------------------------------------------===//
+
+// With pipeline="lds", each staged buffer load of the grouped loop becomes an asynchronous DMA into
+// a two-slot LDS ring, and its value is read back from LDS right before its first use. The
+// pipeliner then issues the next group's DMAs in place of its register loads, so no register holds
+// a value in flight across the back edge. The ring is wave-private: a DMA lane writes its value at
+// the wave's base plus its lane times the lane stride, and the same lane reads it back, so no
+// barrier is needed.
+
+constexpr int64_t kWaveSize = 64;
+constexpr int64_t kRingSlots = 2;
+constexpr int64_t kGfx950LdsBytes = 160 * 1024;
+
+/// The ops the pipeline schedule places explicitly after staging.
+struct LdsStaging {
+  scf::ForOp loop;
+  DenseSet<Operation *> readbacks;
+  Operation *mark = nullptr;
+};
+
+/// The byte size of a scalar or 1-D vector of integers or floats.
+std::optional<int64_t> getByteSize(Type type) {
+  int64_t count = 1;
+  if (auto vec = dyn_cast<VectorType>(type)) {
+    if (vec.getRank() != 1 || vec.isScalable())
+      return std::nullopt;
+    count = vec.getNumElements();
+    type = vec.getElementType();
+  }
+  if (!type.isIntOrFloat() || type.getIntOrFloatBitWidth() % 8)
+    return std::nullopt;
+  return count * type.getIntOrFloatBitWidth() / 8;
+}
+
+/// Why `load` stays in registers, or an empty string when it can be staged.
+StringRef whyNotStaged(Operation *load, const OpSet &slice, Block *body,
+                       WaveUniformityAnalysis &uniformity) {
+  std::optional<int64_t> bytes = getByteSize(load->getResult(0).getType());
+  if (!bytes || (*bytes != 4 && *bytes != 12 && *bytes != 16))
+    return "the DMA moves only 4, 12 or 16 bytes per lane";
+  if (!isa_and_nonnull<IntegerAttr>(load->getAttr("aux")))
+    return "its cache policy is not a plain integer";
+  if (!uniformity.isUniform(load->getOperand(0)))
+    return "its buffer resource is not proven wave-uniform";
+  if (load->use_empty())
+    return "its value is unused";
+  for (Operation *user : load->getUsers()) {
+    Operation *ancestor = body->findAncestorOpInBlock(*user);
+    if (slice.contains(ancestor))
+      return "its value feeds another load's address";
+    if (ancestor == body->getTerminator())
+      return "its value is carried to the next iteration unchanged";
+  }
+  return "";
+}
+
+/// The chip of the module's ROCDL target, or empty.
+StringRef getChip(Operation *op) {
+  auto module = op->getParentOfType<gpu::GPUModuleOp>();
+  ArrayAttr targets = module ? module.getTargetsAttr() : ArrayAttr();
+  for (Attribute target : targets ? targets.getValue() : ArrayRef<Attribute>())
+    if (auto rocdl = dyn_cast<ROCDL::ROCDLTargetAttr>(target))
+      return rocdl.getChip();
+  return "";
+}
+
+/// The bytes of the module's static LDS globals, which LLVM lays out together for each kernel.
+int64_t getStaticLdsBytes(gpu::GPUModuleOp module) {
+  int64_t bytes = 0;
+  for (auto global : module.getBody()->getOps<LLVM::GlobalOp>())
+    if (global.getAddrSpace() == kSharedAddressSpace)
+      bytes += DataLayout::closest(global).getTypeSize(global.getGlobalType());
+  return bytes;
+}
+
+/// The same kind of global that a static SharedAllocator leaf lowers to.
+LLVM::GlobalOp createRing(RewriterBase &rewriter, gpu::GPUModuleOp module, Location loc,
+                          int64_t bytes) {
+  SymbolTable symbols(module);
+  unsigned counter = 0;
+  SmallString<32> name = SymbolTable::generateSymbolName<32>(
+      "__fly_pipeline_ring", [&](StringRef candidate) { return symbols.lookup(candidate); },
+      counter);
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPointToStart(module.getBody());
+  auto type = LLVM::LLVMArrayType::get(rewriter.getI8Type(), bytes);
+  auto ring = LLVM::GlobalOp::create(rewriter, loc, type, /*isConstant=*/false,
+                                     LLVM::Linkage::External, name, /*value=*/Attribute(),
+                                     /*alignment=*/16, kSharedAddressSpace);
+  ring.setDsoLocal(true);
+  return ring;
+}
+
+/// Replaces the grouped loop's stageable loads with DMAs into the ring and LDS readbacks, and adds
+/// the slot offset as an iter arg. Fails with a remark, before changing anything, when no load can
+/// be staged; the loop is then pipelined in registers.
+FailureOr<LdsStaging> stageLoadsInLds(RewriterBase &rewriter, scf::ForOp forOp,
+                                      const UnrollRequest &request) {
+  Location loc = forOp.getLoc();
+  Block *body = forOp.getBody();
+  auto fallBack = [&](const Twine &why) {
+    InFlightDiagnostic remark = mlir::emitRemark(loc);
+    remark << "pipeline=\"lds\" falls back to registers (unroll=" << request.factor << "): " << why;
+    if (!request.kernelName.empty())
+      remark << " (in " << request.kernelName << ")";
+    return failure();
+  };
+
+  StringRef chip = getChip(forOp);
+  if (!chip.starts_with("gfx95"))
+    return fallBack("staging needs gfx950's 12- and 16-byte LDS DMA, and the target is " +
+                    (chip.empty() ? StringRef("unknown") : chip));
+  auto kernel = forOp->getParentOfType<gpu::GPUFuncOp>();
+  std::optional<ArrayRef<int32_t>> blockSize;
+  if (kernel)
+    blockSize = kernel.getKnownBlockSize();
+  if (!blockSize)
+    return fallBack("the kernel has no known_block_size, which sizes the ring");
+
+  SmallVector<Operation *> ops;
+  for (Operation &op : body->without_terminator())
+    ops.push_back(&op);
+  OpSet slice = collectLoadSlice(ops, forOp);
+  WaveUniformityAnalysis uniformity;
+  SmallVector<Operation *> staged;
+  llvm::MapVector<StringRef, int> unstaged;
+  for (Operation *op : ops) {
+    if (!isa<ROCDL::RawPtrBufferLoadOp>(op)) {
+      if (isScalarBufferLoadCall(op))
+        ++unstaged["it is a scalar load, which stays in a scalar register"];
+      else if (isMovableLoad(op))
+        ++unstaged["it is not a buffer load"];
+      continue;
+    }
+    StringRef why = whyNotStaged(op, slice, body, uniformity);
+    if (why.empty())
+      staged.push_back(op);
+    else
+      ++unstaged[why];
+  }
+  std::string reasons;
+  for (auto [why, count] : unstaged)
+    reasons += (reasons.empty() ? "" : "; ") + std::to_string(count) +
+               (count == 1 ? " load: " : " loads: ") + why.str();
+  if (staged.empty())
+    return fallBack("no load can be staged (" + reasons + ")");
+
+  // ring[wave][slot][load][lane]: a DMA of up to 4 bytes per lane spaces lanes 4 bytes apart in
+  // LDS, a larger one 16 bytes.
+  SmallVector<int64_t> laneStrides, loadOffsets;
+  int64_t slotBytes = 0;
+  for (Operation *load : staged) {
+    laneStrides.push_back(*getByteSize(load->getResult(0).getType()) > 4 ? 16 : 4);
+    loadOffsets.push_back(slotBytes);
+    slotBytes += kWaveSize * laneStrides.back();
+  }
+  int64_t threads = int64_t((*blockSize)[0]) * (*blockSize)[1] * (*blockSize)[2];
+  int64_t waves = llvm::divideCeil(threads, kWaveSize);
+  int64_t ringBytes = waves * kRingSlots * slotBytes;
+  auto module = forOp->getParentOfType<gpu::GPUModuleOp>();
+  int64_t ldsBytes = getStaticLdsBytes(module) + ringBytes;
+  if (ldsBytes > kGfx950LdsBytes)
+    return fallBack("the ring needs " + Twine(ringBytes) + " bytes, and the module's LDS would " +
+                    "total " + Twine(ldsBytes) + " of " + Twine(kGfx950LdsBytes));
+  if (!unstaged.empty()) {
+    InFlightDiagnostic remark = mlir::emitRemark(loc);
+    remark << "pipeline=\"lds\" keeps some loads in registers (unroll=" << request.factor
+           << "): " << reasons;
+    if (!request.kernelName.empty())
+      remark << " (in " << request.kernelName << ")";
+  }
+
+  // Before the loop: the wave's part of the ring and each lane's readback offsets.
+  rewriter.setInsertionPoint(forOp);
+  Type i32 = rewriter.getI32Type();
+  auto ptrTy = LLVM::LLVMPointerType::get(rewriter.getContext(), kSharedAddressSpace);
+  auto constant = [&](int64_t c) -> Value {
+    return arith::ConstantOp::create(rewriter, loc, rewriter.getI32IntegerAttr(c));
+  };
+  auto offsetPtr = [&](Value base, Value bytes) -> Value {
+    return LLVM::GEPOp::create(rewriter, loc, ptrTy, rewriter.getI8Type(), base,
+                               ArrayRef<LLVM::GEPArg>{bytes});
+  };
+  LLVM::GlobalOp ring = createRing(rewriter, module, loc, ringBytes);
+  Value tid = ROCDL::ThreadIdXOp::create(rewriter, loc, i32);
+  if ((*blockSize)[1] * (*blockSize)[2] > 1) {
+    Value y = ROCDL::ThreadIdYOp::create(rewriter, loc, i32);
+    Value z = ROCDL::ThreadIdZOp::create(rewriter, loc, i32);
+    Value yz = arith::AddIOp::create(
+        rewriter, loc, y, arith::MulIOp::create(rewriter, loc, z, constant((*blockSize)[1])));
+    tid = arith::AddIOp::create(
+        rewriter, loc, tid, arith::MulIOp::create(rewriter, loc, yz, constant((*blockSize)[0])));
+  }
+  // The DMA's LDS base must be wave-uniform.
+  Value wave = ROCDL::ReadfirstlaneOp::create(
+      rewriter, loc, i32, arith::DivUIOp::create(rewriter, loc, tid, constant(kWaveSize)));
+  Value wavePtr =
+      offsetPtr(LLVM::AddressOfOp::create(rewriter, loc, ring),
+                arith::MulIOp::create(rewriter, loc, wave, constant(kRingSlots * slotBytes)));
+  Value lane =
+      ROCDL::MbcntHiOp::create(rewriter, loc, i32, constant(-1),
+                               ROCDL::MbcntLoOp::create(rewriter, loc, i32, constant(-1),
+                                                        constant(0), ArrayAttr(), ArrayAttr()),
+                               ArrayAttr(), ArrayAttr());
+  SmallVector<Value> readbackOffsets, dmaOffsets;
+  for (auto [stride, offset] : llvm::zip(laneStrides, loadOffsets)) {
+    readbackOffsets.push_back(arith::AddIOp::create(
+        rewriter, loc, arith::MulIOp::create(rewriter, loc, lane, constant(stride)),
+        constant(offset)));
+    dmaOffsets.push_back(constant(offset));
+  }
+  Value zero = constant(0);
+  Value slotStep = constant(slotBytes);
+
+  // The slot that a group's DMAs write: 0 for the first group, then alternating.
+  auto withSlot = cast<scf::ForOp>(*forOp.replaceWithAdditionalYields(
+      rewriter, zero, /*replaceInitOperandUsesInLoop=*/false,
+      [&](OpBuilder &b, Location yieldLoc, ArrayRef<BlockArgument> args) -> SmallVector<Value> {
+        return {arith::XOrIOp::create(b, yieldLoc, args[0], slotStep)};
+      }));
+  body = withSlot.getBody();
+  Value slot = withSlot.getRegionIterArgs().back();
+  Operation *nextSlot =
+      cast<scf::YieldOp>(body->getTerminator()).getResults().back().getDefiningOp();
+  rewriter.moveOpBefore(nextSlot, &body->front());
+  rewriter.setInsertionPointAfter(nextSlot);
+  Value slotPtr = offsetPtr(wavePtr, slot);
+
+  LdsStaging result{withSlot, {}, nullptr};
+  Operation *firstReadback = nullptr, *lastDma = nullptr;
+  for (auto [i, load] : llvm::enumerate(staged)) {
+    Location loadLoc = load->getLoc();
+    rewriter.setInsertionPoint(load);
+    std::optional<int64_t> bytes = getByteSize(load->getResult(0).getType());
+    lastDma = ROCDL::RawPtrBufferLoadAsyncLdsOp::create(
+        rewriter, loadLoc, load->getOperand(0), offsetPtr(slotPtr, dmaOffsets[i]), constant(*bytes),
+        load->getOperand(1), load->getOperand(2), zero, load->getAttr("aux"), ArrayAttr(),
+        ArrayAttr(), ArrayAttr());
+
+    Operation *firstUse = nullptr;
+    for (Operation *user : load->getUsers()) {
+      Operation *ancestor = body->findAncestorOpInBlock(*user);
+      if (!firstUse || ancestor->isBeforeInBlock(firstUse))
+        firstUse = ancestor;
+    }
+    rewriter.setInsertionPoint(firstUse);
+    auto readback = LLVM::LoadOp::create(rewriter, loadLoc, load->getResult(0).getType(),
+                                         offsetPtr(slotPtr, readbackOffsets[i]),
+                                         /*alignment=*/laneStrides[i]);
+    rewriter.replaceAllUsesWith(load->getResult(0), readback.getResult());
+    rewriter.eraseOp(load);
+    result.readbacks.insert(readback);
+    if (!firstReadback || readback->isBeforeInBlock(firstReadback))
+      firstReadback = readback;
+  }
+
+  // One async group per group of iterations. The wait count is for a loop that is not pipelined;
+  // the pipeliner's kernel loop raises it to keep the next group in flight.
+  rewriter.setInsertionPointAfter(lastDma);
+  result.mark = ROCDL::AsyncmarkOp::create(rewriter, loc);
+  rewriter.setInsertionPoint(firstReadback);
+  ROCDL::WaitAsyncmarkOp::create(rewriter, loc, uint16_t(0));
+  return result;
 }
 
 /// Moves `forOp` into `scf.if (lb < ub)`, which yields the loop's inits when it runs no iteration.
@@ -732,27 +1014,22 @@ void guardByFirstIteration(RewriterBase &rewriter, scf::ForOp forOp) {
 /// group's compute, which shortens the time they have to complete. Without the second, it hoists
 /// the copies of the next group's loaded values into the back edge's registers into the compute,
 /// and each copy waits for its load there.
+/// With LDS staging, the next group's loads, DMAs and async mark precede the current group's wait,
+/// and the LDS readbacks after the wait are loads too.
 void pinLoadStage(RewriterBase &rewriter, scf::ForOp loop) {
   Operation *lastLoad = nullptr;
-  for (Operation &op : loop.getBody()->without_terminator())
-    if (isMovableLoad(&op))
+  for (Operation &op : loop.getBody()->without_terminator()) {
+    if (isa<ROCDL::WaitAsyncmarkOp>(op))
+      break;
+    if (isMovableLoad(&op) || isa<ROCDL::AsyncmarkOp>(op))
       lastLoad = &op;
+  }
   assert(lastLoad && "the legality checks require a top-level load");
   rewriter.setInsertionPointAfter(lastLoad);
   ROCDL::SchedBarrier::create(rewriter, lastLoad->getLoc(), ROCDL::SchedGroupMask::none);
   Operation *yield = loop.getBody()->getTerminator();
   rewriter.setInsertionPoint(yield);
   ROCDL::SchedBarrier::create(rewriter, yield->getLoc(), ROCDL::SchedGroupMask::none);
-}
-
-/// The chip of the module's ROCDL target, or empty.
-StringRef getChip(Operation *op) {
-  auto module = op->getParentOfType<gpu::GPUModuleOp>();
-  ArrayAttr targets = module ? module.getTargetsAttr() : ArrayAttr();
-  for (Attribute target : targets ? targets.getValue() : ArrayRef<Attribute>())
-    if (auto rocdl = dyn_cast<ROCDL::ROCDLTargetAttr>(target))
-      return rocdl.getChip();
-  return "";
 }
 
 /// On gfx9, loads and stores share vmcnt. The prologue's last load must complete before the
@@ -777,6 +1054,15 @@ void flushBeforeLoop(RewriterBase &rewriter, scf::ForOp loop) {
 /// and need no predicate. Failure means the pipeliner changed the IR before failing.
 LogicalResult pipelineGroups(RewriterBase &rewriter, scf::ForOp forOp,
                              const UnrollRequest &request) {
+  LdsStaging staging;
+  if (request.lds) {
+    if (FailureOr<LdsStaging> staged = stageLoadsInLds(rewriter, forOp, request);
+        succeeded(staged)) {
+      staging = std::move(*staged);
+      forOp = staging.loop;
+    }
+  }
+
   // The pipeliner rejects a yield of the iter arg itself, which always holds the init value.
   auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
   for (auto [arg, init, yielded] :
@@ -788,16 +1074,26 @@ LogicalResult pipelineGroups(RewriterBase &rewriter, scf::ForOp forOp,
   scf::PipeliningOption options;
   options.supportDynamicLoops = true;
   options.peelEpilogue = true;
-  options.getScheduleFn = [](scf::ForOp loop,
-                             std::vector<std::pair<Operation *, unsigned>> &schedule) {
-    SmallVector<Operation *> ops;
-    for (Operation &op : loop.getBody()->without_terminator())
+  // The LDS readbacks belong to the current group's stage, and the async mark to the next group's.
+  options.getScheduleFn = [&staging](scf::ForOp loop,
+                                     std::vector<std::pair<Operation *, unsigned>> &schedule) {
+    SmallVector<Operation *> ops, sliceCandidates;
+    for (Operation &op : loop.getBody()->without_terminator()) {
       ops.push_back(&op);
-    OpSet slice = collectLoadSlice(ops, loop);
+      if (!staging.readbacks.contains(&op))
+        sliceCandidates.push_back(&op);
+    }
+    OpSet slice = collectLoadSlice(sliceCandidates, loop);
     for (Operation *op : ops)
-      schedule.emplace_back(op, slice.contains(op) ? 0 : 1);
+      schedule.emplace_back(op, slice.contains(op) || op == staging.mark ? 0 : 1);
   };
   options.predicateFn = [](RewriterBase &, Operation *op, Value) { return op; };
+  // In the kernel loop, the next group's DMAs are issued before the current group's wait.
+  options.annotateFn = [](Operation *op, scf::PipeliningOption::PipelinerPart part, unsigned) {
+    if (auto wait = dyn_cast<ROCDL::WaitAsyncmarkOp>(op);
+        wait && part == scf::PipeliningOption::PipelinerPart::Kernel)
+      wait.setCount(kRingSlots - 1);
+  };
 
   rewriter.setInsertionPoint(forOp);
   std::string message;

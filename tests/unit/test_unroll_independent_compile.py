@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""Compile-only checks of range(..., unroll=N, assume_independent=True[, pipeline=True]), with no GPU.
+"""Compile-only checks of range(..., unroll=N, assume_independent=True[, pipeline=True or "lds"]), with no GPU.
 
 The device test compares results with plain range, which also passes when each load is waited on
 before the next one issues. This test checks the final ISA for loads in flight.
@@ -122,10 +122,24 @@ def test_pipeline_keeps_next_group_in_flight(pipeline, tmp_path, monkeypatch):
     assert (max_vmcnt >= 4) == pipeline, max_vmcnt
 
 
-def test_pipelined_store_loop_waits_only_for_loads(tmp_path, monkeypatch):
+@pytest.mark.parametrize("pipeline", [True, "lds"], ids=["registers", "lds"])
+def test_pipelined_store_loop_waits_only_for_loads(pipeline, tmp_path, monkeypatch):
     # In a pipelined loop that stores, no wait may hold the next group's loads back behind the
     # current group's work, or wait for a store: LLVM's wait at the loop's top must not merge in the
-    # prologue's requirement, which would make it wait for the previous iteration's stores too.
-    launch = _scatter_launcher(True, "unroll_independent_pipeline_drains", True)
+    # prologue's requirement, which would make it wait for the previous iteration's stores too. With
+    # LDS staging, the next group's loads are the DMAs.
+    launch = _scatter_launcher(True, f"unroll_independent_pipeline_drains_{pipeline}", pipeline)
     drains = _main_loop_wait_drains(_final_isa(launch, tmp_path, monkeypatch))
     assert drains and not any(kinds for _, kinds in drains), drains
+
+
+def test_pipeline_lds_stages_loads_through_lds(tmp_path, monkeypatch):
+    # The prologue and the main loop each issue the group's 4 loads as LDS DMAs, with the LDS base in
+    # M0 from scalar registers; only the wave's base needs a readfirstlane. The loop waits for the
+    # current group with the next group's 4 DMAs outstanding, then reads the group back from LDS.
+    isa = _final_isa(_scatter_launcher(True, "unroll_independent_pipeline_lds_isa", "lds"), tmp_path, monkeypatch)
+    assert len(re.findall(r"buffer_load_dword .* lds", isa)) == 8
+    assert len(re.findall(r"s_(?:mov|add|or)_[ib]32 m0, s\d+", isa)) >= 8
+    assert isa.count("v_readfirstlane") == 1
+    assert max(int(c) for c in re.findall(r"vmcnt\((\d+)\)", isa)) >= 4
+    assert "ds_read" in isa

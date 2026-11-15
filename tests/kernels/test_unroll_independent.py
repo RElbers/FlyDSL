@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""range(..., unroll=N, assume_independent=True[, pipeline=True]) on the GPU: every output bit-identical to
-plain range.
+"""range(..., unroll=N, assume_independent=True[, pipeline=True or "lds"]) on the GPU: every output
+bit-identical to plain range.
 
 Each lane runs a grid-stride loop, so the sizes give the lanes trip counts of 0, 1, N - 1, N, N + 1 and
 non-multiples of N, with neighbouring lanes one trip apart. Further tests cover runtime bounds with
@@ -32,6 +32,7 @@ if not torch.cuda.is_available():
 
 BLK = get_warp_size()
 FACTORS = [2, 4, 8]
+PIPELINES, PIPELINE_IDS = [False, True, "lds"], ["grouped", "pipelined", "lds"]
 MAX_N = BLK * 64
 
 
@@ -123,7 +124,7 @@ def _run(launch, n, *, seed=0):
     return out.cpu()
 
 
-@pytest.mark.parametrize("pipeline", [False, True], ids=["grouped", "pipelined"])
+@pytest.mark.parametrize("pipeline", PIPELINES, ids=PIPELINE_IDS)
 @pytest.mark.parametrize("factor", FACTORS)
 @pytest.mark.parametrize("i32_bounds", [True, False], ids=["i32_bounds", "index_bounds"])
 @pytest.mark.parametrize("body", list(BODIES))
@@ -159,7 +160,7 @@ def _carried_offset_launcher(factor, pipeline=False):
     return launch
 
 
-@pytest.mark.parametrize("pipeline", [False, True], ids=["grouped", "pipelined"])
+@pytest.mark.parametrize("pipeline", PIPELINES, ids=PIPELINE_IDS)
 @pytest.mark.parametrize("factor", FACTORS)
 def test_unroll_independent_carried_offset(factor, pipeline):
     reference, unrolled = _carried_offset_launcher(None), _carried_offset_launcher(factor, pipeline)
@@ -187,7 +188,7 @@ def _bounds_launcher(factor, pipeline=False):
     return launch
 
 
-@pytest.mark.parametrize("pipeline", [False, True], ids=["grouped", "pipelined"])
+@pytest.mark.parametrize("pipeline", PIPELINES, ids=PIPELINE_IDS)
 @pytest.mark.parametrize("factor", FACTORS)
 def test_unroll_independent_runtime_bounds(factor, pipeline):
     # Empty ranges with ub < lb stay empty, and neither the span, the trip count nor the step times N
@@ -248,7 +249,7 @@ def _check_no_load_past_the_trip_count(factor, pipeline):
         assert torch.equal(outs[1], outs[0]), f"n={n}"
 
 
-@pytest.mark.parametrize("pipeline", [False, True], ids=["grouped", "pipelined"])
+@pytest.mark.parametrize("pipeline", PIPELINES, ids=PIPELINE_IDS)
 @pytest.mark.parametrize("factor", FACTORS)
 def test_unroll_independent_does_not_load_past_the_trip_count(factor, pipeline):
     # Iterations are 1 GiB apart and the buffer holds one row, with an unbounded (max_size) buffer
@@ -257,7 +258,7 @@ def test_unroll_independent_does_not_load_past_the_trip_count(factor, pipeline):
     here = Path(__file__).resolve().parent
     code = (
         f"import sys; sys.path.insert(0, {str(here)!r}); "
-        f"import test_unroll_independent as t; t._check_no_load_past_the_trip_count({factor}, {pipeline})"
+        f"import test_unroll_independent as t; t._check_no_load_past_the_trip_count({factor}, {pipeline!r})"
     )
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=600)
     assert result.returncode == 0, result.stderr[-4000:]
@@ -278,7 +279,7 @@ def _shuffle(rin, rout, i, acc):
     return ArithValue(acc) + ArithValue(x) * ArithValue(gpu.shuffle_xor(x, 1, BLK))
 
 
-@pytest.mark.parametrize("pipeline", [False, True], ids=["grouped", "pipelined"])
+@pytest.mark.parametrize("pipeline", PIPELINES, ids=PIPELINE_IDS)
 @pytest.mark.parametrize("factor", [4])
 @pytest.mark.parametrize("body", [_accumulate_in_memory, _shuffle], ids=["accumulate_in_memory", "shuffle"])
 def test_unroll_independent_rejected_loops_match_plain_range(body, factor, pipeline):
@@ -363,3 +364,121 @@ def test_unroll_independent_moves_scalar_buffer_loads(pipeline, want, tmp_path, 
     dumped = list(tmp_path.glob("*/*_llvm_ir.ll"))
     assert len(dumped) == 1, dumped
     assert sum("call" in line and "s.buffer.load" in line for line in dumped[0].read_text().splitlines()) == want
+
+
+@pytest.mark.parametrize("i32_bounds", [True, False], ids=["i32_bounds", "index_bounds"])
+@pytest.mark.parametrize("body", list(BODIES))
+def test_lds_without_grouping_matches_plain_range(body, i32_bounds):
+    # pipeline="lds" also pipelines single iterations.
+    reference = _body_launcher(BODIES[body], None, i32_bounds)
+    staged = _body_launcher(BODIES[body], 1, i32_bounds, "lds")
+    for n in _sizes(1):
+        assert torch.equal(_run(staged, n), _run(reference, n)), f"n={n}"
+
+
+def _wide_launcher(factor, width, block):
+    """Loads `width` f32 per lane per iteration in a block of shape `block`. Lanes past the masked bound
+    read zeros. buffer_ops lowers a 12-byte load to an i96 load, which LLVM cannot select, so the
+    12-byte DMA is covered by FileCheck only."""
+    unroll, independent, pipe = _directives(factor, "lds")
+    threads = block[0] * block[1] * block[2]
+
+    @flyc.kernel(known_block_size=list(block))
+    def k(inp: fx.Tensor, out: fx.Tensor, n: fx.Int32, valid: fx.Int32) -> None:
+        # Bounded, so the masked lanes' loads read zeros instead of faulting.
+        rin = buffer_ops.create_buffer_resource(inp, max_size=False, num_records_bytes=threads * 16 * width * 4)
+        rout = buffer_ops.create_buffer_resource(out, max_size=True)
+        tid = (
+            ArithValue(arith.index_cast(T.i32, gpu.thread_id("x")))
+            + ArithValue(arith.index_cast(T.i32, gpu.thread_id("y"))) * block[0]
+            + ArithValue(arith.index_cast(T.i32, gpu.thread_id("z"))) * (block[0] * block[1])
+        )
+        for i in range(
+            fx.Int32(tid), n, fx.Int32(threads), unroll=unroll, assume_independent=independent, pipeline=pipe
+        ):
+            x = buffer_ops.buffer_load(
+                rin, ArithValue(i) * width, vec_width=width, dtype=T.f32, mask=ArithValue(i) < valid
+            )
+            buffer_ops.buffer_store(ArithValue(x) * 2.0 + 1.0, rout, ArithValue(i) * width)
+
+    @flyc.jit
+    def launch(inp: fx.Tensor, out: fx.Tensor, n: fx.Int32, valid: fx.Int32, stream: fx.Stream) -> None:
+        k(inp, out, n, valid).launch(grid=(1, 1, 1), block=block, stream=stream)
+
+    return launch
+
+
+@pytest.mark.parametrize("block", [(BLK, 1, 1), (BLK // 2, 4, 2)], ids=["one_wave", "four_waves_3d"])
+@pytest.mark.parametrize("width", [1, 4])
+@pytest.mark.parametrize("factor", [1, 4])
+def test_lds_widths_and_waves_match_plain_range(factor, width, block):
+    # Each wave stages into its own part of the ring; with a 3-D block, a wave spans rows.
+    threads = block[0] * block[1] * block[2]
+    reference, staged = _wide_launcher(None, width, block), _wide_launcher(factor, width, block)
+    inp = torch.rand(threads * 16 * width, device="cuda", generator=torch.Generator(device="cuda").manual_seed(1))
+    for n, valid in [(0, 0), (threads // 2, threads), (threads * 5 + 7, threads * 3 + 5), (threads * 16, threads * 16)]:
+        outs = []
+        for launch in (reference, staged):
+            out = torch.full((threads * 16 * width,), -1.0, device="cuda")
+            launch(inp, out, n, valid, torch.cuda.current_stream())
+            torch.cuda.synchronize()
+            outs.append(out.cpu())
+        assert torch.equal(outs[1], outs[0]), f"n={n} valid={valid}"
+
+
+def _gather_launcher(factor, pipeline=False):
+    # The index load feeds the data load's address, so it stays in registers; the data load is staged.
+    unroll, independent, pipe = _directives(factor, pipeline)
+
+    @flyc.kernel(known_block_size=[BLK, 1, 1])
+    def k(inp: fx.Tensor, idx: fx.Tensor, out: fx.Tensor, n: fx.Int32) -> None:
+        rin = buffer_ops.create_buffer_resource(inp, max_size=True)
+        ridx = buffer_ops.create_buffer_resource(idx, max_size=True)
+        rout = buffer_ops.create_buffer_resource(out, max_size=True)
+        tid = arith.index_cast(T.i32, gpu.thread_id("x"))
+        for i in range(fx.Int32(tid), n, fx.Int32(BLK), unroll=unroll, assume_independent=independent, pipeline=pipe):
+            j = buffer_ops.buffer_load(ridx, i, vec_width=1, dtype=T.i32)
+            buffer_ops.buffer_store(ArithValue(_load(rin, j)) + 1.0, rout, i)
+
+    @flyc.jit
+    def launch(inp: fx.Tensor, idx: fx.Tensor, out: fx.Tensor, n: fx.Int32, stream: fx.Stream) -> None:
+        k(inp, idx, out, n).launch(grid=(1, 1, 1), block=(BLK, 1, 1), stream=stream)
+
+    return launch
+
+
+@pytest.mark.parametrize("factor", [1, 4])
+def test_lds_mixed_with_register_loads_matches_plain_range(factor):
+    reference, staged = _gather_launcher(None), _gather_launcher(factor, "lds")
+    gen = torch.Generator(device="cuda").manual_seed(2)
+    inp = torch.rand(MAX_N, device="cuda", generator=gen)
+    idx = torch.randint(0, MAX_N, (MAX_N,), device="cuda", dtype=torch.int32, generator=gen)
+    for n in _sizes(factor):
+        outs = []
+        for launch in (reference, staged):
+            out = torch.zeros(MAX_N, device="cuda")
+            launch(inp, idx, out, n, torch.cuda.current_stream())
+            torch.cuda.synchronize()
+            outs.append(out.cpu())
+        assert torch.equal(outs[1], outs[0]), f"n={n}"
+
+
+def _llvm_ir_calls(launch, tmp_path, monkeypatch, *needles):
+    monkeypatch.setenv("FLYDSL_DUMP_IR", "1")
+    monkeypatch.setenv("FLYDSL_DUMP_DIR", str(tmp_path))
+    monkeypatch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
+    _run(launch, BLK * 8)
+    dumped = list(tmp_path.glob("*/*_llvm_ir.ll"))
+    assert len(dumped) == 1, dumped
+    lines = [line for line in dumped[0].read_text().splitlines() if "call" in line]
+    return [sum(needle in line for line in lines) for needle in needles]
+
+
+def test_lds_stages_loads_in_the_compile_pipeline(tmp_path, monkeypatch):
+    # Unrolled by 4 and pipelined, the loop's load becomes 8 DMAs (4 in the prologue and 4 in the main
+    # loop) and one register load in the remainder loop, with one async group per group.
+    launch = _body_launcher(_scatter, 4, True, "lds")
+    dmas, loads, marks = _llvm_ir_calls(
+        launch, tmp_path, monkeypatch, "buffer.load.async.lds", "raw.ptr.buffer.load.", "asyncmark()"
+    )
+    assert (dmas, loads - dmas, marks) == (8, 1, 2)
