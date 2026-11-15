@@ -36,7 +36,19 @@ MAX_N = BLK * 64
 
 
 def _sizes(factor):
-    trips = [0, 1, factor - 1, factor, factor + 1, 2 * factor, 2 * factor + 3, 3 * factor, 37]
+    trips = [
+        0,
+        1,
+        factor - 1,
+        factor,
+        factor + 1,
+        2 * factor,
+        2 * factor + 3,
+        3 * factor,
+        4 * factor,
+        5 * factor + 1,
+        37,
+    ]
     return [0] + [BLK * t + BLK // 2 + 1 for t in trips]
 
 
@@ -163,7 +175,19 @@ def _carried_offset_launcher(factor, pipeline=False):
 @pytest.mark.parametrize("factor", FACTORS)
 def test_unroll_independent_carried_offset(factor, pipeline):
     reference, unrolled = _carried_offset_launcher(None), _carried_offset_launcher(factor, pipeline)
-    for trips in [0, 1, factor - 1, factor, factor + 1, 2 * factor, 2 * factor + 3, 3 * factor, 37]:
+    for trips in [
+        0,
+        1,
+        factor - 1,
+        factor,
+        factor + 1,
+        2 * factor,
+        2 * factor + 3,
+        3 * factor,
+        4 * factor,
+        5 * factor + 1,
+        37,
+    ]:
         assert torch.equal(_run(unrolled, trips), _run(reference, trips)), f"trips={trips}"
 
 
@@ -299,12 +323,12 @@ def _buffer_loads_in_llvm_ir(launch, tmp_path, monkeypatch):
 
 @pytest.mark.parametrize(
     "factor, pipeline, want",
-    [(None, False, 1), (4, False, 5), (4, True, 9)],
+    [(None, False, 1), (4, False, 5), (4, True, 17)],
     ids=["plain", "grouped", "pipelined"],
 )
 def test_unroll_independent_runs_in_the_compile_pipeline(factor, pipeline, want, tmp_path, monkeypatch):
     # A comparison with plain range also passes if the pass never runs. Unrolled by N, the loop's
-    # one load becomes N loads in the main loop and one in the remainder loop; pipelined, N more
-    # in the prologue.
+    # one load becomes N loads in the main loop and one in the remainder loop. Pipelined, the
+    # prologue adds N, and the pipelined loop is unrolled by 2 with a one-iteration remainder loop.
     launch = _body_launcher(_scatter, factor, True, pipeline)
     assert _buffer_loads_in_llvm_ir(launch, tmp_path, monkeypatch) == want

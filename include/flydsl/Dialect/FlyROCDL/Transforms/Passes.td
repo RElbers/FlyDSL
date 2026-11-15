@@ -44,8 +44,11 @@ def FlyROCDLUnrollIndependentPass : Pass<"fly-rocdl-unroll-independent"> {
     stages: each iteration issues the next group's load slice, then a
     `rocdl.sched.barrier` that keeps LLVM from sinking those loads, then the
     current group's other ops. The pipelined loop runs inside a guard for at
-    least one group, so its prologue and epilogue need no predicates. A loop
-    that SCF's pipeliner rejects stays grouped and gets a remark.
+    least one group, so its prologue and epilogue need no predicates. The
+    pipelined loop is then unrolled by 2, so its halves alternate between two
+    sets of loaded values and no copy waits for the next group's loads; an
+    odd trip count leaves one iteration for a remainder loop. A loop that
+    SCF's pipeliner rejects stays grouped and gets a remark.
 
     The marker asserts that no iteration reads memory that any thread wrote
     in an earlier iteration. The pass still rejects a loop with a barrier, a

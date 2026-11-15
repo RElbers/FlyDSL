@@ -716,6 +716,20 @@ void pinLoadStage(RewriterBase &rewriter, scf::ForOp loop) {
   ROCDL::SchedBarrier::create(rewriter, lastLoad->getLoc(), ROCDL::SchedGroupMask::none);
 }
 
+/// Unrolls the pipelined loop by 2, so its two halves alternate between two registers for each
+/// loaded value. In one iteration of the pipelined loop the next group's loads and the values the
+/// current group computes on are live together, so the back edge needs a copy, and the copy waits
+/// for the loads; in a loop that stores, LLVM places it inside the current group's compute. After
+/// unrolling, a value loaded in the second half is dead before the next load into its register.
+/// An odd trip count leaves one iteration for the unroller's remainder loop.
+void rotateLoadedValues(scf::ForOp loop) {
+  FailureOr<UnrolledLoopInfo> info = loopUnrollByFactor(loop, 2);
+  assert(succeeded(info) && "the unroller rejects only static unsigned 64-bit loops");
+  for (std::optional<scf::ForOp> part : {info->mainLoopOp, info->epilogueLoopOp})
+    if (part)
+      disableLlvmUnroll(*part);
+}
+
 /// Pipelines the grouped main loop in two stages: each group's load slice, then the rest, so the
 /// next group's loads issue before the current group's other ops. The loop runs only inside a guard
 /// for at least one group, so the pipeliner's prologue and epilogue never run past the trip count
@@ -760,6 +774,7 @@ LogicalResult pipelineGroups(RewriterBase &rewriter, scf::ForOp forOp,
   if (succeeded(pipelined)) {
     disableLlvmUnroll(*pipelined);
     pinLoadStage(rewriter, *pipelined);
+    rotateLoadedValues(*pipelined);
     return success();
   }
   if (changedIR)

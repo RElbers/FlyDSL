@@ -9,6 +9,10 @@
 // run unconditionally inside it. The serial remainder loop follows.
 
 gpu.module @unroll_independent_pipeline {
+  // The pipelined loop is unrolled by 2, so its halves alternate between two sets of loaded values:
+  // the first half computes on the carried values while loading into %[[N0]], %[[N1]], the second
+  // computes on those while loading the values it yields. An odd trip count leaves one iteration
+  // for a remainder loop.
   // CHECK-LABEL: gpu.func @scatter
   // CHECK:      %[[MAIN_UB:.*]] = arith.select
   // CHECK:      %[[HAS_GROUP:.*]] = arith.cmpi slt, %arg2, %[[MAIN_UB]] : i32
@@ -16,16 +20,26 @@ gpu.module @unroll_independent_pipeline {
   // CHECK-NOT:    scf.if
   // CHECK:        %[[V0:.*]] = rocdl.raw.ptr.buffer.load
   // CHECK:        %[[V1:.*]] = rocdl.raw.ptr.buffer.load
-  // CHECK:        scf.for {{.*}} iter_args(%[[A0:.*]] = %[[V0]], %[[A1:.*]] = %[[V1]], %{{.*}} = %{{.*}}) -> (f32, f32, i32) : i32 {
+  // CHECK:        %[[ROT:.*]]:3 = scf.for {{.*}} iter_args(%[[A0:.*]] = %[[V0]], %[[A1:.*]] = %[[V1]], %{{.*}} = %{{.*}}) -> (f32, f32, i32) : i32 {
   // CHECK:          %[[N0:.*]] = rocdl.raw.ptr.buffer.load
   // CHECK:          %[[N1:.*]] = rocdl.raw.ptr.buffer.load
   // CHECK-NEXT:     rocdl.sched.barrier none
   // CHECK-NEXT:     arith.mulf %[[A0]], %[[A0]]
   // CHECK:          rocdl.raw.ptr.buffer.store
   // CHECK:          rocdl.raw.ptr.buffer.store
-  // CHECK-NEXT:     scf.yield %[[N0]], %[[N1]],
+  // CHECK:          %[[M0:.*]] = rocdl.raw.ptr.buffer.load
+  // CHECK:          %[[M1:.*]] = rocdl.raw.ptr.buffer.load
+  // CHECK-NEXT:     rocdl.sched.barrier none
+  // CHECK-NEXT:     arith.mulf %[[N0]], %[[N0]]
+  // CHECK:          rocdl.raw.ptr.buffer.store
+  // CHECK:          rocdl.raw.ptr.buffer.store
+  // CHECK-NEXT:     scf.yield %[[M0]], %[[M1]],
   // CHECK-NEXT:   } {loop_annotation = #llvm.loop_annotation<unroll = <disable = true>>}
+  // CHECK-NEXT:   %[[ODD:.*]]:3 = scf.for {{.*}} iter_args(%{{.*}} = %[[ROT]]#0, %{{.*}} = %[[ROT]]#1, %{{.*}} = %[[ROT]]#2)
+  // CHECK:          rocdl.sched.barrier none
+  // CHECK:        } {loop_annotation = #llvm.loop_annotation<unroll = <disable = true>>}
   // CHECK-NOT:    rocdl.raw.ptr.buffer.load
+  // CHECK:        arith.mulf %[[ODD]]#0, %[[ODD]]#0
   // CHECK:        rocdl.raw.ptr.buffer.store
   // CHECK:        rocdl.raw.ptr.buffer.store
   // CHECK-NEXT: }
@@ -67,16 +81,19 @@ gpu.module @unroll_independent_pipeline {
   }
 
   // A reduction: the accumulator stays in the compute stage, and the loaded values cross the
-  // back edge. The epilogue adds the last group.
+  // back edge. The epilogue adds the last group, after the remainder loop.
   // CHECK-LABEL: gpu.func @reduce
   // CHECK:      scf.if %{{.*}} -> (f32) {
-  // CHECK:        %[[R:.*]]:3 = scf.for {{.*}} iter_args(%[[ACC:.*]] = %cst, %[[A0:.*]] = %{{.*}}, %[[A1:.*]] = %{{.*}}) -> (f32, f32, f32) : i32 {
+  // CHECK:        scf.for {{.*}} iter_args(%[[ACC:.*]] = %cst, %[[A0:.*]] = %{{.*}}, %[[A1:.*]] = %{{.*}}) -> (f32, f32, f32) : i32 {
   // CHECK:          llvm.load
   // CHECK:          llvm.load
   // CHECK-NEXT:     rocdl.sched.barrier none
   // CHECK-NEXT:     %[[S0:.*]] = arith.addf %[[ACC]], %[[A0]]
   // CHECK-NEXT:     %[[S1:.*]] = arith.addf %[[S0]], %[[A1]]
-  // CHECK-NEXT:     scf.yield %[[S1]],
+  // CHECK:          rocdl.sched.barrier none
+  // CHECK-NEXT:     %[[S2:.*]] = arith.addf %[[S1]],
+  // CHECK:          scf.yield
+  // CHECK:        %[[R:.*]]:3 = scf.for
   // CHECK:        %[[E0:.*]] = arith.addf %[[R]]#0, %[[R]]#1
   // CHECK-NEXT:   %[[E1:.*]] = arith.addf %[[E0]], %[[R]]#2
   // CHECK:        scf.yield
@@ -107,7 +124,12 @@ gpu.module @unroll_independent_pipeline {
   // CHECK-NEXT:     %[[N1:.*]] = llvm.load %[[P1]]
   // CHECK-NEXT:     rocdl.sched.barrier none
   // CHECK:          %[[P2:.*]] = llvm.getelementptr %[[P1]][1]
-  // CHECK-NEXT:     scf.yield %[[P2]], %{{.*}}, %[[N0]], %[[N1]]
+  // CHECK-NEXT:     %[[M0:.*]] = llvm.load %[[P2]]
+  // CHECK-NEXT:     %[[P3:.*]] = llvm.getelementptr %[[P2]][1]
+  // CHECK-NEXT:     %[[M1:.*]] = llvm.load %[[P3]]
+  // CHECK-NEXT:     rocdl.sched.barrier none
+  // CHECK:          %[[P4:.*]] = llvm.getelementptr %[[P3]][1]
+  // CHECK-NEXT:     scf.yield %[[P4]], %{{.*}}, %[[M0]], %[[M1]]
   gpu.func @carried_address(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
     %c0 = arith.constant 0 : i32
     %c1 = arith.constant 1 : i32
@@ -146,7 +168,7 @@ gpu.module @unroll_independent_pipeline {
   // Constant bounds with three groups and a remainder of one: the guard and the bounds fold.
   // CHECK-LABEL: gpu.func @constant_bounds
   // CHECK:      scf.if %true{{.*}} {
-  // CHECK:        scf.for %{{.*}} = %c0_i32 to %{{.*}} step %c2_i32 {{.*}} : i32 {
+  // CHECK:        scf.for %{{.*}} = %c0_i32 to %{{.*}} step %{{.*}} : i32 {
   // CHECK:      scf.for %{{.*}} = %c6_i32 to %c7_i32 step %c1_i32 : i32 {
   gpu.func @constant_bounds(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>) kernel {
     %c0 = arith.constant 0 : i32
