@@ -191,6 +191,50 @@ gpu.module @unroll_independent_rejected {
     gpu.return
   }
 
+  // A scalar buffer load with the volatile bit (bit 31) of its cache policy set.
+  // CHECK-LABEL: gpu.func @volatile_scalar_buffer_load
+  // CHECK:      scf.for
+  // CHECK:        llvm.call_intrinsic "llvm.amdgcn.s.buffer.load.i32"
+  gpu.func @volatile_scalar_buffer_load(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %volatile = arith.constant -2147483648 : i32
+    %c0_i16 = arith.constant 0 : i16
+    %num_records = arith.constant 4294967295 : i64
+    %flags = arith.constant 159744 : i32
+    %rin = rocdl.make.buffer.rsrc %in, %c0_i16, %num_records, %flags : <1> to <8>
+    %rout = rocdl.make.buffer.rsrc %out, %c0_i16, %num_records, %flags : <1> to <8>
+    %rin_int = llvm.ptrtoint %rin : !llvm.ptr<8> to i128
+    %rin_vec = llvm.bitcast %rin_int : i128 to vector<4xi32>
+    // expected-remark @below {{it contains a fence, a volatile access or an atomic with acquire or stronger ordering}}
+    scf.for %i = %c0 to %n step %c1 : i32 {
+      %v = llvm.call_intrinsic "llvm.amdgcn.s.buffer.load.i32"(%rin_vec, %i, %volatile) : (vector<4xi32>, i32, i32) -> i32
+      rocdl.raw.ptr.buffer.store %v, %rout, %i, %c0, 0 : i32
+    } {fly.assume_independent, loop_annotation = #llvm.loop_annotation<unroll = <count = 2 : i32>>}
+    gpu.return
+  }
+
+  // A scalar buffer load from the same address every iteration, of a buffer the loop writes.
+  // CHECK-LABEL: gpu.func @invariant_scalar_buffer_load
+  // CHECK:      scf.for
+  // CHECK:        llvm.call_intrinsic "llvm.amdgcn.s.buffer.load.i32"
+  gpu.func @invariant_scalar_buffer_load(%buf: !llvm.ptr<1>, %n: i32) kernel {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %c0_i16 = arith.constant 0 : i16
+    %num_records = arith.constant 4294967295 : i64
+    %flags = arith.constant 159744 : i32
+    %r = rocdl.make.buffer.rsrc %buf, %c0_i16, %num_records, %flags : <1> to <8>
+    %r_int = llvm.ptrtoint %r : !llvm.ptr<8> to i128
+    %r_vec = llvm.bitcast %r_int : i128 to vector<4xi32>
+    // expected-remark @below {{a load reads the same address in every iteration from a buffer the loop writes}}
+    scf.for %i = %c0 to %n step %c1 : i32 {
+      %v = llvm.call_intrinsic "llvm.amdgcn.s.buffer.load.i32"(%r_vec, %c0, %c0) : (vector<4xi32>, i32, i32) -> i32
+      rocdl.raw.ptr.buffer.store %v, %r, %i, %c0, 0 : i32
+    } {fly.assume_independent, loop_annotation = #llvm.loop_annotation<unroll = <count = 2 : i32>>}
+    gpu.return
+  }
+
   // CHECK-LABEL: gpu.func @private_memory
   // CHECK:      llvm.load %{{.*}} : !llvm.ptr<5>
   gpu.func @private_memory(%in: !llvm.ptr<1>, %out: !llvm.ptr<1>, %n: i32) kernel {
