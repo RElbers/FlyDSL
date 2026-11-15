@@ -125,7 +125,8 @@ and compiles it through the Fly MLIR pipeline. The pass list is built by
       │    canonicalize → fly-convert-atom-call-to-ssa-form →    │
       │    fly-promote-regmem-to-vectorssa →                     │
       │    convert-fly-to-rocdl → canonicalize →                 │
-      │    gpu.module(convert-scf-to-cf, cse,                    │
+      │    gpu.module(fly-rocdl-unroll-independent,              │
+      │       convert-scf-to-cf, cse,                            │
       │       convert-rocdl-fastmath-ops,                       │
       │       convert-gpu-to-rocdl{...}, fly-rocdl-cluster-attr) │
       ├──────────────────────────────────────────────────────────┤
