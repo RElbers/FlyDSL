@@ -10,6 +10,7 @@ import os
 import re
 import statistics
 import sys
+import warnings
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Callable, Dict, List
@@ -268,7 +269,14 @@ class Autotuner:
         artifact_name=None,
         validate_hook=None,
         select_config=None,
+        precompile_workers=None,
     ):
+        jit_function = sys.modules.get(f"{__package__}.compiler.jit_function")
+        if jit_function is None or not isinstance(fn, jit_function.JitFunction):
+            # Only an explicit request warns, because FLYDSL_AUTOTUNE_PRECOMPILE_WORKERS reaches every tuner.
+            if precompile_workers is not None and precompile_workers > 1:
+                warnings.warn("precompile_workers is only supported on @jit functions, tuning without workers")
+            precompile_workers = 0
         self.fn = fn  # JitFunction instance
         self.configs = configs
         self.key = key or []
@@ -281,6 +289,7 @@ class Autotuner:
         self.post_hook = post_hook
         self.validate_hook = validate_hook
         self.select_config = select_config
+        self.precompile_workers = precompile_workers
         self._do_bench = do_bench_fn or do_bench
         self.cache: Dict[tuple, Config] = {}
         self.default = default
@@ -710,6 +719,13 @@ class Autotuner:
 
         configs = self.configs(*args, **kwargs) if callable(self.configs) else self.configs
         configs = self._prune(configs, args, kwargs)
+
+        workers = self.precompile_workers
+        if workers is None:
+            workers = env.autotune.precompile_workers
+        if workers > 1:
+            self._precompile_configs(configs, workers, args, kwargs)
+
         print(f"[autotune] tuning {len(configs)} configs...")
         results = []
         last_error = None
@@ -741,6 +757,26 @@ class Autotuner:
         self._save_disk_cache()
 
         return best_config
+
+    def _precompile_configs(self, configs, workers, args, kwargs):
+        from .compiler.kernel_function import CompilationContext
+        from .precompile import CompileJob, precompile
+
+        jobs = []
+        for c in configs:
+            # Each job takes the hints of the context it is created in, as _candidate compiles each config.
+            with CompilationContext.compile_hints(c.compiler_opts()):
+                jobs.append(CompileJob(self.fn, *args, **{**kwargs, **c.all_kwargs()}))
+
+        failures = [error for error in precompile(jobs, workers) if error is not None]
+        if failures:
+            # Many configs usually fail for one reason, so list each distinct first line once.
+            reasons = sorted({failure.splitlines()[0] for failure in failures})
+            shown = "; ".join(reasons[:3]) + (f"; and {len(reasons) - 3} more" if len(reasons) > 3 else "")
+            warnings.warn(
+                f"[autotune] {len(failures)} configs failed to precompile and will be compiled during benchmarking: "
+                f"{shown}"
+            )
 
     def __call__(self, *args, **kwargs):
         config = self.resolve_config(*args, **kwargs)
@@ -780,6 +816,7 @@ def autotune(
     artifact_name: str = None,
     validate_hook: Callable = None,
     select_config: Callable = None,
+    precompile_workers: int = None,
 ):
     """Autotune decorator for @jit functions.
 
@@ -818,6 +855,12 @@ def autotune(
             policy over the successfully measured pairs. The default chooses the
             exact minimum; adopters may use a documented tie band to avoid
             persisting a noise-only winner.
+        precompile_workers: number of worker processes used to compile the configs before
+            benchmarking. Values above 1 compile every config into the JIT disk cache in
+            parallel, then benchmark as usual; configs that fail to compile are JIT
+            compiled during benchmarking. Only ``@jit`` functions support it (others
+            warn and tune without workers), and it requires the disk cache. ``None``
+            uses ``FLYDSL_AUTOTUNE_PRECOMPILE_WORKERS``, which other callables ignore.
     """
 
     def decorator(fn):
@@ -837,6 +880,7 @@ def autotune(
             artifact_name=artifact_name,
             validate_hook=validate_hook,
             select_config=select_config,
+            precompile_workers=precompile_workers,
         )
 
     return decorator

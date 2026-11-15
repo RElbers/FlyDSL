@@ -222,6 +222,13 @@ class AutotuneEnvManager(EnvManager):
     env_prefix = "AUTOTUNE"
 
     config_dir = OptStr("", description="Directory for offline config artifacts; empty disables artifacts")
+    precompile_workers = OptInt(
+        0,
+        min_value=0,
+        description=(
+            "Worker processes that precompile a search's configs, for tuners that leave precompile_workers unset"
+        ),
+    )
 
 
 class CompileEnvManager(EnvManager):
