@@ -501,6 +501,7 @@ be a Python constant, written as a keyword in the `range(...)` call itself.
 | `unroll=N` | LLVM unrolls the loop by N. `unroll=1` disables unrolling. |
 | `unroll_full=True` | LLVM unrolls the loop fully. Cannot be combined with `unroll`. |
 | `assume_independent=True` | Requires `unroll=N` with 2 <= N <= 32. FlyDSL unrolls the loop by N and issues each group's loads before its other operations. |
+| `pipeline=True` | Requires `assume_independent=True`. Also issues the next group's loads before the current group's other operations. |
 
 `assume_independent=True` asserts that no iteration reads memory that any
 thread wrote in an earlier iteration, including other lanes and waves, not

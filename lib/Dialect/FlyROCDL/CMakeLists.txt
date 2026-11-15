@@ -26,5 +26,7 @@ add_mlir_dialect_library(MLIRFlyROCDLDialect
   MLIRArithUtils
   MLIRFlyDialect
   MLIRROCDLDialect
+  MLIRSCFTransforms
   MLIRSCFUtils
+  MLIRGPUDialect
 )
