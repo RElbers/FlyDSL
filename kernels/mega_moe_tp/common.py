@@ -181,7 +181,7 @@ def bst(val, rs, voff, soff, aux=0):
 
 
 # LDS-DMA (buffer_load ... lds, M0 = LDS base): the async form, so the compiler's
-# waitcnt pass does not wait on it; waits are explicit (wait_vm).
+# waitcnt pass does not wait on it; callers close async groups and wait on them.
 def _dma(lds_addr, rs, voff, soff, nbytes, aux):
     _rocdl.raw_ptr_buffer_load_async_lds(
         rs,

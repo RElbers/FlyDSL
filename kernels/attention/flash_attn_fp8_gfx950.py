@@ -27,9 +27,7 @@ from kernels.attention.flash_attn_utils import (
     _make_dualwave_swp_fp8_traits,
     _s_setprio,
     _stagger_extra_barrier_if_one,
-    _waitcnt_vm_n,
     daz_denormal_attr,
-    dualwave_fp8_dma_per_iter,
     dualwave_splitk_workspace_elems,  # noqa: F401
 )
 from kernels.common.kernels_common import dtype_to_elem_type
@@ -193,10 +191,13 @@ def build_flash_attn_dualwave_swp_fp8_module(
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
 
-        DMA_PER_ITER = const_expr(dualwave_fp8_dma_per_iter(traits))
+        def _dma_tile(load, tile, buf):
+            """DMA one K or V tile as one async group; an iteration issues four."""
+            load(tile * BN, buf)
+            rocdl.asyncmark()
 
         def _iter_end_bar():
-            _waitcnt_vm_n(DMA_PER_ITER)
+            rocdl.wait_asyncmark(4)
             rocdl.sched_barrier(0)
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
@@ -250,7 +251,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         else:
             q_row, q_wide = None, None
 
-        kv_gmem_to_lds.load_k(t0 * BN, t0 % fx.Index(NPF))
+        _dma_tile(kv_gmem_to_lds.load_k, t0, t0 % fx.Index(NPF))
         if const_expr(traits.QLDS):
             q_loader.stage_q_to_lds()
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
@@ -258,17 +259,17 @@ def build_flash_attn_dualwave_swp_fp8_module(
             rocdl.s_barrier()
             q_row, q_wide = _load_q_regs()
 
-        kv_gmem_to_lds.load_k((t0 + 1) * BN, (t0 + 1) % fx.Index(NPF))
-        kv_gmem_to_lds.load_v(t0 * BN, t0 % fx.Index(NPF))
-        kv_gmem_to_lds.load_v((t0 + 1) * BN, (t0 + 1) % fx.Index(NPF))
-        kv_gmem_to_lds.load_k((t0 + 2) * BN, (t0 + 2) % fx.Index(NPF))
-        kv_gmem_to_lds.load_k((t0 + 3) * BN, (t0 + 3) % fx.Index(NPF))
-        kv_gmem_to_lds.load_v((t0 + 2) * BN, (t0 + 2) % fx.Index(NPF))
-        kv_gmem_to_lds.load_v((t0 + 3) * BN, (t0 + 3) % fx.Index(NPF))
+        _dma_tile(kv_gmem_to_lds.load_k, t0 + 1, (t0 + 1) % fx.Index(NPF))
+        _dma_tile(kv_gmem_to_lds.load_v, t0, t0 % fx.Index(NPF))
+        _dma_tile(kv_gmem_to_lds.load_v, t0 + 1, (t0 + 1) % fx.Index(NPF))
+        _dma_tile(kv_gmem_to_lds.load_k, t0 + 2, (t0 + 2) % fx.Index(NPF))
+        _dma_tile(kv_gmem_to_lds.load_k, t0 + 3, (t0 + 3) % fx.Index(NPF))
+        _dma_tile(kv_gmem_to_lds.load_v, t0 + 2, (t0 + 2) % fx.Index(NPF))
+        _dma_tile(kv_gmem_to_lds.load_v, t0 + 3, (t0 + 3) % fx.Index(NPF))
         if const_expr(traits.QLDS):
             fx.rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0, expcnt=0)
         else:
-            _waitcnt_vm_n(DMA_PER_ITER)
+            rocdl.wait_asyncmark(4)
         rocdl.sched_barrier(0)
         rocdl.s_barrier()
         rocdl.sched_barrier(0)
@@ -311,10 +312,10 @@ def build_flash_attn_dualwave_swp_fp8_module(
 
             v_v_a = kv_lds_to_regs.load_v(a_buf)
 
-            kv_gmem_to_lds.load_k((j + fx.Index(4)) * BN, f_a_buf)
-            kv_gmem_to_lds.load_k((j + fx.Index(5)) * BN, f_b_buf)
-            kv_gmem_to_lds.load_v((j + fx.Index(4)) * BN, f_a_buf)
-            kv_gmem_to_lds.load_v((j + fx.Index(5)) * BN, f_b_buf)
+            _dma_tile(kv_gmem_to_lds.load_k, j + fx.Index(4), f_a_buf)
+            _dma_tile(kv_gmem_to_lds.load_k, j + fx.Index(5), f_b_buf)
+            _dma_tile(kv_gmem_to_lds.load_v, j + fx.Index(4), f_a_buf)
+            _dma_tile(kv_gmem_to_lds.load_v, j + fx.Index(5), f_b_buf)
 
             if const_expr(PP):
                 _phase_bar()
