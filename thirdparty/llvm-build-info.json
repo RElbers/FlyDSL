@@ -52,6 +52,11 @@
         "file": "amdgpu-asyncmark-nocallback.patch",
         "description": "Mark llvm.amdgcn.asyncmark and llvm.amdgcn.wait.asyncmark nocallback, willreturn and nofree. Without it the AMDGPU attributor treats every asyncmark as a possible callback, infers no amdgpu-agpr-alloc for the kernel, and the backend reserves half of the vector register file for AGPRs in any kernel that uses fx.rocdl.asyncmark or wait_asyncmark.",
         "upstream_status": "merged into upstream: e282c27d4c4d1c4fd8cea8d0dcb4674ad2dff02d"
+      },
+      {
+        "file": "reassociate-forget-stale-uniformity.patch",
+        "description": "Forget an instruction's uniformity when Reassociate erases it, so a new instruction that reuses its address is not misclassified as uniform. Without it the optimized IR, and the registers allocated, depend on heap addresses and differ from run to run.",
+        "upstream_status": "merged into upstream: 8237c29e6b60e2bf3bab374df3f3e429999d2e53"
       }
     ],
     "extensions": []
